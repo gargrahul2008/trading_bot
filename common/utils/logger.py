@@ -1,8 +1,5 @@
 from __future__ import annotations
-
-import logging
-import sys
-from typing import Optional
+import logging, sys
 
 def setup_logger(name: str = "bot", level: int = logging.INFO) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -16,7 +13,4 @@ def setup_logger(name: str = "bot", level: int = logging.INFO) -> logging.Logger
     )
     h.setFormatter(fmt)
     logger.addHandler(h)
-    logger.propagate = False
     return logger
-
-LOG = setup_logger("bot")

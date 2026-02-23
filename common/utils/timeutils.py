@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -17,21 +16,13 @@ def parse_hhmmss(s: str) -> dt.time:
         return dt.time(parts[0], parts[1], parts[2])
     raise ValueError(f"Invalid time {s!r}. Use HH:MM or HH:MM:SS")
 
-def now_utc() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
+def now_local(tz_name: str) -> dt.datetime:
+    return dt.datetime.now(ZoneInfo(tz_name))
 
-def local_dt_for_today(tz_name: str, t: dt.time) -> dt.datetime:
-    tz = ZoneInfo(tz_name)
-    now = dt.datetime.now(tz)
-    return dt.datetime(now.year, now.month, now.day, t.hour, t.minute, t.second, tzinfo=tz)
-
-def iso_utc(dtobj: dt.datetime) -> str:
-    if dtobj.tzinfo is None:
-        dtobj = dtobj.replace(tzinfo=dt.timezone.utc)
-    return dtobj.astimezone(dt.timezone.utc).isoformat()
-
-def parse_iso(s: str) -> dt.datetime:
-    x = dt.datetime.fromisoformat(s)
+def to_utc_iso(x: dt.datetime) -> str:
     if x.tzinfo is None:
         x = x.replace(tzinfo=dt.timezone.utc)
-    return x
+    return x.astimezone(dt.timezone.utc).isoformat()
+
+def utcnow() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)

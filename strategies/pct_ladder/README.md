@@ -1,38 +1,54 @@
-# Percent Ladder (Reactive)
+# Percentage Ladder (with optional Fixed-Qty steps)
 
-This is the refactored, drop-in *percentage ladder* built to address:
+This strategy maintains a **reference price** per symbol and trades when price moves ±X%:
 
-- **Sellable inventory mismatches** due to `T1/T2/T0` holdings in FYERS holdings response.
-- **"You can sell only X quantity"** rejects: we clamp SELL to broker-reported sellable qty and also parse qty from reject messages.
-- **Adopt existing holdings as tradable inventory** (so strategy sells what you already have; no "core").
+- BUY when `ltp <= reference * (1 - lower_pct/100)`
+- SELL when `ltp >= reference * (1 + upper_pct/100)`
 
-## Your Rajoo config (example)
+After every **fill**, the reference is reset to the fill price.
 
-- `ladder.upper_pct = 1` and `ladder.lower_pct = 1`
-- `sizing.mode = fixed_qty`
-- `fixed_buy_qty = fixed_sell_qty = 800`
-- `behaviour.adopt_broker_inventory = traded` (take current holdings as tradable)
-- `behaviour.include_t_settled_for_eq = true` (counts T1/T2 in sellable for NSE:*-EQ and BSE:*-A/-EQ)
+## Key features
+- Uses shared FYERS execution layer (`common/`) for:
+  - DB auth via `tr_db`
+  - Quotes, orders, orderbook polling
+  - **Sellable quantity calculation** using Positions + Holdings (T1/BTST aware)
+  - Adaptive SELL quantity on “insufficient qty/holdings” style rejects
+- Strategy config is provided via JSON config file
 
-Copy the example and edit auth:
+## Strategy config variables (under `strategy`)
+- `symbols` (list[str]): e.g. `["NSE:RAJOOENG-EQ"]`
+- `upper_pct`, `lower_pct` (float): ladder threshold percentages
 
-```bash
-cp strategies/pct_ladder/config.example.json strategies/pct_ladder/config.json
-```
+### Sizing
+- `sizing_mode`: `"fixed_qty"` or `"pct"`
+  - `"fixed_qty"`: always use fixed qty per step
+    - `fixed_qty_buy` (int)
+    - `fixed_qty_sell` (int)
+  - `"pct"`: compute qty from base * pct
+    - `sizing_base`: `"strategy_equity"`, `"cash"`, `"fixed"`
+    - `fixed_capital` (float): used if `sizing_base="fixed"`
+    - `buy_trade_pct`, `sell_trade_pct` (float)
 
-Run:
+### Quantity rounding
+- `qty_step` (int): round down to multiples of step
+- `min_qty` (int): if result below this, skip trade
 
-```bash
-python run.py live --config strategies/pct_ladder/config.json
-```
+## Execution settings (under `execution`)
+- `product_type` (default CNC)
+- `allow_btst_auto` (true): Treat T1 holdings as sellable automatically for **NSE *-EQ** and **BSE *-A**
+- `sync_on_start` (true): pull cash and adopt broker inventory
+- `adopt_broker_inventory` (true): set `state.traded_qty` from broker (positions + holdings)
+- `poll_seconds`, `closed_poll_seconds`
+- market timings / EOD cancel
 
-## How we avoid the SELL reject
+## Running
+1. Create a config JSON (see `config.example.json`)
+2. Run:
+   ```bash
+   python run_strategy.py --config strategies/pct_ladder/config.example.json
+   ```
 
-Runner calls `broker.get_inventory()` which uses FYERS `holdings()` and:
-- treats **HLD** as sellable
-- for NSE:*-EQ and BSE:*-A/-EQ it also includes **T0/T1/T2** lots (BTST-like behavior)
-- uses `remainingQuantity` to avoid overselling
 
-Then strategy clamps SELL qty to `min(traded_qty, sellable_qty)`.
-
-If FYERS still rejects, we log the message and parse any quantity embedded in it.
+## Crypto sizing modes
+- fixed_quote: set buy_quote_usdt and sell_quote_usdt
+- fixed_percent_of_portfolio: set buy_percent and sell_percent where 0.25 means 25%

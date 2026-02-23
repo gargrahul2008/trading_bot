@@ -1,24 +1,48 @@
-# Trading Bot Codebase (FYERS)
+# Modular FYERS Strategy Runner (Common Broker + Per-Strategy Folders)
 
-This repo contains:
-- `common/`: shared FYERS broker adapter, DB credentials loader, inventory helpers, reject parsing, JSON state persistence.
-- `strategies/`: each strategy lives in its own folder with `strategy.py`, `config.json`, and `README.md`.
-- `run.py`: generic runner for **reactive** (tick-driven) and **proactive** (pre-place orders then react to fills) styles.
+## What you get
+- `common/` shared layer:
+  - FYERS client wrapper (quotes/orders/orderbook/positions/holdings/funds/history)
+  - DB auth helper (reads `tr_db`)
+  - Sellable quantity computation with **T1/BTST auto**:
+    - Treat T1 as sellable automatically for `NSE:* -EQ` and `BSE:* -A` (BTST eligible)
+  - Reject parser + adaptive SELL qty retry on "insufficient qty/holdings" type rejects
 
-## Quick start (ladder)
+- `strategies/` per-strategy folders:
+  - each strategy has `strategy.py`, config, README
+  - examples:
+    - `pct_ladder` (reactive; market orders)
+    - `order_grid_template` (managed; pre-place limit orders)
 
-1) Copy the example config:
-
+## Install
 ```bash
-cp strategies/pct_ladder/config.example.json strategies/pct_ladder/config.json
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-2) Run live:
+## Run example (pct ladder)
+1) Copy/modify config:
+`strategies/pct_ladder/config.example.json`
 
+2) Ensure `tr_db` file is present (for DB auth) or switch broker.auth_mode to env.
+
+3) Run:
 ```bash
-python run.py live --config strategies/pct_ladder/config.json
+python run_strategy.py --config strategies/pct_ladder/config.example.json
 ```
 
-3) State/trades are written where `paths.*` in config points.
+## Proactive strategies
+For strategies that pre-place orders and react to fills:
+- set `"runner_type": "managed"`
+- implement `desired_actions()` in strategy
 
-> Credentials: use either `auth.user_id` (fetch from Postgres via `tr_db`) **or** set `FYERS_CLIENT_ID` and `FYERS_ACCESS_TOKEN` env vars.
+If you need something more advanced (modify order, complex state machine),
+it's fine to keep a custom runner inside the strategy folder while still reusing
+`common/` modules.
+
+
+## Crypto (MEXC Spot)
+- Configure broker.type = "mexc_spot" and set broker.secrets_file to a repo-root secrets json.
+- Example config: strategies/pct_ladder/config.mexc.example.json
+- Reactive runner supports order_mode=marketable_limit with slippage_bps and limit_ttl_seconds.

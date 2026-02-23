@@ -1,0 +1,39 @@
+{
+  "strategy_name": "pct_ladder",
+  "runner_type": "reactive",
+  "broker": {
+    "type": "mexc_spot",
+    "base_url": "https://api.mexc.com",
+    "recv_window_ms": 5000,
+    "timeout_s": 10,
+    "secrets_file": "secrets/mexc_spot.json"
+  },
+  "strategy": {
+    "symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT"
+    ],
+    "upper_pct": 1.0,
+    "lower_pct": 1.0,
+    "sizing_mode": "fixed_quote",
+    "buy_quote_usdt": 50,
+    "sell_quote_usdt": 60,
+    "qty_step": 1e-06,
+    "min_qty": 1e-06
+  },
+  "execution": {
+    "poll_seconds": 2,
+    "order_mode": "marketable_limit",
+    "slippage_bps": 10,
+    "limit_ttl_seconds": 15,
+    "quote_reserve_usdt": 25,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true
+  },
+  "paths": {
+    "state_path": "state/mexc_state.json",
+    "trades_path": "state/mexc_trades.jsonl",
+    "rejects_path": "state/mexc_rejects.jsonl"
+  }
+}

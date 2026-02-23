@@ -15,6 +15,7 @@ venv/
 env/
 ENV/
 .conda/
+secrets/
 
 # Env files / secrets
 .env

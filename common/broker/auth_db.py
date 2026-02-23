@@ -1,28 +1,24 @@
 from __future__ import annotations
-
 import re
 from typing import Tuple
 
 try:
-    import sqlalchemy
-except Exception:  # pragma: no cover
+    import sqlalchemy  # type: ignore
+except Exception:
     sqlalchemy = None  # type: ignore
 
 def connect_to_traderealm_db(db_info_file: str, db_name_default: str = "traderealm"):
-    """Return a SQLAlchemy connection for db info file.
-
-    File content (whitespace separated):
-        host user password [dbname]
+    """Return a SQLAlchemy connection for the DB info file.
+    db_info_file content (whitespace separated): host user password [dbname]
     """
     if sqlalchemy is None:
-        raise ImportError("sqlalchemy is required for auth.user_id. Install: pip install sqlalchemy psycopg2-binary")
+        raise ImportError("sqlalchemy is required for DB auth. Install: pip install sqlalchemy psycopg2-binary")
     with open(db_info_file, mode="r", encoding="utf-8") as f:
         parts = f.read().split()
     if len(parts) < 3:
         raise ValueError(f"DB info file {db_info_file!r} must contain: host user password [dbname]")
     host, user, password = parts[0], parts[1], parts[2]
     dbname = parts[3] if len(parts) >= 4 else db_name_default
-
     from urllib import parse as _parse
     engine = sqlalchemy.create_engine(f"postgresql://{user}:{_parse.quote_plus(password)}@{host}/{dbname}")
     return engine.connect()
@@ -34,9 +30,9 @@ def get_fyers_creds_from_db(
     db_name: str = "traderealm",
     table_name: str = "nse_usercredential",
 ) -> Tuple[str, str]:
-    """Fetch (api_key, access_token) from DB."""
+    """Fetch (api_key, access_token) from DB for a user_id."""
     if sqlalchemy is None:
-        raise ImportError("sqlalchemy is required for auth.user_id. Install: pip install sqlalchemy psycopg2-binary")
+        raise ImportError("sqlalchemy is required for DB auth. Install: pip install sqlalchemy psycopg2-binary")
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
         raise ValueError(f"Unsafe table name: {table_name!r}")
 
