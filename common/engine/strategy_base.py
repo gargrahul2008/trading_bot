@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Literal, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Literal, Optional, Protocol, runtime_checkable
 from common.broker.interfaces import Side, PlaceOrderRequest
 
 D0 = Decimal("0")
@@ -21,6 +21,7 @@ class OrderAction:
     request: Optional[PlaceOrderRequest] = None
     order_id: Optional[str] = None
     reason: str = ""
+    meta: Optional[Dict[str, Any]] = None
 
 @runtime_checkable
 class ReactiveStrategy(Protocol):

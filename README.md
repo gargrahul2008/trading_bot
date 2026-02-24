@@ -46,3 +46,8 @@ it's fine to keep a custom runner inside the strategy folder while still reusing
 - Configure broker.type = "mexc_spot" and set broker.secrets_file to a repo-root secrets json.
 - Example config: strategies/pct_ladder/config.mexc.example.json
 - Reactive runner supports order_mode=marketable_limit with slippage_bps and limit_ttl_seconds.
+
+
+## Proactive levels from previous close
+- Strategy: strategies/prevclose_levels (runner_type: managed)
+- Example config: strategies/prevclose_levels/config.fyers.rajoo.example.json

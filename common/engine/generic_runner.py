@@ -490,6 +490,7 @@ class GenericRunner:
 
     def run_managed(self, strategy: ManagedOrderStrategy, *, state_path: str) -> None:
         self.state.ensure_symbols(self.symbols)
+
         if self.sync_on_start:
             try:
                 self.reconcile_from_broker()
@@ -498,17 +499,110 @@ class GenericRunner:
 
         LOG.info("MANAGED LIVE started symbols=%s", ",".join(self.symbols))
 
+        # Track orders placed by managed strategies so we can detect fills and notify strategy
+        self.state.extras.setdefault("managed_order_meta", {})  # order_id -> meta dict
+
         while True:
+            now = now_local(self.market_tz)
+            today = now.date().isoformat()
+
+            # session reset by market date
+            if self.state.session_date != today:
+                self.state.session_date = today
+                self.state.reject_events = []
+                self.state.cooldown_until = None
+                self.state.halted_until = None
+                self.state.halt_reason = None
+                self.state.last_eod_cancel_date = None
+
+            open_dt = now.replace(hour=self.open_t.hour, minute=self.open_t.minute, second=self.open_t.second, microsecond=0)
+            close_dt = now.replace(hour=self.close_t.hour, minute=self.close_t.minute, second=self.close_t.second, microsecond=0)
+            eod_cancel_dt = now.replace(hour=self.eod_cancel_t.hour, minute=self.eod_cancel_t.minute, second=self.eod_cancel_t.second, microsecond=0)
+
+            # EOD cancel at/after time once per day (equities). For crypto you typically set eod_cancel_time=23:59:59.
+            if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:
+                try:
+                    n = self.cancel_open_orders(cancel_all=self.cancel_all_open_orders)
+                    self.state.last_eod_cancel_date = today
+                    self.state.halted_until = close_dt.astimezone(dt.timezone.utc).isoformat()
+                    self.state.halt_reason = "EOD_CANCEL"
+                    LOG.warning("EOD cancel done: cancelled=%d", n)
+                except Exception as e:
+                    LOG.warning("EOD cancel failed: %s", e)
+
+            allow_place = (now >= open_dt) and (now < eod_cancel_dt)
+
             try:
                 prices = self.broker.get_ltps(self.symbols)
+
+                # update marks
+                for sym, px in prices.items():
+                    self.state.last_prices[sym] = _dec(px)
+                    self.state.symbol_states[sym].last_mark_price = _dec(px)
+
+                # fetch open orders once
                 ob = self.broker.orderbook()
                 open_orders = ob.get("orderBook") or ob.get("data") or ob.get("orders") or []
                 if isinstance(open_orders, dict):
                     open_orders = list(open_orders.values())
 
+                open_ids = set()
+                for o in (open_orders or []):
+                    if not isinstance(o, dict):
+                        continue
+                    oid = str(o.get("id") or o.get("order_id") or "")
+                    if oid:
+                        open_ids.add(oid)
+
                 now_ts = utcnow().isoformat()
+
+                # Optional hook for strategies that need broker access (e.g., anchor prev close)
+                if hasattr(strategy, "ensure_anchor"):
+                    try:
+                        strategy.ensure_anchor(self.broker, self.state, now_ts, prices)  # type: ignore[attr-defined]
+                    except Exception as e:
+                        LOG.warning("strategy.ensure_anchor failed: %s", e)
+
+                # 1) detect terminals for tracked orders that disappeared from open orders
+                meta_map: Dict[str, Any] = self.state.extras.get("managed_order_meta", {})  # type: ignore[assignment]
+                for oid, meta in list(meta_map.items()):
+                    if str(oid) in open_ids:
+                        continue
+
+                    try:
+                        term = self.exec.poll_terminal(str(oid))
+                    except Exception:
+                        term = None
+
+                    if term is None:
+                        continue
+
+                    if term.status in TERMINAL_STATUSES:
+                        if term.status == "FILLED" and term.filled_qty > 0:
+                            px = term.avg_price if term.avg_price > 0 else (_dec(self.state.last_prices.get(term.symbol)) if term.symbol else D0)
+                            cum = term.cum_quote_qty if term.cum_quote_qty > 0 else (px * term.filled_qty)
+                            self._apply_fill(term.symbol, term.side, term.filled_qty, px, cum,
+                                             reason=str(meta.get("reason") or "managed_fill"),
+                                             order_id=term.order_id, status=term.status)
+                        else:
+                            self._apply_fill(term.symbol, term.side, D0, D0, D0,
+                                             reason=str(meta.get("reason") or "managed_terminal"),
+                                             order_id=term.order_id, status=term.status)
+
+                        if hasattr(strategy, "on_order_terminal"):
+                            try:
+                                strategy.on_order_terminal(term, meta, self.state)  # type: ignore[attr-defined]
+                            except Exception as e:
+                                LOG.warning("strategy.on_order_terminal failed: %s", e)
+
+                        meta_map.pop(str(oid), None)
+
+                self.state.extras["managed_order_meta"] = meta_map
+
+                # 2) get desired actions from strategy
                 actions = strategy.desired_actions(prices, list(open_orders or []), self.state, now_ts)
 
+                # 3) execute actions
                 for act in actions:
                     if act.kind == "CANCEL" and act.order_id:
                         try:
@@ -516,10 +610,40 @@ class GenericRunner:
                             LOG.info("Cancelled order %s reason=%s", act.order_id, act.reason)
                         except Exception as e:
                             LOG.warning("Cancel failed %s: %s", act.order_id, e)
+                        self.state.extras.get("managed_order_meta", {}).pop(str(act.order_id), None)
+                        if hasattr(strategy, "on_order_cancelled"):
+                            try:
+                                strategy.on_order_cancelled(str(act.order_id), act.meta or {}, self.state)  # type: ignore[attr-defined]
+                            except Exception:
+                                pass
+
                     elif act.kind == "PLACE" and act.request:
+                        if not allow_place:
+                            continue
                         oid = self.exec.place_with_adaptive_qty(act.request, reason=act.reason)
                         if oid:
-                            LOG.info("Placed order oid=%s %s %s qty=%s", oid, act.request.symbol, act.request.side, act.request.qty)
+                            meta = dict(act.meta or {})
+                            meta.setdefault("symbol", act.request.symbol)
+                            meta.setdefault("side", act.request.side)
+                            meta.setdefault("reason", act.reason)
+                            meta.setdefault("ts", now_ts)
+                            self.state.extras.setdefault("managed_order_meta", {})[str(oid)] = meta
+                            LOG.info("Placed order oid=%s %s %s qty=%s", oid, act.request.symbol, act.request.side, str(act.request.qty))
+
+                            if hasattr(strategy, "on_order_placed"):
+                                try:
+                                    strategy.on_order_placed(str(oid), meta, self.state)  # type: ignore[attr-defined]
+                                except Exception as e:
+                                    LOG.warning("strategy.on_order_placed failed: %s", e)
+
+                # status line
+                parts = []
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    px = self.state.last_prices.get(s, D0)
+                    ref = ss.reference_price or D0
+                    parts.append(f"{s} px={px} ref={ref} traded={ss.traded_qty} avg={ss.traded_avg_price} R={ss.realized_pnl}")
+                LOG.info("cash=%s eq=%s | %s", str(self.state.cash), str(self.state.strategy_equity()), " | ".join(parts))
 
             except KeyboardInterrupt:
                 LOG.info("Stopped by user.")
@@ -529,4 +653,6 @@ class GenericRunner:
 
             self.state.last_update_ts = utcnow().isoformat()
             self.state.dump(state_path)
-            time.sleep(max(int(self.poll_seconds), 1))
+
+            sleep_s = self.poll_seconds if (now >= open_dt and now < close_dt) else self.closed_poll_seconds
+            time.sleep(max(int(sleep_s), 1))
