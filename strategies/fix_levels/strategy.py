@@ -49,7 +49,7 @@ class PrevCloseLevelsStrategy:
     - When a side is exhausted, it is reset after the opposite side fills.
     """
 
-    NS_KEY = "prevclose_levels"
+    NS_KEY = "fix_levels"
 
     def __init__(self, cfg: Dict[str, Any]):
         self.cfg_raw = cfg
