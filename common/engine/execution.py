@@ -74,7 +74,8 @@ class OrderExecutor:
 
     def compute_broker_sellable(self, symbol: str) -> Decimal:
         # If broker exposes crypto balances, compute sellable from balances + open sell orders
-        if hasattr(self.broker, "balances"):
+        is_crypto_symbol = (":" not in symbol)
+        if is_crypto_symbol  and hasattr(self.broker, "balances"):
             try:
                 # MEXC-specific helper: sellable is base_free - base_locked_in_open_sells
                 # We'll compute locked in open sells by scanning open orders.
