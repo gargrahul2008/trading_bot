@@ -83,7 +83,7 @@ class MexcSpotClient(Broker):
         params["recvWindow"] = self.recv_window_ms
         params["signature"] = self._sign(params)
 
-        headers = {"X-MEXC-APIKEY": self.api_key}
+        headers = {"X-MEXC-APIKEY": self.api_key, "Content-Type": "application/json"}
 
         if method.upper() == "GET":
             r = self._session.get(url, params=params, headers=headers, timeout=self.timeout_s)
