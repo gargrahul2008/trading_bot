@@ -65,6 +65,18 @@ class GenericRunner:
         # Crypto path: balances exist and symbols are like BTCUSDT
         try:
             bals = self.broker.balances()
+            quote_assets = set()
+            for sym in self.symbols:
+                info = getattr(self.broker, "symbol_info")(sym)
+                quote_assets.add(info.quote_asset)
+
+            if len(quote_assets) != 1:
+                raise RuntimeError(f"All symbols must share same quote asset. got={sorted(quote_assets)}")
+
+            quote = next(iter(quote_assets))
+            qbal = bals.get(quote) or {"free": D0, "locked": D0}
+            self.state.cash = _dec(qbal.get("free") or "0")
+            self.state.extras["quote_asset"] = quote
         except Exception:
             bals = {}
 
@@ -326,21 +338,19 @@ class GenericRunner:
             bals = {}
         if not bals:
             return
-        # portfolio = USDT + base_total * price
-        usdt = _dec((bals.get("USDT") or {}).get("free")) + _dec((bals.get("USDT") or {}).get("locked"))
-        total = usdt
+        quote = self.state.extras.get("quote_asset") or "USDC"  # fallback
+        qfree = _dec((bals.get(quote) or {}).get("free"))
+        qlock = _dec((bals.get(quote) or {}).get("locked"))
+        quote_total = qfree + qlock
+
+        total = quote_total
         for sym, px in prices.items():
-            base = None
-            try:
-                info = getattr(self.broker, "symbol_info")(sym)
-                base = info.base_asset
-            except Exception:
-                if sym.endswith("USDT"):
-                    base = sym[:-4]
-            if base and base in bals:
-                base_total = _dec(bals[base].get("free")) + _dec(bals[base].get("locked"))
-                total += base_total * px
+            info = getattr(self.broker, "symbol_info")(sym)
+            base = info.base_asset
+            base_total = _dec((bals.get(base) or {}).get("free")) + _dec((bals.get(base) or {}).get("locked"))
+            total += base_total * px
         self.state.extras["portfolio_value"] = str(total)
+        self.state.extras["quote_asset"] = quote
 
     def _place_intent(self, intent: OrderIntent, *, ltp: Decimal) -> None:
         ss = self.state.symbol_states[intent.symbol]

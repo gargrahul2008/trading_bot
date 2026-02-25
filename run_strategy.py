@@ -120,6 +120,11 @@ def main() -> None:
     symbols = list((cfg.get("strategy") or {}).get("symbols") or [])
     if not symbols:
         raise SystemExit("Config must include strategy.symbols list.")
+    if hasattr(broker, "self_symbols"):
+        allowed = set(broker.self_symbols())
+        missing = [s for s in symbols if s not in allowed]
+        if missing:
+            raise SystemExit(f"MEXC API key does not allow symbols: {missing}. Allowed: {sorted(allowed)}")
     state.ensure_symbols(symbols)
 
     runner = GenericRunner(

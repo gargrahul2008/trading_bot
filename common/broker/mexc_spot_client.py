@@ -347,3 +347,12 @@ class MexcSpotClient(Broker):
 
     def history(self, data: Dict[str, Any]) -> Dict[str, Any]:
         raise NotImplementedError("MEXC spot history not implemented in this codebase")
+
+    def self_symbols(self) -> list[str]:
+        data = self._private_request("GET", "/api/v3/selfSymbols", params={})
+        # docs show dict with "data": [...] :contentReference[oaicite:2]{index=2}
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return list(data["data"])
+        if isinstance(data, list):
+            return list(data)
+        return []
