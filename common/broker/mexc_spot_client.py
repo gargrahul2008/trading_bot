@@ -4,7 +4,7 @@ import hmac
 import time
 import urllib.parse
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -21,9 +21,17 @@ class MexcSymbolInfo:
     symbol: str
     base_asset: str
     quote_asset: str
-    base_size_precision: int
+    # base_size_precision: int
+    base_step: Decimal
     quote_precision: int
-    quote_amount_precision: int
+    # quote_amount_precision: int
+
+def _to_step(v) -> Decimal:
+    try:
+        d = Decimal(str(v))
+        return d if d > 0 else Decimal("0")
+    except Exception:
+        return Decimal("0")
 
 class MexcSpotClient(Broker):
     def __init__(self, api_key: str, api_secret: str, *, base_url: str = "https://api.mexc.com", recv_window_ms: int = 5000, timeout_s: int = 10):
@@ -97,35 +105,41 @@ class MexcSpotClient(Broker):
         return data
 
     def _ensure_exchange_info(self, symbols: Optional[List[str]] = None) -> None:
-        # Cache for 10 minutes
         now = time.time()
+
+        # Cache for 10 minutes; refresh if any requested symbol missing
         if self._exchange_cache and (now - self._exchange_cache_ts) < 600 and symbols:
             missing = [s for s in symbols if s not in self._exchange_cache]
             if not missing:
                 return
-        if self._exchange_cache and (now - self._exchange_cache_ts) < 600 and symbols is None:
+            # fetch only missing
+            data = self._public_get("/api/v3/exchangeInfo", params={"symbols": ",".join(missing)})
+        elif self._exchange_cache and (now - self._exchange_cache_ts) < 600 and symbols is None:
             return
+        else:
+            data = self._public_get("/api/v3/exchangeInfo", params=None)
 
-        data = self._public_get("/api/v3/exchangeInfo", params=None)
         syms = data.get("symbols") or []
-        cache: Dict[str, MexcSymbolInfo] = {}
+        cache = dict(self._exchange_cache)  # keep existing
+
         for s in syms:
             if not isinstance(s, dict):
                 continue
             sym = str(s.get("symbol") or "")
             if not sym:
                 continue
-            try:
-                cache[sym] = MexcSymbolInfo(
-                    symbol=sym,
-                    base_asset=str(s.get("baseAsset") or ""),
-                    quote_asset=str(s.get("quoteAsset") or ""),
-                    base_size_precision=int(s.get("baseSizePrecision") or 0),
-                    quote_precision=int(s.get("quotePrecision") or 0),
-                    quote_amount_precision=int(s.get("quoteAmountPrecision") or s.get("quoteAmountPrecision") or 0),
-                )
-            except Exception:
-                continue
+
+            base_step = _to_step(s.get("baseSizePrecision") or "0")
+            quote_precision = int(s.get("quotePrecision") or s.get("quoteAssetPrecision") or 8)
+
+            cache[sym] = MexcSymbolInfo(
+                symbol=sym,
+                base_asset=str(s.get("baseAsset") or ""),
+                quote_asset=str(s.get("quoteAsset") or ""),
+                base_step=base_step,
+                quote_precision=quote_precision,
+            )
+
         self._exchange_cache = cache
         self._exchange_cache_ts = now
 
@@ -137,24 +151,16 @@ class MexcSpotClient(Broker):
 
     def _round_qty(self, symbol: str, qty: Decimal) -> Decimal:
         info = self.symbol_info(symbol)
-        p = info.base_size_precision
-        if p < 0:
+        step = info.base_step
+        if step <= 0:
             return qty
-        q = qty.quantize(Decimal("1e-%d" % p))
-        # floor to precision
-        if q > qty:
-            q = qty
-        return q
+        return (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
 
     def _round_price(self, symbol: str, price: Decimal) -> Decimal:
         info = self.symbol_info(symbol)
-        p = info.quote_precision
-        if p < 0:
-            return price
-        q = price.quantize(Decimal("1e-%d" % p))
-        if q > price:
-            q = price
-        return q
+        p = max(int(info.quote_precision), 0)
+        tick = Decimal("1e-%d" % p)
+        return price.quantize(tick, rounding=ROUND_DOWN)
 
     # ----- Broker interface -----
 
