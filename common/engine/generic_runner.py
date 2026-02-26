@@ -1,5 +1,6 @@
 from __future__ import annotations
 import datetime as dt
+import os
 import json
 import time
 from decimal import Decimal
@@ -7,10 +8,11 @@ from typing import Any, Dict, List
 
 from common.broker.interfaces import Broker, PlaceOrderRequest, to_decimal
 from common.engine.state import GlobalState
-from common.engine.strategy_base import ReactiveStrategy, ManagedOrderStrategy, OrderIntent, OrderAction
+from common.engine.strategy_base import ReactiveStrategy, ManagedOrderStrategy, OrderIntent
 from common.engine.execution import OrderExecutor, ExecutionConfig
 from common.utils.logger import setup_logger
 from common.utils.timeutils import parse_hhmm, parse_hhmmss, now_local, utcnow
+from common.engine.pnl import PnLWriter, PnLPoint, infer_broker_name, compute_portfolio_value_for_symbols, compute_strategy_pnl, update_drawdown, ensure_portfolio_start
 
 LOG = setup_logger("runner")
 
@@ -41,6 +43,12 @@ class GenericRunner:
         self.cancel_all_open_orders = bool(cancel_all_open_orders)
         self.sync_on_start = bool(sync_on_start)
         self.adopt_broker_inventory = bool(adopt_broker_inventory)
+        base_dir = os.path.dirname(os.path.abspath(trades_path)) or "."
+        self._pnl_writer = PnLWriter(
+            csv_path=os.path.join(base_dir, "pnl_points.csv"),
+            snapshot_path=os.path.join(base_dir, "positions_snapshot.json"),
+            summary_path=os.path.join(base_dir, "pnl_summary.json"),
+        )
 
     def _append_jsonl(self, path: str, rec: Dict[str, Any]) -> None:
         try:
@@ -54,31 +62,25 @@ class GenericRunner:
         - For equities: keeps old behavior (cash from funds, traded qty from sellable)
         - For crypto spot: traded_qty per symbol = base free+locked from balances
         """
-        try:
-            self.state.cash = _dec(self.broker.funds_cash())
-        except Exception:
-            pass
+        quote_assets = set()
+        base_by_sym = {}
+
+        for sym in self.symbols:
+            info = getattr(self.broker, "symbol_info")(sym)  # MexcSpotClient
+            quote_assets.add(info.quote_asset)
+            base_by_sym[sym] = info.base_asset
+
+        if len(quote_assets) != 1:
+            raise RuntimeError(f"All crypto symbols must share same quote asset. got={sorted(quote_assets)}")
+
+        quote_asset = next(iter(quote_assets))
+        self.state.extras["quote_asset"] = quote_asset
+        bals = self.broker.balances()
+        q = bals.get(quote_asset) or {}
+        self.state.cash = _dec(q.get("free") or "0")
 
         if not self.adopt_broker_inventory:
             return
-
-        # Crypto path: balances exist and symbols are like BTCUSDT
-        try:
-            bals = self.broker.balances()
-            quote_assets = set()
-            for sym in self.symbols:
-                info = getattr(self.broker, "symbol_info")(sym)
-                quote_assets.add(info.quote_asset)
-
-            if len(quote_assets) != 1:
-                raise RuntimeError(f"All symbols must share same quote asset. got={sorted(quote_assets)}")
-
-            quote = next(iter(quote_assets))
-            qbal = bals.get(quote) or {"free": D0, "locked": D0}
-            self.state.cash = _dec(qbal.get("free") or "0")
-            self.state.extras["quote_asset"] = quote
-        except Exception:
-            bals = {}
 
         if bals:
             # require MexcSpotClient-like symbol_info if possible
@@ -348,9 +350,9 @@ class GenericRunner:
             info = getattr(self.broker, "symbol_info")(sym)
             base = info.base_asset
             base_total = _dec((bals.get(base) or {}).get("free")) + _dec((bals.get(base) or {}).get("locked"))
-            total += base_total * px
+            total += base_total * _dec(px)
         self.state.extras["portfolio_value"] = str(total)
-        self.state.extras["quote_asset"] = quote
+        self.state.extras["quote_asset"] = str(quote)
 
     def _place_intent(self, intent: OrderIntent, *, ltp: Decimal) -> None:
         ss = self.state.symbol_states[intent.symbol]
@@ -484,6 +486,71 @@ class GenericRunner:
                     parts.append(f"{s} px={px} ref={ref} traded={ss.traded_qty} avg={ss.traded_avg_price} R={ss.realized_pnl}")
                 pv = self.state.extras.get("portfolio_value")
                 pv_str = f" pv={pv}" if pv else ""
+                # --- Stage-1 PnL persistence (hybrid: account + strategy) ---
+                broker_name = infer_broker_name(self.broker)
+                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+                start_val = ensure_portfolio_start(self.state, port_val)
+                port_pnl = port_val - start_val
+                port_pnl_pct = (port_pnl / start_val) if start_val > 0 else D0
+                dd = update_drawdown(self.state, port_val)
+
+                se, realized, unreal, st_total, exposure, exp_pct = compute_strategy_pnl(self.state)
+
+                pt = PnLPoint(
+                    ts=utcnow().isoformat(),
+                    broker=broker_name,
+                    quote_asset=str(quote_asset),
+                    portfolio_value=port_val,
+                    portfolio_pnl=port_pnl,
+                    portfolio_pnl_pct=port_pnl_pct,
+                    strategy_equity=se,
+                    strategy_realized=realized,
+                    strategy_unrealized=unreal,
+                    strategy_total=st_total,
+                    drawdown_pct=dd,
+                    exposure=exposure,
+                    exposure_pct=exp_pct,
+                )
+                if self._pnl_writer:
+                    self._pnl_writer.append(pt)
+
+                snap = {
+                    "ts": pt.ts,
+                    "broker": broker_name,
+                    "quote_asset": str(quote_asset),
+                    "portfolio_value": str(port_val),
+                    "portfolio_pnl": str(port_pnl),
+                    "portfolio_pnl_pct": str(port_pnl_pct),
+                    "drawdown_pct": str(dd),
+                    "portfolio_details": port_details,
+                    "symbols": {},
+                }
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    px = self.state.last_prices.get(s, D0)
+                    snap["symbols"][s] = {
+                        "px": str(px),
+                        "ref": str(ss.reference_price) if ss.reference_price is not None else None,
+                        "traded_qty": str(ss.traded_qty),
+                        "avg_price": str(ss.traded_avg_price),
+                        "realized": str(ss.realized_pnl),
+                        "unrealized": str((ss.traded_qty * (px - ss.traded_avg_price)) if (px is not None) else D0),
+                        "pending_order_id": ss.pending_order_id,
+                        "pending_reason": ss.pending_reason,
+                    }
+                if self._pnl_writer:
+                    self._pnl_writer.write_snapshot(snap)
+                    self._pnl_writer.write_summary({
+                        "ts": pt.ts,
+                        "portfolio_value": str(port_val),
+                        "portfolio_pnl": str(port_pnl),
+                        "portfolio_pnl_pct": str(port_pnl_pct),
+                        "strategy_total": str(st_total),
+                        "strategy_realized": str(realized),
+                        "strategy_unrealized": str(unreal),
+                        "max_dd": str(self.state.extras.get("pnl_max_dd") or "0"),
+                        "quote_asset": str(quote_asset),
+                    })
                 LOG.info("cash=%s eq=%s%s | %s", str(self.state.cash), str(self.state.strategy_equity()), pv_str, " | ".join(parts))
 
             except KeyboardInterrupt:
@@ -653,6 +720,71 @@ class GenericRunner:
                     px = self.state.last_prices.get(s, D0)
                     ref = ss.reference_price or D0
                     parts.append(f"{s} px={px} ref={ref} traded={ss.traded_qty} avg={ss.traded_avg_price} R={ss.realized_pnl}")
+                # --- Stage-1 PnL persistence (hybrid: account + strategy) ---
+                broker_name = infer_broker_name(self.broker)
+                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+                start_val = ensure_portfolio_start(self.state, port_val)
+                port_pnl = port_val - start_val
+                port_pnl_pct = (port_pnl / start_val) if start_val > 0 else D0
+                dd = update_drawdown(self.state, port_val)
+
+                se, realized, unreal, st_total, exposure, exp_pct = compute_strategy_pnl(self.state)
+
+                pt = PnLPoint(
+                    ts=utcnow().isoformat(),
+                    broker=broker_name,
+                    quote_asset=str(quote_asset),
+                    portfolio_value=port_val,
+                    portfolio_pnl=port_pnl,
+                    portfolio_pnl_pct=port_pnl_pct,
+                    strategy_equity=se,
+                    strategy_realized=realized,
+                    strategy_unrealized=unreal,
+                    strategy_total=st_total,
+                    drawdown_pct=dd,
+                    exposure=exposure,
+                    exposure_pct=exp_pct,
+                )
+                if self._pnl_writer:
+                    self._pnl_writer.append(pt)
+
+                snap = {
+                    "ts": pt.ts,
+                    "broker": broker_name,
+                    "quote_asset": str(quote_asset),
+                    "portfolio_value": str(port_val),
+                    "portfolio_pnl": str(port_pnl),
+                    "portfolio_pnl_pct": str(port_pnl_pct),
+                    "drawdown_pct": str(dd),
+                    "portfolio_details": port_details,
+                    "symbols": {},
+                }
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    px = self.state.last_prices.get(s, D0)
+                    snap["symbols"][s] = {
+                        "px": str(px),
+                        "ref": str(ss.reference_price) if ss.reference_price is not None else None,
+                        "traded_qty": str(ss.traded_qty),
+                        "avg_price": str(ss.traded_avg_price),
+                        "realized": str(ss.realized_pnl),
+                        "unrealized": str((ss.traded_qty * (px - ss.traded_avg_price)) if (px is not None) else D0),
+                        "pending_order_id": ss.pending_order_id,
+                        "pending_reason": ss.pending_reason,
+                    }
+                if self._pnl_writer:
+                    self._pnl_writer.write_snapshot(snap)
+                    self._pnl_writer.write_summary({
+                        "ts": pt.ts,
+                        "portfolio_value": str(port_val),
+                        "portfolio_pnl": str(port_pnl),
+                        "portfolio_pnl_pct": str(port_pnl_pct),
+                        "strategy_total": str(st_total),
+                        "strategy_realized": str(realized),
+                        "strategy_unrealized": str(unreal),
+                        "max_dd": str(self.state.extras.get("pnl_max_dd") or "0"),
+                        "quote_asset": str(quote_asset),
+                    })
                 LOG.info("cash=%s eq=%s | %s", str(self.state.cash), str(self.state.strategy_equity()), " | ".join(parts))
 
             except KeyboardInterrupt:
