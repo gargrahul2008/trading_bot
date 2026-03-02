@@ -6,7 +6,7 @@ import time
 from decimal import Decimal
 from typing import Any, Dict, List
 
-from common.broker.interfaces import Broker, PlaceOrderRequest, to_decimal
+from common.broker.interfaces import Broker, PlaceOrderRequest, to_decimal, OrderTerminal
 from common.engine.state import GlobalState
 from common.engine.strategy_base import ReactiveStrategy, ManagedOrderStrategy, OrderIntent
 from common.engine.execution import OrderExecutor, ExecutionConfig
@@ -624,12 +624,24 @@ class GenericRunner:
                     open_orders = list(open_orders.values())
 
                 open_ids = set()
+                order_map = {}
                 for o in (open_orders or []):
                     if not isinstance(o, dict):
                         continue
                     oid = str(o.get("id") or o.get("order_id") or "")
-                    if oid:
-                        open_ids.add(oid)
+                    if not oid:
+                        continue
+                    order_map[oid] = o
+                    status = str(o.get("status") or o.get("orderStatus") or o.get("order_status") or "").upper()
+                    qty = int(o.get("qty") or o.get("quantity") or 0)
+                    filled = int(o.get("filledQty") or o.get("tradedQty") or o.get("filled_qty") or 0)
+                    # treat these as terminal (FYERS returns filled orders in orderbook)
+                    terminal = {"TRADED", "FILLED", "COMPLETE", "REJECTED", "CANCELLED", "CANCELED"}
+                    if status in terminal:
+                        continue
+                    if qty > 0 and filled >= qty:
+                        continue
+                    open_ids.add(oid)
 
                 now_ts = utcnow().isoformat()
 
@@ -643,8 +655,54 @@ class GenericRunner:
                 # 1) detect terminals for tracked orders that disappeared from open orders
                 meta_map: Dict[str, Any] = self.state.extras.get("managed_order_meta", {})  # type: ignore[assignment]
                 for oid, meta in list(meta_map.items()):
+                    # --- partial fill detection: treat any fill > 0 as fill-event ---
                     if str(oid) in open_ids:
-                        continue
+                        o = order_map.get(str(oid))
+                        if isinstance(o, dict):
+                            filled = int(o.get("filledQty") or o.get("tradedQty") or o.get("filled_qty") or 0)
+                            if filled > 0 and not meta.get("partial_handled"):
+                                meta["partial_handled"] = True  # prevent double counting
+
+                                qty = _dec(filled)
+                                avg_px = _dec(o.get("avgPrice") or o.get("averagePrice") or o.get("avg_price") or o.get(
+                                    "tradedPrice") or 0)
+                                sym = str(o.get("symbol") or o.get("tradingSymbol") or meta.get("symbol") or "")
+                                side_val = o.get("side")
+                                side = "BUY" if side_val in (1, "1", "BUY", "B") else "SELL"
+
+                                # cancel remaining qty (best-effort)
+                                try:
+                                    self.broker.cancel_order(str(oid))
+                                except Exception:
+                                    pass
+
+                                # apply fill to state
+                                cum = avg_px * qty if (avg_px > 0 and qty > 0) else D0
+                                self._apply_fill(sym, side, qty, avg_px, cum,
+                                                 reason=str(meta.get("reason") or "managed_partial_fill"),
+                                                 order_id=str(oid), status="FILLED")
+
+                                # notify strategy as FILLED (so it advances levels)
+                                if hasattr(strategy, "on_order_terminal"):
+                                    term = OrderTerminal(
+                                        order_id=str(oid),
+                                        symbol=sym,
+                                        side=side,  # type: ignore
+                                        status="FILLED",
+                                        filled_qty=qty,
+                                        avg_price=avg_px,
+                                        cum_quote_qty=cum,
+                                        message="partial_fill_event",
+                                        ts=utcnow(),
+                                        raw=o,
+                                    )
+                                    try:
+                                        strategy.on_order_terminal(term, meta, self.state)  # type: ignore[attr-defined]
+                                    except Exception as e:
+                                        LOG.warning("strategy.on_order_terminal failed: %s", e)
+
+                                meta_map.pop(str(oid), None)
+                                continue
 
                     try:
                         term = self.exec.poll_terminal(str(oid))
