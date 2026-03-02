@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 from typing import Any, Dict, Tuple
+from decimal import Decimal
 
 from common.broker.auth_db import get_fyers_creds_from_db
 from common.broker.fyers_client import FyersClient
@@ -144,6 +145,28 @@ def main() -> None:
         sync_on_start=bool(ex.get("sync_on_start") or False),
         adopt_broker_inventory=bool(ex.get("adopt_broker_inventory") or False),
     )
+
+    # --- cycle unit quote (per symbol) for fixed_quote ladders ---
+    try:
+        strat = cfg.get("strategy", {}) or {}
+        sizing_mode = str(strat.get("sizing_mode") or "")
+        if sizing_mode == "fixed_quote":
+            per = strat.get("per_symbol") or {}
+            defaults_buy = strat.get("buy_quote")
+            defaults_sell = strat.get("sell_quote")
+
+            unit_map = {}
+            for sym in symbols:
+                ps = per.get(sym) or {}
+                b = ps.get("buy_quote", defaults_buy)
+                s = ps.get("sell_quote", defaults_sell)
+                if b is None or s is None:
+                    continue
+                unit_map[sym] = str(min(Decimal(str(b)), Decimal(str(s))))
+            if unit_map:
+                runner.state.extras["cycle_unit_quote_by_symbol"] = unit_map
+    except Exception:
+        pass
 
     runner_type = (cfg.get("runner_type") or "reactive").lower()
     if runner_type == "managed":

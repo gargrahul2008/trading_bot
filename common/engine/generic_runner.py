@@ -12,7 +12,12 @@ from common.engine.strategy_base import ReactiveStrategy, ManagedOrderStrategy, 
 from common.engine.execution import OrderExecutor, ExecutionConfig
 from common.utils.logger import setup_logger
 from common.utils.timeutils import parse_hhmm, parse_hhmmss, now_local, utcnow
-from common.engine.pnl import PnLWriter, PnLPoint, infer_broker_name, compute_portfolio_value_for_symbols, compute_strategy_pnl, update_drawdown, ensure_portfolio_start
+from common.engine.pnl import (
+    PnLWriter, PnLPoint,
+    infer_broker_name, compute_portfolio_value_for_symbols,
+    compute_strategy_pnl, update_drawdown, ensure_portfolio_start,
+    ensure_today_buckets, update_trade_counters, realized_today,
+)
 
 LOG = setup_logger("runner")
 
@@ -58,51 +63,59 @@ class GenericRunner:
             LOG.warning("Failed writing %s: %s", path, e)
 
     def reconcile_from_broker(self) -> None:
-        """Sync cash and adopt broker inventory into traded_qty (best-effort).
-        - For equities: keeps old behavior (cash from funds, traded qty from sellable)
-        - For crypto spot: traded_qty per symbol = base free+locked from balances
+        """Sync cash + adopt broker inventory into traded_qty (best-effort).
+        - Crypto: uses balances() and symbol_info()
+        - Equities: uses funds_cash() + positions/holdings sellable qty
         """
-        quote_assets = set()
-        base_by_sym = {}
-
-        for sym in self.symbols:
-            info = getattr(self.broker, "symbol_info")(sym)  # MexcSpotClient
-            quote_assets.add(info.quote_asset)
-            base_by_sym[sym] = info.base_asset
-
-        if len(quote_assets) != 1:
-            raise RuntimeError(f"All crypto symbols must share same quote asset. got={sorted(quote_assets)}")
-
-        quote_asset = next(iter(quote_assets))
-        self.state.extras["quote_asset"] = quote_asset
-        bals = self.broker.balances()
-        q = bals.get(quote_asset) or {}
-        self.state.cash = _dec(q.get("free") or "0")
-
-        if not self.adopt_broker_inventory:
-            return
+        # Try crypto path first (balances exist and non-empty)
+        bals = {}
+        try:
+            bals = self.broker.balances() or {}
+        except Exception:
+            bals = {}
 
         if bals:
-            # require MexcSpotClient-like symbol_info if possible
+            # ---- Crypto path ----
+            quote_assets = set()
+            base_by_sym = {}
+
+            for sym in self.symbols:
+                info = getattr(self.broker, "symbol_info")(sym)
+                quote_assets.add(info.quote_asset)
+                base_by_sym[sym] = info.base_asset
+
+            if len(quote_assets) != 1:
+                raise RuntimeError(f"All crypto symbols must share same quote asset. got={sorted(quote_assets)}")
+
+            quote_asset = next(iter(quote_assets))
+            self.state.extras["quote_asset"] = quote_asset
+
+            q = bals.get(quote_asset) or {}
+            self.state.cash = _dec(q.get("free") or "0")
+
+            if not self.adopt_broker_inventory:
+                return
+
             for sym in self.symbols:
                 ss = self.state.symbol_states[sym]
                 ss.core_qty = D0
-                base = None
-                try:
-                    info = getattr(self.broker, "symbol_info")(sym)
-                    base = info.base_asset
-                except Exception:
-                    if sym.endswith("USDT"):
-                        base = sym[:-4]
+                base = base_by_sym.get(sym)
                 total = D0
                 if base and base in bals:
                     total = _dec(bals[base].get("free")) + _dec(bals[base].get("locked"))
                 ss.traded_qty = total
-                # avg price unknown; keep existing or 0
             LOG.info("Adopted crypto balances into traded_qty.")
             return
 
-        # Equities fallback
+        # ---- Equities fallback ----
+        try:
+            self.state.cash = _dec(self.broker.funds_cash())
+        except Exception:
+            pass
+
+        if not self.adopt_broker_inventory:
+            return
+
         from common.broker.sellable_qty import compute_sellable_qty
         pos = self.broker.positions()
         hld = self.broker.holdings()
@@ -215,6 +228,19 @@ class GenericRunner:
         }
         self.state.trades.append(rec)
         self._append_jsonl(self.trades_path, rec)
+        # --- cycles/trade totals today(UTC) + all-time ---
+        try:
+            if qty > 0:
+                eff_cum = cum_quote if cum_quote > 0 else (price * qty)
+                update_trade_counters(
+                    self.state,
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    cum_quote_qty=eff_cum,
+                )
+        except Exception:
+            pass
 
     def _poll_pending(self, symbol: str, current_price: Decimal) -> None:
         ss = self.state.symbol_states[symbol]
@@ -495,6 +521,69 @@ class GenericRunner:
                 dd = update_drawdown(self.state, port_val)
 
                 se, realized, unreal, st_total, exposure, exp_pct = compute_strategy_pnl(self.state)
+                # --- realized today (UTC) baseline + value ---
+                ensure_today_buckets(self.state, realized_now=realized)
+                realized_td = realized_today(self.state, realized_now=realized)
+                # --- deployed (market now/peak) and deployed cost (strategy bucket) ---
+                deployed_market = D0
+
+                # crypto: port_details has quote_total
+                if isinstance(port_details, dict) and port_details.get("quote_total") is not None:
+                    quote_total = Decimal(str(port_details.get("quote_total") or "0"))
+                    deployed_market = port_val - quote_total
+                else:
+                    # equities: sum qty_used*px from port_details
+                    per = (port_details.get("per_symbol") or {}) if isinstance(port_details, dict) else {}
+                    for _, d in per.items():
+                        try:
+                            deployed_market += Decimal(str(d.get("qty_used") or "0")) * Decimal(str(d.get("px") or "0"))
+                        except Exception:
+                            pass
+
+                peak = Decimal(str(self.state.extras.get("deployed_market_peak") or "0"))
+                if deployed_market > peak:
+                    self.state.extras["deployed_market_peak"] = str(deployed_market)
+
+                deployed_cost_strategy = D0
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    deployed_cost_strategy += Decimal(str(ss.traded_qty)) * Decimal(str(ss.traded_avg_price))
+                unit_map = self.state.extras.get("cycle_unit_quote_by_symbol") or {}
+
+                def _cycles_block(store: dict) -> dict:
+                    out = {"per_symbol": {}}
+                    per = (store.get("per_symbol") or {})
+                    for sym, rec in per.items():
+                        buy_q = Decimal(str(rec.get("buy_quote") or "0"))
+                        sell_q = Decimal(str(rec.get("sell_quote") or "0"))
+                        cycle_q = min(buy_q, sell_q)
+                        unit = unit_map.get(sym)
+                        cycles_est = (cycle_q / Decimal(str(unit))) if unit else None
+                        out["per_symbol"][sym] = {
+                            "buy_quote": str(buy_q),
+                            "sell_quote": str(sell_q),
+                            "buy_qty": str(rec.get("buy_qty") or "0"),
+                            "sell_qty": str(rec.get("sell_qty") or "0"),
+                            "cycle_quote": str(cycle_q),
+                            "cycle_unit_quote": str(unit) if unit else None,
+                            "cycles_est": str(cycles_est) if cycles_est is not None else None,
+                        }
+                    return out
+
+                cycles_today_store = self.state.extras.get("cycles_today") or {"per_symbol": {}}
+                cycles_all_store = self.state.extras.get("cycles_all_time") or {"per_symbol": {}}
+
+                cycles_today_out = {
+                    "date_utc": self.state.extras.get("cycles_today_utc_date"),
+                    **_cycles_block(cycles_today_store),
+                }
+                cycles_all_out = _cycles_block(cycles_all_store)
+                holdings_out = {
+                    "quote_total": str(port_details.get("quote_total")) if isinstance(port_details,
+                                                                                      dict) and port_details.get(
+                        "quote_total") is not None else None,
+                    "per_symbol": (port_details.get("per_symbol") if isinstance(port_details, dict) else {}),
+                }
 
                 pt = PnLPoint(
                     ts=utcnow().isoformat(),
@@ -514,17 +603,20 @@ class GenericRunner:
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
 
-                snap = {
-                    "ts": pt.ts,
-                    "broker": broker_name,
-                    "quote_asset": str(quote_asset),
-                    "portfolio_value": str(port_val),
-                    "portfolio_pnl": str(port_pnl),
-                    "portfolio_pnl_pct": str(port_pnl_pct),
-                    "drawdown_pct": str(dd),
-                    "portfolio_details": port_details,
-                    "symbols": {},
-                }
+                snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
+                        "portfolio_value": str(port_val), "portfolio_pnl": str(port_pnl),
+                        "portfolio_pnl_pct": str(port_pnl_pct), "drawdown_pct": str(dd),
+                        "portfolio_details": port_details, "symbols": {}, "created": {
+                        "strategy_realized_today": str(realized_td),
+                        "strategy_realized_all_time": str(realized),
+                        "strategy_unrealized_now": str(unreal),
+                        "strategy_total_now": str(st_total),
+                    }, "deployed": {
+                        "deployed_market_now": str(deployed_market),
+                        "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
+                        "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                        "quote_asset": str(quote_asset),
+                    }, "cycles_today": cycles_today_out, "cycles_all_time": cycles_all_out, "holdings": holdings_out}
                 for s in self.symbols:
                     ss = self.state.symbol_states[s]
                     px = self.state.last_prices.get(s, D0)
@@ -540,17 +632,31 @@ class GenericRunner:
                     }
                 if self._pnl_writer:
                     self._pnl_writer.write_snapshot(snap)
-                    self._pnl_writer.write_summary({
+                    summary_out = {
                         "ts": pt.ts,
                         "portfolio_value": str(port_val),
                         "portfolio_pnl": str(port_pnl),
                         "portfolio_pnl_pct": str(port_pnl_pct),
-                        "strategy_total": str(st_total),
-                        "strategy_realized": str(realized),
-                        "strategy_unrealized": str(unreal),
                         "max_dd": str(self.state.extras.get("pnl_max_dd") or "0"),
                         "quote_asset": str(quote_asset),
-                    })
+
+                        "created": {
+                            "strategy_realized_today": str(realized_td),
+                            "strategy_realized_all_time": str(realized),
+                            "strategy_unrealized_now": str(unreal),
+                            "strategy_total_now": str(st_total),
+                        },
+                        "deployed": {
+                            "deployed_market_now": str(deployed_market),
+                            "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
+                            "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                            "quote_asset": str(quote_asset),
+                        },
+                        "cycles_today": cycles_today_out,
+                        "cycles_all_time": cycles_all_out,
+                        "holdings": holdings_out,
+                    }
+                    self._pnl_writer.write_summary(summary_out)
                 LOG.info("cash=%s eq=%s%s | %s", str(self.state.cash), str(self.state.strategy_equity()), pv_str, " | ".join(parts))
 
             except KeyboardInterrupt:
@@ -616,6 +722,7 @@ class GenericRunner:
                 for sym, px in prices.items():
                     self.state.last_prices[sym] = _dec(px)
                     self.state.symbol_states[sym].last_mark_price = _dec(px)
+                self._update_extras_crypto(prices)
 
                 # fetch open orders once
                 ob = self.broker.orderbook()
@@ -787,6 +894,70 @@ class GenericRunner:
                 dd = update_drawdown(self.state, port_val)
 
                 se, realized, unreal, st_total, exposure, exp_pct = compute_strategy_pnl(self.state)
+                # --- realized today (UTC) baseline + value ---
+                ensure_today_buckets(self.state, realized_now=realized)
+                realized_td = realized_today(self.state, realized_now=realized)
+                # --- deployed (market now/peak) and deployed cost (strategy bucket) ---
+                deployed_market = D0
+
+                # crypto: port_details has quote_total
+                if isinstance(port_details, dict) and port_details.get("quote_total") is not None:
+                    quote_total = Decimal(str(port_details.get("quote_total") or "0"))
+                    deployed_market = port_val - quote_total
+                else:
+                    # equities: sum qty_used*px from port_details
+                    per = (port_details.get("per_symbol") or {}) if isinstance(port_details, dict) else {}
+                    for _, d in per.items():
+                        try:
+                            deployed_market += Decimal(str(d.get("qty_used") or "0")) * Decimal(str(d.get("px") or "0"))
+                        except Exception:
+                            pass
+
+                peak = Decimal(str(self.state.extras.get("deployed_market_peak") or "0"))
+                if deployed_market > peak:
+                    self.state.extras["deployed_market_peak"] = str(deployed_market)
+
+                deployed_cost_strategy = D0
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    deployed_cost_strategy += Decimal(str(ss.traded_qty)) * Decimal(str(ss.traded_avg_price))
+                unit_map = self.state.extras.get("cycle_unit_quote_by_symbol") or {}
+
+                def _cycles_block(store: dict) -> dict:
+                    out = {"per_symbol": {}}
+                    per = (store.get("per_symbol") or {})
+                    for sym, rec in per.items():
+                        buy_q = Decimal(str(rec.get("buy_quote") or "0"))
+                        sell_q = Decimal(str(rec.get("sell_quote") or "0"))
+                        cycle_q = min(buy_q, sell_q)
+                        unit = unit_map.get(sym)
+                        cycles_est = (cycle_q / Decimal(str(unit))) if unit else None
+                        out["per_symbol"][sym] = {
+                            "buy_quote": str(buy_q),
+                            "sell_quote": str(sell_q),
+                            "buy_qty": str(rec.get("buy_qty") or "0"),
+                            "sell_qty": str(rec.get("sell_qty") or "0"),
+                            "cycle_quote": str(cycle_q),
+                            "cycle_unit_quote": str(unit) if unit else None,
+                            "cycles_est": str(cycles_est) if cycles_est is not None else None,
+                        }
+                    return out
+
+                cycles_today_store = self.state.extras.get("cycles_today") or {"per_symbol": {}}
+                cycles_all_store = self.state.extras.get("cycles_all_time") or {"per_symbol": {}}
+
+                cycles_today_out = {
+                    "date_utc": self.state.extras.get("cycles_today_utc_date"),
+                    **_cycles_block(cycles_today_store),
+                }
+                cycles_all_out = _cycles_block(cycles_all_store)
+
+                holdings_out = {
+                    "quote_total": str(port_details.get("quote_total")) if isinstance(port_details,
+                                                                                      dict) and port_details.get(
+                        "quote_total") is not None else None,
+                    "per_symbol": (port_details.get("per_symbol") if isinstance(port_details, dict) else {}),
+                }
 
                 pt = PnLPoint(
                     ts=utcnow().isoformat(),
@@ -806,17 +977,20 @@ class GenericRunner:
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
 
-                snap = {
-                    "ts": pt.ts,
-                    "broker": broker_name,
-                    "quote_asset": str(quote_asset),
-                    "portfolio_value": str(port_val),
-                    "portfolio_pnl": str(port_pnl),
-                    "portfolio_pnl_pct": str(port_pnl_pct),
-                    "drawdown_pct": str(dd),
-                    "portfolio_details": port_details,
-                    "symbols": {},
-                }
+                snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
+                        "portfolio_value": str(port_val), "portfolio_pnl": str(port_pnl),
+                        "portfolio_pnl_pct": str(port_pnl_pct), "drawdown_pct": str(dd),
+                        "portfolio_details": port_details, "symbols": {}, "created": {
+                        "strategy_realized_today": str(realized_td),
+                        "strategy_realized_all_time": str(realized),
+                        "strategy_unrealized_now": str(unreal),
+                        "strategy_total_now": str(st_total),
+                    }, "deployed": {
+                        "deployed_market_now": str(deployed_market),
+                        "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
+                        "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                        "quote_asset": str(quote_asset),
+                    }, "cycles_today": cycles_today_out, "cycles_all_time": cycles_all_out, "holdings": holdings_out}
                 for s in self.symbols:
                     ss = self.state.symbol_states[s]
                     px = self.state.last_prices.get(s, D0)
@@ -832,17 +1006,31 @@ class GenericRunner:
                     }
                 if self._pnl_writer:
                     self._pnl_writer.write_snapshot(snap)
-                    self._pnl_writer.write_summary({
+                    summary_out = {
                         "ts": pt.ts,
                         "portfolio_value": str(port_val),
                         "portfolio_pnl": str(port_pnl),
                         "portfolio_pnl_pct": str(port_pnl_pct),
-                        "strategy_total": str(st_total),
-                        "strategy_realized": str(realized),
-                        "strategy_unrealized": str(unreal),
                         "max_dd": str(self.state.extras.get("pnl_max_dd") or "0"),
                         "quote_asset": str(quote_asset),
-                    })
+
+                        "created": {
+                            "strategy_realized_today": str(realized_td),
+                            "strategy_realized_all_time": str(realized),
+                            "strategy_unrealized_now": str(unreal),
+                            "strategy_total_now": str(st_total),
+                        },
+                        "deployed": {
+                            "deployed_market_now": str(deployed_market),
+                            "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
+                            "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                            "quote_asset": str(quote_asset),
+                        },
+                        "cycles_today": cycles_today_out,
+                        "cycles_all_time": cycles_all_out,
+                        "holdings": holdings_out,
+                    }
+                    self._pnl_writer.write_summary(summary_out)
                 LOG.info("cash=%s eq=%s | %s", str(self.state.cash), str(self.state.strategy_equity()), " | ".join(parts))
 
             except KeyboardInterrupt:

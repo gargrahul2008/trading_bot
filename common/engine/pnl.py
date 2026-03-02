@@ -227,3 +227,74 @@ def ensure_portfolio_start(state, portfolio_value: Decimal) -> Decimal:
     except Exception:
         state.extras["portfolio_start_value"] = str(portfolio_value)
         return portfolio_value
+
+
+def _today_utc_date() -> str:
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
+def ensure_today_buckets(state, *, realized_now: Decimal) -> None:
+    """
+    Ensures 'today (UTC)' buckets exist and resets them at UTC midnight.
+    Also stores realized baseline for 'realized_today' computation.
+    """
+    today = _today_utc_date()
+
+    if state.extras.get("cycles_today_utc_date") != today:
+        state.extras["cycles_today_utc_date"] = today
+        state.extras["cycles_today"] = {"per_symbol": {}}
+
+    if state.extras.get("realized_today_utc_date") != today:
+        state.extras["realized_today_utc_date"] = today
+        state.extras["realized_today_base"] = str(realized_now)
+
+
+def update_trade_counters(
+    state,
+    *,
+    symbol: str,
+    side: str,
+    qty: Decimal,
+    cum_quote_qty: Decimal,
+) -> None:
+    """
+    Updates:
+      - cycles_today (UTC day)
+      - cycles_all_time (since this state file started)
+    """
+    # today bucket must exist
+    realized_now = Decimal(str(state.total_realized())) if hasattr(state, "total_realized") else D0
+    ensure_today_buckets(state, realized_now=realized_now)
+
+    # all-time bucket
+    all_time = state.extras.setdefault("cycles_all_time", {"per_symbol": {}})
+    all_per = all_time.setdefault("per_symbol", {})
+    all_rec = all_per.setdefault(symbol, {"buy_quote": "0", "sell_quote": "0", "buy_qty": "0", "sell_qty": "0"})
+
+    # today bucket
+    today_store = state.extras.setdefault("cycles_today", {"per_symbol": {}})
+    td_per = today_store.setdefault("per_symbol", {})
+    td_rec = td_per.setdefault(symbol, {"buy_quote": "0", "sell_quote": "0", "buy_qty": "0", "sell_qty": "0"})
+
+    s = side.upper()
+    if s == "BUY":
+        all_rec["buy_quote"] = str(Decimal(all_rec["buy_quote"]) + cum_quote_qty)
+        all_rec["buy_qty"] = str(Decimal(all_rec["buy_qty"]) + qty)
+
+        td_rec["buy_quote"] = str(Decimal(td_rec["buy_quote"]) + cum_quote_qty)
+        td_rec["buy_qty"] = str(Decimal(td_rec["buy_qty"]) + qty)
+    else:
+        all_rec["sell_quote"] = str(Decimal(all_rec["sell_quote"]) + cum_quote_qty)
+        all_rec["sell_qty"] = str(Decimal(all_rec["sell_qty"]) + qty)
+
+        td_rec["sell_quote"] = str(Decimal(td_rec["sell_quote"]) + cum_quote_qty)
+        td_rec["sell_qty"] = str(Decimal(td_rec["sell_qty"]) + qty)
+
+
+def realized_today(state, *, realized_now: Decimal) -> Decimal:
+    """
+    realized_today = realized_now - realized_today_base (reset at UTC midnight)
+    """
+    ensure_today_buckets(state, realized_now=realized_now)
+    base = Decimal(str(state.extras.get("realized_today_base") or "0"))
+    return realized_now - base
