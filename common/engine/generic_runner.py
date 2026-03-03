@@ -93,18 +93,19 @@ class GenericRunner:
             q = bals.get(quote_asset) or {}
             self.state.cash = _dec(q.get("free") or "0")
 
-            if not self.adopt_broker_inventory:
-                return
-
-            for sym in self.symbols:
-                ss = self.state.symbol_states[sym]
-                ss.core_qty = D0
-                base = base_by_sym.get(sym)
-                total = D0
-                if base and base in bals:
-                    total = _dec(bals[base].get("free")) + _dec(bals[base].get("locked"))
-                ss.traded_qty = total
-            LOG.info("Adopted crypto balances into traded_qty.")
+            # if not self.adopt_broker_inventory:
+            #     return
+            #
+            # for sym in self.symbols:
+            #     ss = self.state.symbol_states[sym]
+            #     ss.core_qty = D0
+            #     base = base_by_sym.get(sym)
+            #     total = D0
+            #     if base and base in bals:
+            #         total = _dec(bals[base].get("free")) + _dec(bals[base].get("locked"))
+            #     ss.traded_qty = total
+            # LOG.info("Adopted crypto balances into traded_qty.")
+            LOG.info("Crypto reconcile: cash synced from balances; strategy inventory NOT adopted from broker.")
             return
 
         # ---- Equities fallback ----
