@@ -115,6 +115,7 @@ def main() -> None:
         limit_ttl_seconds=int(ex.get("limit_ttl_seconds") or 15),
         max_place_retries=int(ex.get("max_place_retries") or 3),
         quote_reserve=to_decimal(ex.get("quote_reserve_usdt") or ex.get("quote_reserve") or 0),
+        use_inventory_buffer=bool(ex.get("use_inventory_buffer", False)),
     )
 
     state = GlobalState.load(state_path)

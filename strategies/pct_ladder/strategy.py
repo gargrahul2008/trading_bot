@@ -105,7 +105,8 @@ class LadderPctStrategy:
                     intents.append(OrderIntent(sym, "BUY", qty, f"ltp<=ref-{self.cfg.lower_pct}%"))
                 continue
 
-            if ltp >= sell_thr and _dec(ss.traded_qty) > 0:
+            allow_buffer = bool(state.extras.get("use_inventory_buffer"))
+            if ltp >= sell_thr and (_dec(ss.traded_qty) > 0 or allow_buffer):
                 qty = D0
                 if self.cfg.sizing_mode == "fixed_qty":
                     qty = _dec(self.cfg.fixed_qty_sell)
@@ -120,7 +121,10 @@ class LadderPctStrategy:
                     order_value = (_dec(self.cfg.sell_trade_pct) / Decimal("100")) * base
                     qty = order_value / (ltp if ltp > 0 else Decimal("1e-9"))
 
-                qty = min(qty, _dec(ss.traded_qty))
+                # If buffer is OFF -> cap to strategy inventory
+                if not allow_buffer:
+                    qty = min(qty, _dec(ss.traded_qty))
+
                 qty = self._round_qty(qty)
                 if qty > 0:
                     intents.append(OrderIntent(sym, "SELL", qty, f"ltp>=ref+{self.cfg.upper_pct}%"))

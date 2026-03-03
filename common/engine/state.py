@@ -16,6 +16,10 @@ def to_decimal(x: Any, default: Decimal = D0) -> Decimal:
     except Exception:
         return default
 
+
+def _dec(x: Any) -> Decimal:
+    return to_decimal(x)
+
 @dataclass
 class SymbolState:
     initialized: bool = False
@@ -28,6 +32,8 @@ class SymbolState:
     pending_reason: Optional[str] = None
     pending_since: Optional[str] = None  # UTC ISO
     last_mark_price: Optional[Decimal] = None
+    borrowed_qty: Decimal = D0
+    borrowed_avg_sell: Decimal = D0
 
 @dataclass
 class GlobalState:
@@ -106,17 +112,21 @@ class GlobalState:
             px = self.last_prices.get(sym) or ss.last_mark_price
             if px is None:
                 continue
-            exp += ss.traded_qty * px
-        return exp
+            px = _dec(px)
+            net_qty = _dec(ss.traded_qty) - _dec(getattr(ss, "borrowed_qty", D0))
+            exp += abs(net_qty) * px
+        return _dec(exp)
 
     def strategy_equity(self) -> Decimal:
-        eq = self.cash
+        eq = _dec(self.cash)
         for sym, ss in self.symbol_states.items():
             px = self.last_prices.get(sym) or ss.last_mark_price
             if px is None:
                 continue
-            eq += ss.traded_qty * px
-        return eq
+            px = _dec(px)
+            net_qty = _dec(ss.traded_qty) - _dec(getattr(ss, "borrowed_qty", D0))
+            eq += net_qty * px
+        return _dec(eq)
 
     def total_realized(self) -> Decimal:
         return sum((ss.realized_pnl for ss in self.symbol_states.values()), D0)
@@ -125,7 +135,19 @@ class GlobalState:
         total = D0
         for sym, ss in self.symbol_states.items():
             px = self.last_prices.get(sym) or ss.last_mark_price
-            if px is None or ss.traded_qty <= 0:
+            if px is None:
                 continue
-            total += ss.traded_qty * (px - ss.traded_avg_price)
-        return total
+            px = _dec(px)
+
+            traded_qty = _dec(ss.traded_qty)
+            borrowed_qty = _dec(getattr(ss, "borrowed_qty", D0))
+
+            # long unrealized
+            if traded_qty > 0:
+                total += traded_qty * (px - _dec(ss.traded_avg_price))
+
+            # short/buffer unrealized (sold-first)
+            if borrowed_qty > 0:
+                total += borrowed_qty * (_dec(getattr(ss, "borrowed_avg_sell", D0)) - px)
+
+        return _dec(total)

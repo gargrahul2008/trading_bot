@@ -25,6 +25,7 @@ class ExecutionConfig:
 
     max_place_retries: int = 3
     quote_reserve: Decimal = D0         # keep some quote cash unused (USDT/INR etc)
+    use_inventory_buffer: bool = False
 
 class OrderExecutor:
     def __init__(self, broker: Broker, state, cfg: ExecutionConfig, *, rejects_path: str):

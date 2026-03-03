@@ -38,6 +38,7 @@ class GenericRunner:
         self.symbols = symbols
         self.exec = OrderExecutor(broker, state, exec_cfg, rejects_path=rejects_path)
         self.exec_cfg = exec_cfg
+        self.state.extras["use_inventory_buffer"] = bool(exec_cfg.use_inventory_buffer)
         self.trades_path = trades_path
         self.market_tz = market_tz
         self.open_t = parse_hhmm(market_open)
@@ -91,7 +92,9 @@ class GenericRunner:
             self.state.extras["quote_asset"] = quote_asset
 
             q = bals.get(quote_asset) or {}
-            self.state.cash = _dec(q.get("free") or "0")
+            if not self.state.extras.get("strategy_cash_initialized"):
+                self.state.cash = _dec(q.get("free") or "0")
+                self.state.extras["strategy_cash_initialized"] = True
 
             # if not self.adopt_broker_inventory:
             #     return
@@ -185,24 +188,56 @@ class GenericRunner:
             ss.pending_reason = None
             ss.pending_since = None
         else:
-            if side == "BUY":
-                # Prefer cum_quote if provided (crypto). Else compute.
-                cost = cum_quote if cum_quote > 0 else (price * qty)
-                self.state.cash -= cost
-                old_qty = ss.traded_qty
-                new_qty = old_qty + qty
-                if new_qty > 0:
-                    ss.traded_avg_price = ((ss.traded_avg_price * old_qty) + (price * qty)) / new_qty
-                ss.traded_qty = new_qty
-            else:
+            if side == "SELL":
                 proceeds = cum_quote if cum_quote > 0 else (price * qty)
                 self.state.cash += proceeds
-                sell_qty = min(qty, ss.traded_qty) if ss.traded_qty > 0 else qty
-                realized_delta = sell_qty * (price - ss.traded_avg_price)
-                ss.realized_pnl += realized_delta
-                ss.traded_qty = max(ss.traded_qty - sell_qty, D0)
-                if ss.traded_qty == 0:
-                    ss.traded_avg_price = D0
+
+                # 1) sell from strategy inventory first
+                sell_from_traded = min(qty, ss.traded_qty) if ss.traded_qty > 0 else D0
+                if sell_from_traded > 0:
+                    realized_delta = sell_from_traded * (price - ss.traded_avg_price)
+                    ss.realized_pnl += realized_delta
+
+                    ss.traded_qty = ss.traded_qty - sell_from_traded
+                    if ss.traded_qty <= 0:
+                        ss.traded_qty = D0
+                        ss.traded_avg_price = D0
+
+                # 2) remainder is "borrowed" (sell-first buffer)
+                sell_from_borrow = qty - sell_from_traded
+                if sell_from_borrow > 0:
+                    old_b = ss.borrowed_qty
+                    new_b = old_b + sell_from_borrow
+                    if new_b > 0:
+                        ss.borrowed_avg_sell = ((ss.borrowed_avg_sell * old_b) + (price * sell_from_borrow)) / new_b
+                    ss.borrowed_qty = new_b
+
+            else:  # BUY
+                cost = cum_quote if cum_quote > 0 else (price * qty)
+                self.state.cash -= cost
+
+                remaining = qty
+
+                # 1) cover borrowed first (realized happens here)
+                if ss.borrowed_qty > 0:
+                    cover = min(remaining, ss.borrowed_qty)
+                    if cover > 0:
+                        realized_delta = cover * (ss.borrowed_avg_sell - price)
+                        ss.realized_pnl += realized_delta
+
+                        ss.borrowed_qty = ss.borrowed_qty - cover
+                        remaining = remaining - cover
+                        if ss.borrowed_qty <= 0:
+                            ss.borrowed_qty = D0
+                            ss.borrowed_avg_sell = D0
+
+                # 2) leftover adds to strategy inventory
+                if remaining > 0:
+                    old_qty = ss.traded_qty
+                    new_qty = old_qty + remaining
+                    if new_qty > 0:
+                        ss.traded_avg_price = ((ss.traded_avg_price * old_qty) + (price * remaining)) / new_qty
+                    ss.traded_qty = new_qty
 
             ss.reference_price = price
             ss.pending_order_id = None
@@ -226,6 +261,9 @@ class GenericRunner:
             "traded_avg_after": str(ss.traded_avg_price),
             "realized_pnl_after": str(ss.realized_pnl),
             "reference_after": str(ss.reference_price) if ss.reference_price is not None else None,
+            "borrowed_qty_after": str(ss.borrowed_qty),
+            "borrowed_avg_sell_after": str(ss.borrowed_avg_sell),
+            "net_qty_after": str(ss.traded_qty - ss.borrowed_qty),
         }
         self.state.trades.append(rec)
         self._append_jsonl(self.trades_path, rec)
@@ -402,6 +440,20 @@ class GenericRunner:
                 if qty <= 0:
                     return
 
+        # SELL cap for crypto (buffer inventory protection)
+        if intent.side == "SELL" and hasattr(self.broker, "balances") and hasattr(self.broker, "symbol_info"):
+            try:
+                bals = self.broker.balances() or {}
+                info = self.broker.symbol_info(intent.symbol)
+                base = info.base_asset
+                base_free = _dec((bals.get(base) or {}).get("free"))
+                if base_free <= 0:
+                    return  # nothing sellable -> skip
+                qty = min(qty, base_free)
+                if qty <= 0:
+                    return
+            except Exception:
+                pass
         # Determine order type and limit px based on execution config
         mode = (self.exec_cfg.order_mode or "market").lower()
         if mode == "marketable_limit":
@@ -630,6 +682,9 @@ class GenericRunner:
                         "unrealized": str((ss.traded_qty * (px - ss.traded_avg_price)) if (px is not None) else D0),
                         "pending_order_id": ss.pending_order_id,
                         "pending_reason": ss.pending_reason,
+                        "borrowed_qty": str(ss.borrowed_qty),
+                        "borrowed_avg_sell": str(ss.borrowed_avg_sell),
+                        "net_qty": str(ss.traded_qty - ss.borrowed_qty),
                     }
                 if self._pnl_writer:
                     self._pnl_writer.write_snapshot(snap)
@@ -1004,6 +1059,9 @@ class GenericRunner:
                         "unrealized": str((ss.traded_qty * (px - ss.traded_avg_price)) if (px is not None) else D0),
                         "pending_order_id": ss.pending_order_id,
                         "pending_reason": ss.pending_reason,
+                        "borrowed_qty": str(ss.borrowed_qty),
+                        "borrowed_avg_sell": str(ss.borrowed_avg_sell),
+                        "net_qty": str(ss.traded_qty - ss.borrowed_qty),
                     }
                 if self._pnl_writer:
                     self._pnl_writer.write_snapshot(snap)
