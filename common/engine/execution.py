@@ -140,9 +140,14 @@ class OrderExecutor:
 
         if side == "SELL":
             sellable = self.compute_broker_sellable(symbol)
-            ss = self.state.symbol_states.get(symbol)
-            state_cap = Decimal(ss.traded_qty) if ss else sellable
-            qty = min(qty, sellable, state_cap) if state_cap > 0 else min(qty, sellable)
+            allow_buffer = bool(self.state.extras.get("use_inventory_buffer"))
+
+            if allow_buffer:
+                qty = min(qty, sellable)
+            else:
+                ss = self.state.symbol_states.get(symbol)
+                state_cap = Decimal(ss.traded_qty) if ss else sellable
+                qty = min(qty, sellable, state_cap) if state_cap > 0 else min(qty, sellable)
             if qty <= 0:
                 LOG.warning("SELL qty capped to 0 for %s. Skipping.", symbol)
                 return None
