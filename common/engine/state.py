@@ -34,6 +34,8 @@ class SymbolState:
     last_mark_price: Optional[Decimal] = None
     borrowed_qty: Decimal = D0
     borrowed_avg_sell: Decimal = D0
+    pending_expected_price: Optional[Decimal] = None
+    pending_expected_source: Optional[str] = None
 
 @dataclass
 class GlobalState:

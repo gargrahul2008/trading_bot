@@ -244,6 +244,16 @@ class GenericRunner:
             ss.pending_reason = None
             ss.pending_since = None
 
+        expected = _dec(ss.pending_expected_price) if ss.pending_expected_price is not None else D0
+        expected_src = ss.pending_expected_source or None
+
+        # slippage bps: positive = worse
+        slip_bps = None
+        if expected > 0 and qty > 0 and price > 0:
+            if side == "BUY":
+                slip_bps = (price - expected) / expected * Decimal("10000")
+            else:  # SELL
+                slip_bps = (expected - price) / expected * Decimal("10000")
         rec = {
             "ts": utcnow().isoformat(),
             "event": "FILL" if qty > 0 else "ORDER_TERMINAL",
@@ -264,6 +274,9 @@ class GenericRunner:
             "borrowed_qty_after": str(ss.borrowed_qty),
             "borrowed_avg_sell_after": str(ss.borrowed_avg_sell),
             "net_qty_after": str(ss.traded_qty - ss.borrowed_qty),
+            "expected_price": str(expected) if expected and expected > 0 else None,
+            "expected_source": expected_src,
+            "slippage_bps": str(slip_bps) if slip_bps is not None else None,
         }
         self.state.trades.append(rec)
         self._append_jsonl(self.trades_path, rec)
@@ -280,6 +293,8 @@ class GenericRunner:
                 )
         except Exception:
             pass
+        ss.pending_expected_price = None
+        ss.pending_expected_source = None
 
     def _poll_pending(self, symbol: str, current_price: Decimal) -> None:
         ss = self.state.symbol_states[symbol]
@@ -407,6 +422,7 @@ class GenericRunner:
             return
         quote = self.state.extras.get("quote_asset") or "USDC"  # fallback
         qfree = _dec((bals.get(quote) or {}).get("free"))
+        self.state.cash = qfree
         qlock = _dec((bals.get(quote) or {}).get("locked"))
         quote_total = qfree + qlock
 
@@ -489,6 +505,15 @@ class GenericRunner:
                 product_type=self.exec_cfg.product_type,
                 order_type="MARKET",
             )
+        # expected price for slippage tracking
+        if getattr(req, "order_type", "").upper() == "LIMIT" and getattr(req, "limit_price", None):
+            exp = _dec(req.limit_price)
+            src = "limit_price"
+        else:
+            exp = _dec(ltp)
+            src = "ltp"
+        ss.pending_expected_price = exp
+        ss.pending_expected_source = src
 
         oid = self.exec.place_with_adaptive_qty(req, reason=intent.reason)
         if oid:
