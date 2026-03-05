@@ -9,16 +9,12 @@
     "secrets_file": "secrets/mexc_spot.json"
   },
   "strategy": {
-    "symbols": [
-      "BTCUSDT",
-      "ETHUSDT",
-      "SOLUSDT"
-    ],
+    "symbols": ["ETHUSDT"],
     "upper_pct": 1.0,
     "lower_pct": 1.0,
     "sizing_mode": "fixed_quote",
-    "buy_quote_usdt": 50,
-    "sell_quote_usdt": 60,
+    "buy_quote": 300,
+    "sell_quote": 290,
     "qty_step": 1e-06,
     "min_qty": 1e-06
   },
@@ -29,11 +25,15 @@
     "limit_ttl_seconds": 15,
     "quote_reserve_usdt": 25,
     "sync_on_start": true,
-    "adopt_broker_inventory": true
+    "adopt_broker_inventory": true,
+    "use_inventory_buffer": true,
+    "reconcile_crypto_balances": true,
+    "bot_only_pnl": true
   },
   "paths": {
     "state_path": "state/mexc_state.json",
     "trades_path": "state/mexc_trades.jsonl",
-    "rejects_path": "state/mexc_rejects.jsonl"
+    "rejects_path": "state/mexc_rejects.jsonl",
+    "manual_adjustments_path": "state/manual_adjustments.jsonl"
   }
 }

@@ -78,6 +78,8 @@ class GlobalState:
                 pending_reason=ss.get("pending_reason"),
                 pending_since=ss.get("pending_since"),
                 last_mark_price=to_decimal(ss.get("last_mark_price")) if ss.get("last_mark_price") is not None else None,
+                borrowed_qty=to_decimal(ss.get("borrowed_qty", "0")),
+                borrowed_avg_sell=to_decimal(ss.get("borrowed_avg_sell", "0")),
             )
 
         last_prices = {k: to_decimal(v) for k, v in (raw.get("last_prices") or {}).items()}

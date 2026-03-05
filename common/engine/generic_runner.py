@@ -32,7 +32,7 @@ class GenericRunner:
     def __init__(self, *, broker: Broker, state: GlobalState, symbols: List[str], exec_cfg: ExecutionConfig,
                  trades_path: str, rejects_path: str, market_tz: str, market_open: str, market_close: str,
                  eod_cancel_time: str, poll_seconds: int, closed_poll_seconds: int, cancel_all_open_orders: bool,
-                 sync_on_start: bool, adopt_broker_inventory: bool):
+                 sync_on_start: bool, adopt_broker_inventory: bool, manual_adjustments_path: str | None = None):
         self.broker = broker
         self.state = state
         self.symbols = symbols
@@ -40,6 +40,7 @@ class GenericRunner:
         self.exec_cfg = exec_cfg
         self.state.extras["use_inventory_buffer"] = bool(exec_cfg.use_inventory_buffer)
         self.trades_path = trades_path
+        self.manual_adjustments_path = manual_adjustments_path
         self.market_tz = market_tz
         self.open_t = parse_hhmm(market_open)
         self.close_t = parse_hhmm(market_close)
@@ -55,6 +56,8 @@ class GenericRunner:
             snapshot_path=os.path.join(base_dir, "positions_snapshot.json"),
             summary_path=os.path.join(base_dir, "pnl_summary.json"),
         )
+        if self.manual_adjustments_path:
+            os.makedirs(os.path.dirname(self.manual_adjustments_path) or ".", exist_ok=True)
 
     def _append_jsonl(self, path: str, rec: Dict[str, Any]) -> None:
         try:
@@ -427,13 +430,46 @@ class GenericRunner:
         quote_total = qfree + qlock
 
         total = quote_total
+        per_symbol_totals: Dict[str, Dict[str, Decimal]] = {}
         for sym, px in prices.items():
             info = getattr(self.broker, "symbol_info")(sym)
             base = info.base_asset
             base_total = _dec((bals.get(base) or {}).get("free")) + _dec((bals.get(base) or {}).get("locked"))
             total += base_total * _dec(px)
+            per_symbol_totals[sym] = {"base": str(base), "base_total": base_total, "px": _dec(px)}
         self.state.extras["portfolio_value"] = str(total)
         self.state.extras["quote_asset"] = str(quote)
+        if self.state.extras.get("reconcile_crypto_balances"):
+            self._reconcile_manual_inventory(per_symbol_totals, quote_asset=str(quote))
+
+    def _reconcile_manual_inventory(self, per_symbol_totals: Dict[str, Dict[str, Decimal]], *, quote_asset: str) -> None:
+        manual_map = self.state.extras.setdefault("manual_inventory_by_symbol", {})
+        ts = utcnow().isoformat()
+        for sym, d in per_symbol_totals.items():
+            base_total = _dec(d.get("base_total") or 0)
+            ss = self.state.symbol_states.get(sym)
+            bot_net = D0
+            if ss is not None:
+                bot_net = _dec(ss.traded_qty) - _dec(getattr(ss, "borrowed_qty", D0))
+            manual_qty = base_total - bot_net
+            prev = _dec(manual_map.get(sym, "0"))
+            if manual_qty != prev:
+                manual_map[sym] = str(manual_qty)
+                if self.manual_adjustments_path:
+                    rec = {
+                        "ts": ts,
+                        "event": "MANUAL_BALANCE_RECONCILE",
+                        "symbol": sym,
+                        "base_asset": str(d.get("base") or ""),
+                        "quote_asset": quote_asset,
+                        "base_total": str(base_total),
+                        "bot_net_qty": str(bot_net),
+                        "manual_qty": str(manual_qty),
+                        "manual_delta": str(manual_qty - prev),
+                        "px": str(_dec(d.get("px") or 0)),
+                        "reason": "balance_reconcile",
+                    }
+                    self._append_jsonl(self.manual_adjustments_path, rec)
 
     def _place_intent(self, intent: OrderIntent, *, ltp: Decimal) -> None:
         ss = self.state.symbol_states[intent.symbol]
@@ -602,6 +638,10 @@ class GenericRunner:
                 # --- realized today (UTC) baseline + value ---
                 ensure_today_buckets(self.state, realized_now=realized)
                 realized_td = realized_today(self.state, realized_now=realized)
+                non_strategy_value = port_val - se
+                non_strategy_pct = (non_strategy_value / port_val) if port_val > 0 else D0
+                non_strategy_value = port_val - se
+                non_strategy_pct = (non_strategy_value / port_val) if port_val > 0 else D0
                 # --- deployed (market now/peak) and deployed cost (strategy bucket) ---
                 deployed_market = D0
 
@@ -681,6 +721,7 @@ class GenericRunner:
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
 
+                manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
                 snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
                         "portfolio_value": str(port_val), "portfolio_pnl": str(port_pnl),
                         "portfolio_pnl_pct": str(port_pnl_pct), "drawdown_pct": str(dd),
@@ -689,7 +730,16 @@ class GenericRunner:
                         "strategy_realized_all_time": str(realized),
                         "strategy_unrealized_now": str(unreal),
                         "strategy_total_now": str(st_total),
-                    }, "deployed": {
+                    }, "bot": {
+                        "equity": str(se),
+                        "realized_today": str(realized_td),
+                        "realized_all_time": str(realized),
+                        "unrealized_now": str(unreal),
+                        "total_now": str(st_total),
+                    }, "non_strategy": {
+                        "value_est": str(non_strategy_value),
+                        "value_pct_est": str(non_strategy_pct),
+                    }, "manual_inventory_by_symbol": manual_map, "deployed": {
                         "deployed_market_now": str(deployed_market),
                         "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
                         "deployed_cost_strategy_now": str(deployed_cost_strategy),
@@ -727,6 +777,18 @@ class GenericRunner:
                             "strategy_unrealized_now": str(unreal),
                             "strategy_total_now": str(st_total),
                         },
+                        "bot": {
+                            "equity": str(se),
+                            "realized_today": str(realized_td),
+                            "realized_all_time": str(realized),
+                            "unrealized_now": str(unreal),
+                            "total_now": str(st_total),
+                        },
+                        "non_strategy": {
+                            "value_est": str(non_strategy_value),
+                            "value_pct_est": str(non_strategy_pct),
+                        },
+                        "manual_inventory_by_symbol": manual_map,
                         "deployed": {
                             "deployed_market_now": str(deployed_market),
                             "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
@@ -1058,6 +1120,7 @@ class GenericRunner:
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
 
+                manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
                 snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
                         "portfolio_value": str(port_val), "portfolio_pnl": str(port_pnl),
                         "portfolio_pnl_pct": str(port_pnl_pct), "drawdown_pct": str(dd),
@@ -1066,7 +1129,16 @@ class GenericRunner:
                         "strategy_realized_all_time": str(realized),
                         "strategy_unrealized_now": str(unreal),
                         "strategy_total_now": str(st_total),
-                    }, "deployed": {
+                    }, "bot": {
+                        "equity": str(se),
+                        "realized_today": str(realized_td),
+                        "realized_all_time": str(realized),
+                        "unrealized_now": str(unreal),
+                        "total_now": str(st_total),
+                    }, "non_strategy": {
+                        "value_est": str(non_strategy_value),
+                        "value_pct_est": str(non_strategy_pct),
+                    }, "manual_inventory_by_symbol": manual_map, "deployed": {
                         "deployed_market_now": str(deployed_market),
                         "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
                         "deployed_cost_strategy_now": str(deployed_cost_strategy),
@@ -1104,6 +1176,18 @@ class GenericRunner:
                             "strategy_unrealized_now": str(unreal),
                             "strategy_total_now": str(st_total),
                         },
+                        "bot": {
+                            "equity": str(se),
+                            "realized_today": str(realized_td),
+                            "realized_all_time": str(realized),
+                            "unrealized_now": str(unreal),
+                            "total_now": str(st_total),
+                        },
+                        "non_strategy": {
+                            "value_est": str(non_strategy_value),
+                            "value_pct_est": str(non_strategy_pct),
+                        },
+                        "manual_inventory_by_symbol": manual_map,
                         "deployed": {
                             "deployed_market_now": str(deployed_market),
                             "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),

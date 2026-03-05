@@ -100,6 +100,7 @@ def main() -> None:
     state_path = _abs(str(paths.get("state_path") or "state.json"), base_dir)
     trades_path = _abs(str(paths.get("trades_path") or "trades.jsonl"), base_dir)
     rejects_path = _abs(str(paths.get("rejects_path") or "rejects.jsonl"), base_dir)
+    manual_adjustments_path = _abs(str(paths.get("manual_adjustments_path") or "manual_adjustments.jsonl"), base_dir)
 
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
 
@@ -145,7 +146,11 @@ def main() -> None:
         cancel_all_open_orders=bool(ex.get("cancel_all_open_orders") or False),
         sync_on_start=bool(ex.get("sync_on_start") or False),
         adopt_broker_inventory=bool(ex.get("adopt_broker_inventory") or False),
+        manual_adjustments_path=manual_adjustments_path,
     )
+
+    state.extras["reconcile_crypto_balances"] = bool(ex.get("reconcile_crypto_balances", False))
+    state.extras["bot_only_pnl"] = bool(ex.get("bot_only_pnl", False))
 
     # --- cycle unit quote (per symbol) for fixed_quote ladders ---
     try:

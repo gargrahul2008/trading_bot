@@ -1,26 +1,4 @@
-# streamlit_app.py
-# Drop-in Streamlit dashboard for this trading_bot repo.
-#
-# Features:
-# - Select strategy + run folder (state/...) and load snapshot/summary/trades
-# - UTC date-range filter across trades
-# - Daily aggregates (realized, buy/sell quote, cycles_est)
-# - Slippage view (expected vs fill, slippage_bps) if present in trades.jsonl
-# - Current snapshot view (created/deployed/cycles/holdings + per-symbol table)
-# - Optional pnl_points.csv plot if present
-#
-# Usage:
-#   streamlit run streamlit_app.py
-#
-# Assumptions:
-# - Per run folder contains:
-#     - positions_snapshot.json (optional)
-#     - pnl_summary.json (optional)
-#     - trades.jsonl (or any *trades*.jsonl) (optional)
-#     - pnl_points.csv (optional)
-#     - state.json (optional; used for cycle_unit_quote_by_symbol)
-#
-# If your filenames differ, the file picker will attempt "best effort" discovery.
+# streamlit_app.py  (MANUAL REFRESH ONLY)
 
 from __future__ import annotations
 
@@ -29,7 +7,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
@@ -49,13 +27,26 @@ def _safe_json_load(path: str) -> Optional[dict]:
         return None
 
 
-def _load_jsonl(path: str) -> List[dict]:
-    out: List[dict] = []
+def _tail_jsonl(path: str, max_lines: int = 50000) -> List[dict]:
+    """Tail last max_lines of a jsonl file without reading whole file."""
     if not path or not os.path.exists(path):
-        return out
+        return []
+    out: List[dict] = []
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = 1024 * 1024  # 1MB
+            data = b""
+            pos = size
+            while pos > 0 and data.count(b"\n") < max_lines:
+                step = chunk if pos >= chunk else pos
+                pos -= step
+                f.seek(pos)
+                data = f.read(step) + data
+            text = data.decode("utf-8", errors="ignore")
+            lines = text.splitlines()[-max_lines:]
+            for line in lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -64,14 +55,12 @@ def _load_jsonl(path: str) -> List[dict]:
                 except Exception:
                     pass
     except Exception:
-        pass
+        return []
     return out
 
 
 def _latest_by_mtime(paths: List[str]) -> Optional[str]:
-    if not paths:
-        return None
-    paths2 = [p for p in paths if os.path.exists(p)]
+    paths2 = [p for p in paths if p and os.path.exists(p)]
     if not paths2:
         return None
     paths2.sort(key=lambda p: os.path.getmtime(p), reverse=True)
@@ -79,12 +68,10 @@ def _latest_by_mtime(paths: List[str]) -> Optional[str]:
 
 
 def _find_file(run_dir: str, preferred_names: List[str], patterns: List[str]) -> Optional[str]:
-    # 1) exact preferred names
     for nm in preferred_names:
         p = os.path.join(run_dir, nm)
         if os.path.exists(p):
             return p
-    # 2) glob patterns
     hits: List[str] = []
     for pat in patterns:
         hits.extend(glob.glob(os.path.join(run_dir, pat)))
@@ -92,32 +79,21 @@ def _find_file(run_dir: str, preferred_names: List[str], patterns: List[str]) ->
 
 
 def _discover_state_dirs(repo_root: str) -> List[str]:
-    # Prefer ./strategies/*/state, but also allow any */state under repo_root
-    candidates = []
-    p1 = os.path.join(repo_root, "strategies", "*", "state")
-    candidates += [p for p in glob.glob(p1) if os.path.isdir(p)]
-    # fallback: any state dir
-    p2 = os.path.join(repo_root, "**", "state")
-    candidates += [p for p in glob.glob(p2, recursive=True) if os.path.isdir(p)]
-    # de-dup, stable sort
-    uniq = sorted(set(candidates))
-    return uniq
+    candidates: List[str] = []
+    candidates += [p for p in glob.glob(os.path.join(repo_root, "strategies", "*", "state")) if os.path.isdir(p)]
+    candidates += [p for p in glob.glob(os.path.join(repo_root, "**", "state"), recursive=True) if os.path.isdir(p)]
+    return sorted(set(candidates))
 
 
 def _discover_run_dirs(state_dir: str) -> List[str]:
-    # runs are subfolders; also include the state_dir itself as "current"
     runs = [state_dir]
-    try:
-        for p in sorted(glob.glob(os.path.join(state_dir, "*"))):
-            if os.path.isdir(p):
-                runs.append(p)
-    except Exception:
-        pass
+    for p in sorted(glob.glob(os.path.join(state_dir, "*"))):
+        if os.path.isdir(p):
+            runs.append(p)
     return runs
 
 
 def _read_cycle_units_from_state_json(run_dir: str) -> Dict[str, str]:
-    # Looks for state.json (or any *state*.json) and reads extras.cycle_unit_quote_by_symbol if present.
     state_path = _find_file(run_dir, preferred_names=["state.json"], patterns=["*state*.json"])
     raw = _safe_json_load(state_path or "")
     if not isinstance(raw, dict):
@@ -129,6 +105,27 @@ def _read_cycle_units_from_state_json(run_dir: str) -> Dict[str, str]:
     if isinstance(m, dict):
         return {str(k): str(v) for k, v in m.items()}
     return {}
+
+
+@dataclass
+class RunFiles:
+    run_dir: str
+    snapshot_path: Optional[str]
+    summary_path: Optional[str]
+    trades_path: Optional[str]
+    manual_path: Optional[str]
+
+
+def _resolve_run_files(run_dir: str) -> RunFiles:
+    snapshot = _find_file(run_dir, ["positions_snapshot.json"], ["*snapshot*.json", "positions*.json"])
+    summary = _find_file(run_dir, ["pnl_summary.json"], ["*summary*.json", "pnl*.json"])
+    trades = _find_file(run_dir, ["trades.jsonl"], ["*trades*.jsonl", "*.jsonl"])
+    manual = _find_file(run_dir, ["manual_adjustments.jsonl"], ["*manual*adjust*.jsonl", "*manual*.jsonl"])
+    if trades and "reject" in os.path.basename(trades).lower():
+        alt = _find_file(run_dir, [], ["*trades*.jsonl"])
+        if alt:
+            trades = alt
+    return RunFiles(run_dir, snapshot, summary, trades, manual)
 
 
 def _coerce_ts(df: pd.DataFrame) -> pd.DataFrame:
@@ -152,27 +149,94 @@ def _pretty_pct(x: Any) -> str:
     except Exception:
         return str(x)
 
+def _safe_float(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-@dataclass
-class RunFiles:
-    run_dir: str
-    snapshot_path: Optional[str]
-    summary_path: Optional[str]
-    trades_path: Optional[str]
-    points_path: Optional[str]
+def _sum_cycles(store: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
+    per = store.get("per_symbol", {}) if isinstance(store, dict) else {}
+    total_cycles = 0.0
+    total_cycle_quote = 0.0
+    has_cycles = False
+    has_quote = False
+    for rec in (per or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        ce = _safe_float(rec.get("cycles_est"))
+        if ce is not None:
+            total_cycles += ce
+            has_cycles = True
+        cq = _safe_float(rec.get("cycle_quote"))
+        if cq is not None:
+            total_cycle_quote += cq
+            has_quote = True
+    return (total_cycles if has_cycles else None, total_cycle_quote if has_quote else None)
 
 
-def _resolve_run_files(run_dir: str) -> RunFiles:
-    snapshot = _find_file(run_dir, preferred_names=["positions_snapshot.json"], patterns=["*snapshot*.json", "positions*.json"])
-    summary = _find_file(run_dir, preferred_names=["pnl_summary.json"], patterns=["*summary*.json", "pnl*.json"])
-    trades = _find_file(run_dir, preferred_names=["trades.jsonl"], patterns=["*trades*.jsonl", "*.jsonl"])
-    points = _find_file(run_dir, preferred_names=["pnl_points.csv"], patterns=["*pnl*points*.csv", "*.csv"])
-    # try to avoid rejects.jsonl if possible
-    if trades and "reject" in os.path.basename(trades).lower():
-        alt = _find_file(run_dir, preferred_names=[], patterns=["*trades*.jsonl"])
-        if alt:
-            trades = alt
-    return RunFiles(run_dir=run_dir, snapshot_path=snapshot, summary_path=summary, trades_path=trades, points_path=points)
+# -------------------------
+# Manual-refresh state
+# -------------------------
+
+def _ensure_session_defaults() -> None:
+    ss = st.session_state
+    ss.setdefault("loaded", False)
+    ss.setdefault("data_snapshot", None)
+    ss.setdefault("data_summary", None)
+    ss.setdefault("data_trades_df", pd.DataFrame())
+    ss.setdefault("data_manual_df", pd.DataFrame())
+    ss.setdefault("data_cycle_units", {})
+    ss.setdefault("data_run_files", {})
+    ss.setdefault("last_loaded_at", None)
+
+
+def _load_all(repo_root: str, selected_runs: List[str], max_lines: int) -> None:
+    run_file_map: Dict[str, RunFiles] = {}
+    cycle_units: Dict[str, str] = {}
+    trades: List[dict] = []
+    manuals: List[dict] = []
+
+    for rd in selected_runs:
+        rf = _resolve_run_files(rd)
+        run_file_map[rd] = rf
+        cycle_units.update(_read_cycle_units_from_state_json(rd))
+        if rf.trades_path:
+            recs = _tail_jsonl(rf.trades_path, max_lines=max_lines)
+            for r in recs:
+                r["_run_dir"] = rd
+                r["_trades_file"] = rf.trades_path
+            trades.extend(recs)
+        if rf.manual_path:
+            recs = _tail_jsonl(rf.manual_path, max_lines=max_lines)
+            for r in recs:
+                r["_run_dir"] = rd
+                r["_manual_file"] = rf.manual_path
+            manuals.extend(recs)
+
+    df = pd.DataFrame(trades)
+    if not df.empty:
+        df = _coerce_ts(df)
+        df = _to_num(df, ["qty", "price", "cum_quote_qty", "realized_delta", "expected_price", "slippage_bps"])
+
+    # pick latest snapshot/summary among selected runs
+    latest_snapshot_path = _latest_by_mtime([run_file_map[r].snapshot_path for r in selected_runs if run_file_map[r].snapshot_path] or [])
+    latest_summary_path = _latest_by_mtime([run_file_map[r].summary_path for r in selected_runs if run_file_map[r].summary_path] or [])
+
+    snapshot = _safe_json_load(latest_snapshot_path or "")
+    summary = _safe_json_load(latest_summary_path or "")
+    manual_df = pd.DataFrame(manuals)
+    if not manual_df.empty:
+        manual_df = _coerce_ts(manual_df)
+
+    st.session_state["loaded"] = True
+    st.session_state["data_snapshot"] = snapshot
+    st.session_state["data_summary"] = summary
+    st.session_state["data_trades_df"] = df
+    st.session_state["data_manual_df"] = manual_df
+    st.session_state["data_cycle_units"] = cycle_units
+    st.session_state["data_run_files"] = {k: run_file_map[k].__dict__ for k in run_file_map}
+    st.session_state["last_loaded_at"] = pd.Timestamp.utcnow().isoformat() + "Z"
 
 
 # -------------------------
@@ -180,8 +244,9 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
 # -------------------------
 
 st.set_page_config(page_title="Trading Bot Dashboard", layout="wide")
+_ensure_session_defaults()
 
-st.title("Trading Bot Dashboard")
+st.title("Trading Bot Dashboard (Manual Refresh Only)")
 
 repo_root_default = os.getenv("TRADING_BOT_ROOT", str(Path.cwd()))
 repo_root = st.sidebar.text_input("Repo root", value=repo_root_default)
@@ -206,111 +271,153 @@ selected_runs = st.sidebar.multiselect(
     format_func=_label_run,
 )
 
-# Load trades across selected runs
-all_trades: List[dict] = []
-run_file_map: Dict[str, RunFiles] = {}
-cycle_units: Dict[str, str] = {}
+max_lines = int(st.sidebar.number_input("Max trades lines to load (tail)", min_value=1000, value=50000, step=5000))
 
-for rd in selected_runs:
-    rf = _resolve_run_files(rd)
-    run_file_map[rd] = rf
-    # merge cycle units (state.json)
-    cycle_units.update(_read_cycle_units_from_state_json(rd))
-    # load trades
-    if rf.trades_path:
-        recs = _load_jsonl(rf.trades_path)
-        for r in recs:
-            r["_run_dir"] = rd
-            r["_trades_file"] = rf.trades_path
-        all_trades.extend(recs)
+col_btn1, col_btn2 = st.sidebar.columns(2)
+with col_btn1:
+    if st.button("Refresh", type="primary"):
+        with st.spinner("Loading data..."):
+            _load_all(repo_root, selected_runs, max_lines=max_lines)
+with col_btn2:
+    if st.button("Clear"):
+        for k in ["loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df", "data_cycle_units", "data_run_files", "last_loaded_at"]:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
 
-df = pd.DataFrame(all_trades)
-if not df.empty:
-    df = _coerce_ts(df)
-    df = _to_num(df, ["qty", "price", "cum_quote_qty", "realized_delta", "expected_price", "slippage_bps"])
+if not st.session_state.get("loaded"):
+    st.info("Click **Refresh** to load data. No background refresh is performed.")
+    st.stop()
+
+snapshot = st.session_state.get("data_snapshot")
+summary = st.session_state.get("data_summary")
+df = st.session_state.get("data_trades_df")
+manual_df = st.session_state.get("data_manual_df")
+cycle_units = st.session_state.get("data_cycle_units") or {}
+last_loaded_at = st.session_state.get("last_loaded_at")
+
+st.caption(f"Loaded at: {last_loaded_at}")
+
+# -------------------------
+# Filters (do NOT reload data)
+# -------------------------
+
+if isinstance(df, pd.DataFrame) and not df.empty:
+    symbol_list = sorted(df["symbol"].dropna().unique().tolist()) if "symbol" in df.columns else []
 else:
-    st.info("No trades found for selected run(s). You can still view snapshot/summary if present.")
+    symbol_list = []
 
-# Filters
-symbol_list = sorted([s for s in df["symbol"].dropna().unique().tolist()]) if not df.empty and "symbol" in df.columns else []
-sel_symbols = st.sidebar.multiselect("Symbols", options=symbol_list, default=symbol_list)
-
+sel_symbols = st.sidebar.multiselect("Symbols (filter)", options=symbol_list, default=symbol_list)
 only_fills = st.sidebar.checkbox("Only FILL events", value=True)
 
-if not df.empty and "ts" in df.columns:
-    ts_min = df["ts"].min()
-    ts_max = df["ts"].max()
-    if pd.notnull(ts_min) and pd.notnull(ts_max):
-        d0 = ts_min.date()
-        d1 = ts_max.date()
-        d_from, d_to = st.sidebar.date_input("Date range (UTC)", value=(d0, d1))
-    else:
-        d_from = d_to = None
-else:
-    d_from = d_to = None
-
-dff = df.copy()
+dff = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
 if not dff.empty:
     if sel_symbols and "symbol" in dff.columns:
         dff = dff[dff["symbol"].isin(sel_symbols)]
     if only_fills and "event" in dff.columns:
         dff = dff[dff["event"] == "FILL"]
-    if d_from and d_to and "ts" in dff.columns:
+
+    if "ts" in dff.columns and dff["ts"].notna().any():
+        ts_min = dff["ts"].min()
+        ts_max = dff["ts"].max()
+        d0 = ts_min.date()
+        d1 = ts_max.date()
+        d_from, d_to = st.sidebar.date_input("Date range (UTC)", value=(d0, d1))
         start = pd.Timestamp(d_from, tz="UTC")
         end = pd.Timestamp(d_to, tz="UTC") + pd.Timedelta(days=1)
         dff = dff[(dff["ts"] >= start) & (dff["ts"] < end)]
 
-default_cycle_unit = st.sidebar.number_input("Default cycle unit quote (if missing)", min_value=1.0, value=1500.0, step=100.0)
+default_cycle_unit = float(st.sidebar.number_input("Default cycle unit quote", min_value=1.0, value=1500.0, step=100.0))
 
-# Pick “latest snapshot/summary” among selected runs
-latest_snapshot_path = _latest_by_mtime([run_file_map[r].snapshot_path for r in selected_runs if run_file_map[r].snapshot_path] or [])
-latest_summary_path = _latest_by_mtime([run_file_map[r].summary_path for r in selected_runs if run_file_map[r].summary_path] or [])
-snapshot = _safe_json_load(latest_snapshot_path or "")
-summary = _safe_json_load(latest_summary_path or "")
+def _unit_for(sym: str) -> float:
+    if sym in cycle_units:
+        try:
+            return float(cycle_units[sym])
+        except Exception:
+            pass
+    # try latest snapshot cycles_today
+    try:
+        if isinstance(snapshot, dict):
+            ct = snapshot.get("cycles_today", {})
+            ps = ct.get("per_symbol", {}) if isinstance(ct, dict) else {}
+            if sym in ps:
+                u = ps[sym].get("cycle_unit_quote")
+                if u:
+                    return float(u)
+    except Exception:
+        pass
+    return default_cycle_unit
+
 
 # -------------------------
 # Top metrics
 # -------------------------
 
-colA, colB, colC, colD = st.columns(4)
+colA, colB, colC, colD, colE = st.columns(5)
 
 if isinstance(summary, dict):
     pv = summary.get("portfolio_value")
     ppnl = summary.get("portfolio_pnl")
     ppct = summary.get("portfolio_pnl_pct")
     created = summary.get("created") if isinstance(summary.get("created"), dict) else {}
-    st_total = created.get("strategy_total_now")
-    st_real_td = created.get("strategy_realized_today")
+    bot = summary.get("bot") if isinstance(summary.get("bot"), dict) else {}
+    non_strategy = summary.get("non_strategy") if isinstance(summary.get("non_strategy"), dict) else {}
 
-    with colA:
-        st.metric("Portfolio Value", str(pv) if pv is not None else "—")
-    with colB:
-        st.metric("Portfolio PnL", str(ppnl) if ppnl is not None else "—", delta=_pretty_pct(ppct) if ppct is not None else None)
-    with colC:
-        st.metric("Strategy Total (now)", str(st_total) if st_total is not None else "—")
-    with colD:
-        st.metric("Strategy Realized Today (UTC)", str(st_real_td) if st_real_td is not None else "—")
+    st_total = bot.get("total_now") if bot.get("total_now") is not None else created.get("strategy_total_now")
+    st_real_td = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
+    nsv = non_strategy.get("value_est")
+    nsp = non_strategy.get("value_pct_est")
+
+    colA.metric("Portfolio Value", str(pv) if pv is not None else "—")
+    colB.metric("Portfolio PnL", str(ppnl) if ppnl is not None else "—", delta=_pretty_pct(ppct) if ppct is not None else None)
+    colC.metric("Bot Total (now)", str(st_total) if st_total is not None else "—")
+    colD.metric("Bot Realized Today (UTC)", str(st_real_td) if st_real_td is not None else "—")
+    colE.metric("Non-Strategy Value (est)", str(nsv) if nsv is not None else "—", delta=_pretty_pct(nsp) if nsp is not None else None)
 else:
-    with colA:
-        st.metric("Portfolio Value", "—")
-    with colB:
-        st.metric("Portfolio PnL", "—")
-    with colC:
-        st.metric("Strategy Total (now)", "—")
-    with colD:
-        st.metric("Strategy Realized Today (UTC)", "—")
+    colA.metric("Portfolio Value", "—")
+    colB.metric("Portfolio PnL", "—")
+    colC.metric("Bot Total (now)", "—")
+    colD.metric("Bot Realized Today (UTC)", "—")
+    colE.metric("Non-Strategy Value (est)", "—")
+
+# -------------------------
+# Bot summary panel
+# -------------------------
+
+st.subheader("Bot Summary")
+
+if isinstance(summary, dict):
+    bot = summary.get("bot") if isinstance(summary.get("bot"), dict) else {}
+    created = summary.get("created") if isinstance(summary.get("created"), dict) else {}
+    bot_total = bot.get("total_now") if bot.get("total_now") is not None else created.get("strategy_total_now")
+    bot_real_today = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
+    bot_real_all = bot.get("realized_all_time") if bot.get("realized_all_time") is not None else created.get("strategy_realized_all_time")
+else:
+    bot_total = bot_real_today = bot_real_all = None
+
+cycles_today = snapshot.get("cycles_today", {}) if isinstance(snapshot, dict) else {}
+cycles_all = snapshot.get("cycles_all_time", {}) if isinstance(snapshot, dict) else {}
+ct_est, ct_quote = _sum_cycles(cycles_today)
+ca_est, ca_quote = _sum_cycles(cycles_all)
+
+s1, s2, s3, s4, s5 = st.columns(5)
+s1.metric("Bot PnL Today (realized)", str(bot_real_today) if bot_real_today is not None else "—")
+s2.metric("Bot PnL All-time (realized)", str(bot_real_all) if bot_real_all is not None else "—")
+s3.metric("Bot Total PnL (now)", str(bot_total) if bot_total is not None else "—")
+s4.metric("Cycles Today (est)", f"{ct_est:.4f}" if ct_est is not None else "—")
+s5.metric("Cycles All-time (est)", f"{ca_est:.4f}" if ca_est is not None else "—")
+
 
 # -------------------------
 # Snapshot view
 # -------------------------
 
-st.subheader("Current Snapshot (latest)")
+st.subheader("Current Snapshot (latest loaded)")
 
 if isinstance(snapshot, dict):
-    c1, c2 = st.columns([1.1, 1.0])
+    c1, c2 = st.columns([1.2, 1.0])
 
     with c1:
-        # Per-symbol table
         sym_map = snapshot.get("symbols") if isinstance(snapshot.get("symbols"), dict) else {}
         rows = []
         for sym, d in (sym_map or {}).items():
@@ -325,57 +432,28 @@ if isinstance(snapshot, dict):
             st.info("No symbols in snapshot.")
 
     with c2:
-        created = snapshot.get("created") if isinstance(snapshot.get("created"), dict) else {}
-        deployed = snapshot.get("deployed") if isinstance(snapshot.get("deployed"), dict) else {}
-        cycles_today = snapshot.get("cycles_today") if isinstance(snapshot.get("cycles_today"), dict) else {}
-        cycles_all = snapshot.get("cycles_all_time") if isinstance(snapshot.get("cycles_all_time"), dict) else {}
-        holdings = snapshot.get("holdings") if isinstance(snapshot.get("holdings"), dict) else {}
-
+        st.markdown("**Bot**")
+        st.json(snapshot.get("bot", {}))
+        st.markdown("**Non-Strategy (est)**")
+        st.json(snapshot.get("non_strategy", {}))
+        st.markdown("**Manual Inventory**")
+        st.json(snapshot.get("manual_inventory_by_symbol", {}))
         st.markdown("**Created**")
-        st.json(created)
-
+        st.json(snapshot.get("created", {}))
         st.markdown("**Deployed**")
-        st.json(deployed)
-
+        st.json(snapshot.get("deployed", {}))
         st.markdown("**Cycles (Today UTC)**")
-        st.json(cycles_today)
-
+        st.json(snapshot.get("cycles_today", {}))
         st.markdown("**Cycles (All-time)**")
-        st.json(cycles_all)
-
+        st.json(snapshot.get("cycles_all_time", {}))
         st.markdown("**Holdings**")
-        st.json(holdings)
+        st.json(snapshot.get("holdings", {}))
 
-    with st.expander("Raw positions_snapshot.json"):
+    with st.expander("Raw positions_snapshot.json (loaded)"):
         st.code(json.dumps(snapshot, indent=2), language="json")
 else:
-    st.info("No snapshot found in selected run(s).")
+    st.info("No snapshot loaded.")
 
-# -------------------------
-# PnL points (optional)
-# -------------------------
-
-st.subheader("PnL Points (optional)")
-
-points_paths = [run_file_map[r].points_path for r in selected_runs if run_file_map[r].points_path]
-points_path = _latest_by_mtime([p for p in points_paths if p])
-if points_path and os.path.exists(points_path):
-    try:
-        pdf = pd.read_csv(points_path)
-        if "ts" in pdf.columns:
-            pdf["ts"] = pd.to_datetime(pdf["ts"], utc=True, errors="coerce")
-        st.caption(f"Using: {points_path}")
-        if not pdf.empty and "portfolio_value" in pdf.columns and "ts" in pdf.columns:
-            pdf = pdf.sort_values("ts")
-            st.line_chart(pdf.set_index("ts")["portfolio_value"])
-        if not pdf.empty and "strategy_total" in pdf.columns and "ts" in pdf.columns:
-            st.line_chart(pdf.set_index("ts")["strategy_total"])
-        with st.expander("pnl_points.csv"):
-            st.dataframe(pdf)
-    except Exception as e:
-        st.warning(f"Failed reading pnl_points.csv: {e}")
-else:
-    st.info("No pnl_points.csv found (this is optional).")
 
 # -------------------------
 # Trades view + daily summary
@@ -387,56 +465,31 @@ if dff.empty:
     st.info("No trades match current filters.")
 else:
     st.caption(f"Trades loaded: {len(df)} | After filters: {len(dff)}")
-    # Slippage metrics
-    slp = dff.dropna(subset=["slippage_bps"]) if "slippage_bps" in dff.columns else pd.DataFrame()
-    if not slp.empty:
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.metric("Avg slippage (bps)", f"{slp['slippage_bps'].mean():.2f}")
-        with m2:
-            st.metric("Median slippage (bps)", f"{slp['slippage_bps'].median():.2f}")
-        with m3:
-            st.metric("Worst slippage (bps)", f"{slp['slippage_bps'].max():.2f}")
 
-    cols = ["ts", "symbol", "side", "qty", "expected_price", "price", "slippage_bps", "cum_quote_qty", "realized_delta", "reason", "order_id", "_run_dir"]
+    # Slippage stats
+    if "slippage_bps" in dff.columns:
+        slp = dff.dropna(subset=["slippage_bps"])
+        if not slp.empty:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Avg slippage (bps)", f"{slp['slippage_bps'].mean():.2f}")
+            m2.metric("Median slippage (bps)", f"{slp['slippage_bps'].median():.2f}")
+            m3.metric("Worst slippage (bps)", f"{slp['slippage_bps'].max():.2f}")
+
+    cols = ["ts", "symbol", "side", "qty", "expected_price", "price", "slippage_bps",
+            "cum_quote_qty", "realized_delta", "reason", "order_id", "_run_dir"]
     cols = [c for c in cols if c in dff.columns]
-    st.dataframe(dff.sort_values("ts")[cols])
+    st.dataframe(dff.sort_values("ts")[cols], use_container_width=True)
 
-    # Daily aggregation
     st.subheader("Daily Summary (UTC, filtered)")
-
-    # per-symbol unit lookup
-    def _unit_for(sym: str) -> float:
-        # 1) from state.json extras if present
-        if sym in cycle_units:
-            try:
-                return float(cycle_units[sym])
-            except Exception:
-                pass
-        # 2) from latest snapshot cycles_today if present
-        try:
-            if isinstance(snapshot, dict):
-                ct = snapshot.get("cycles_today", {})
-                ps = ct.get("per_symbol", {}) if isinstance(ct, dict) else {}
-                if sym in ps:
-                    u = ps[sym].get("cycle_unit_quote")
-                    if u:
-                        return float(u)
-        except Exception:
-            pass
-        return float(default_cycle_unit)
 
     fills = dff.copy()
     if "event" in fills.columns:
-        # in case only_fills is off
         fills = fills[fills["event"] == "FILL"] if "FILL" in fills["event"].unique().tolist() else fills
 
     if not fills.empty and "date_utc" in fills.columns and "symbol" in fills.columns:
-        # buy/sell quote sums
-        buy_mask = (fills["side"].astype(str).str.upper() == "BUY") if "side" in fills.columns else False
-        sell_mask = (fills["side"].astype(str).str.upper() == "SELL") if "side" in fills.columns else False
+        buy_mask = fills["side"].astype(str).str.upper().eq("BUY") if "side" in fills.columns else False
+        sell_mask = fills["side"].astype(str).str.upper().eq("SELL") if "side" in fills.columns else False
 
-        # group
         g = fills.groupby(["date_utc", "symbol"], dropna=True)
 
         daily = g.agg(
@@ -445,7 +498,6 @@ else:
             avg_slip_bps=("slippage_bps", "mean") if "slippage_bps" in fills.columns else ("symbol", "count"),
         ).reset_index()
 
-        # add buy_quote/sell_quote
         if "cum_quote_qty" in fills.columns:
             bq = fills[buy_mask].groupby(["date_utc", "symbol"])["cum_quote_qty"].sum().rename("buy_quote")
             sq = fills[sell_mask].groupby(["date_utc", "symbol"])["cum_quote_qty"].sum().rename("sell_quote")
@@ -457,16 +509,25 @@ else:
             daily["cycle_unit_quote"] = daily["symbol"].apply(_unit_for)
             daily["cycles_est"] = daily["cycle_quote"] / daily["cycle_unit_quote"]
 
-        st.dataframe(daily.sort_values(["date_utc", "symbol"]))
+        st.dataframe(daily.sort_values(["date_utc", "symbol"]), use_container_width=True)
+
+# -------------------------
+# Manual adjustments (balance reconcile)
+# -------------------------
+
+st.subheader("Manual Adjustments (balance reconcile)")
+
+if not isinstance(manual_df, pd.DataFrame) or manual_df.empty:
+    st.info("No manual adjustments loaded.")
+else:
+    cols = ["ts", "symbol", "manual_delta", "manual_qty", "base_total", "bot_net_qty", "px", "reason", "_run_dir"]
+    cols = [c for c in cols if c in manual_df.columns]
+    st.dataframe(manual_df.sort_values("ts")[cols], use_container_width=True)
     else:
-        st.info("Not enough fields to compute daily summary (need ts/date_utc, symbol).")
+        st.info("Not enough fields to compute daily summary.")
 
-# -------------------------
-# Raw summary
-# -------------------------
-
-with st.expander("Raw pnl_summary.json (latest)"):
+with st.expander("Raw pnl_summary.json (loaded)"):
     if isinstance(summary, dict):
         st.code(json.dumps(summary, indent=2), language="json")
     else:
-        st.info("No pnl_summary.json found.")
+        st.info("No summary loaded.")
