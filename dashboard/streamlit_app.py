@@ -310,13 +310,15 @@ else:
 sel_symbols = st.sidebar.multiselect("Symbols (filter)", options=symbol_list, default=symbol_list)
 only_fills = st.sidebar.checkbox("Only FILL events", value=True)
 
-dff = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
-if not dff.empty:
-    if sel_symbols and "symbol" in dff.columns:
-        dff = dff[dff["symbol"].isin(sel_symbols)]
-    if only_fills and "event" in dff.columns:
-        dff = dff[dff["event"] == "FILL"]
+dff_base = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+if not dff_base.empty:
+    if sel_symbols and "symbol" in dff_base.columns:
+        dff_base = dff_base[dff_base["symbol"].isin(sel_symbols)]
+    if only_fills and "event" in dff_base.columns:
+        dff_base = dff_base[dff_base["event"] == "FILL"]
 
+dff = dff_base.copy()
+if not dff.empty:
     if "ts" in dff.columns and dff["ts"].notna().any():
         ts_min = dff["ts"].min()
         ts_max = dff["ts"].max()
@@ -326,6 +328,11 @@ if not dff.empty:
         start = pd.Timestamp(d_from, tz="UTC")
         end = pd.Timestamp(d_to, tz="UTC") + pd.Timedelta(days=1)
         dff = dff[(dff["ts"] >= start) & (dff["ts"] < end)]
+
+    # PnL date filter (single day)
+    pnl_date = st.sidebar.date_input("PnL date (UTC)", value=d1 if "d1" in locals() else pd.Timestamp.utcnow().date())
+else:
+    pnl_date = pd.Timestamp.utcnow().date()
 
 default_cycle_unit = float(st.sidebar.number_input("Default cycle unit quote", min_value=1.0, value=1500.0, step=100.0))
 
@@ -407,6 +414,50 @@ s3.metric("Bot Total PnL (now)", str(bot_total) if bot_total is not None else "�
 s4.metric("Cycles Today (est)", f"{ct_est:.4f}" if ct_est is not None else "—")
 s5.metric("Cycles All-time (est)", f"{ca_est:.4f}" if ca_est is not None else "—")
 
+# -------------------------
+# PnL for selected date
+# -------------------------
+
+st.subheader("PnL For Selected Date (UTC)")
+
+if not isinstance(dff_base, pd.DataFrame) or dff_base.empty or "ts" not in dff_base.columns:
+    st.info("No trades available for date-based PnL.")
+else:
+    day_start = pd.Timestamp(pnl_date, tz="UTC")
+    day_end = day_start + pd.Timedelta(days=1)
+    day_df = dff_base[(dff_base["ts"] >= day_start) & (dff_base["ts"] < day_end)]
+    if day_df.empty:
+        st.info("No trades on selected date.")
+    else:
+        fills_day = day_df
+        if "event" in fills_day.columns:
+            fills_day = fills_day[fills_day["event"] == "FILL"] if "FILL" in fills_day["event"].unique().tolist() else fills_day
+        realized_day = fills_day["realized_delta"].sum() if "realized_delta" in fills_day.columns else None
+        buys = fills_day["side"].astype(str).str.upper().eq("BUY") if "side" in fills_day.columns else False
+        sells = fills_day["side"].astype(str).str.upper().eq("SELL") if "side" in fills_day.columns else False
+        buy_q = sells_q = None
+        cycles_est_day = None
+        if "cum_quote_qty" in fills_day.columns and "symbol" in fills_day.columns:
+            buy_q = fills_day[buys]["cum_quote_qty"].sum()
+            sells_q = fills_day[sells]["cum_quote_qty"].sum()
+            cycles_sum = 0.0
+            has_cycles = False
+            for sym, g in fills_day.groupby("symbol"):
+                bq = g[g["side"].astype(str).str.upper().eq("BUY")]["cum_quote_qty"].sum()
+                sq = g[g["side"].astype(str).str.upper().eq("SELL")]["cum_quote_qty"].sum()
+                cycle_q = min(bq, sq)
+                unit = _unit_for(str(sym))
+                if unit and unit > 0:
+                    cycles_sum += float(cycle_q) / float(unit)
+                    has_cycles = True
+            cycles_est_day = cycles_sum if has_cycles else None
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Realized PnL (day)", str(realized_day) if realized_day is not None else "—")
+        c2.metric("Fills (day)", str(len(fills_day)))
+        c3.metric("Buy Quote (day)", str(buy_q) if buy_q is not None else "—")
+        c4.metric("Sell Quote (day)", str(sells_q) if sells_q is not None else "—")
+        c5.metric("Cycles Est (day)", f"{cycles_est_day:.4f}" if cycles_est_day is not None else "—")
+
 
 # -------------------------
 # Snapshot view
@@ -448,6 +499,37 @@ if isinstance(snapshot, dict):
         st.json(snapshot.get("cycles_all_time", {}))
         st.markdown("**Holdings**")
         st.json(snapshot.get("holdings", {}))
+        st.markdown("**LIFO Lots (state, by symbol)**")
+        state_dir_info = st.session_state.get("data_run_files", {})
+        lots_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        try:
+            if isinstance(state_dir_info, dict):
+                # use the latest state.json from selected runs
+                state_paths = []
+                for v in state_dir_info.values():
+                    if isinstance(v, dict):
+                        sp = v.get("snapshot_path")
+                        rp = v.get("run_dir")
+                        if rp:
+                            p = _find_file(rp, preferred_names=["state.json"], patterns=["*state*.json"])
+                            if p:
+                                state_paths.append(p)
+                latest_state_path = _latest_by_mtime(state_paths)
+                raw_state = _safe_json_load(latest_state_path or "")
+                if isinstance(raw_state, dict):
+                    ss = raw_state.get("symbol_states") or {}
+                    for sym, sd in ss.items():
+                        if not isinstance(sd, dict):
+                            continue
+                        lots = sd.get("lots") or []
+                        if isinstance(lots, list):
+                            lots_by_symbol[str(sym)] = lots
+        except Exception:
+            lots_by_symbol = {}
+        if lots_by_symbol:
+            st.json(lots_by_symbol)
+        else:
+            st.info("No lots found in state.json (or lots not saved yet).")
 
     with st.expander("Raw positions_snapshot.json (loaded)"):
         st.code(json.dumps(snapshot, indent=2), language="json")

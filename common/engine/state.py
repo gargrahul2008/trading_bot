@@ -28,6 +28,7 @@ class SymbolState:
     traded_qty: Decimal = D0
     traded_avg_price: Decimal = D0
     realized_pnl: Decimal = D0
+    lots: List[Dict[str, Any]] = field(default_factory=list)
     pending_order_id: Optional[str] = None
     pending_reason: Optional[str] = None
     pending_since: Optional[str] = None  # UTC ISO
@@ -67,6 +68,16 @@ class GlobalState:
         for sym, ss in (raw.get("symbol_states") or {}).items():
             if not isinstance(ss, dict):
                 continue
+            lots_raw = ss.get("lots") or []
+            lots: List[Dict[str, Any]] = []
+            if isinstance(lots_raw, list):
+                for lot in lots_raw:
+                    if not isinstance(lot, dict):
+                        continue
+                    qty = to_decimal(lot.get("qty") or lot.get("quantity") or "0")
+                    price = to_decimal(lot.get("price") or lot.get("avg_price") or "0")
+                    if qty != D0:
+                        lots.append({"qty": qty, "price": price})
             sym_states[str(sym)] = SymbolState(
                 initialized=bool(ss.get("initialized", False)),
                 reference_price=to_decimal(ss.get("reference_price")) if ss.get("reference_price") is not None else None,
@@ -74,6 +85,7 @@ class GlobalState:
                 traded_qty=to_decimal(ss.get("traded_qty", "0")),
                 traded_avg_price=to_decimal(ss.get("traded_avg_price", "0")),
                 realized_pnl=to_decimal(ss.get("realized_pnl", "0")),
+                lots=lots,
                 pending_order_id=ss.get("pending_order_id"),
                 pending_reason=ss.get("pending_reason"),
                 pending_since=ss.get("pending_since"),
@@ -147,7 +159,17 @@ class GlobalState:
             borrowed_qty = _dec(getattr(ss, "borrowed_qty", D0))
 
             # long unrealized
-            if traded_qty > 0:
+            lots = getattr(ss, "lots", None)
+            if lots:
+                for lot in lots:
+                    try:
+                        lq = _dec(lot.get("qty") or 0)
+                        lp = _dec(lot.get("price") or 0)
+                        if lq > 0:
+                            total += lq * (px - lp)
+                    except Exception:
+                        pass
+            elif traded_qty > 0:
                 total += traded_qty * (px - _dec(ss.traded_avg_price))
 
             # short/buffer unrealized (sold-first)

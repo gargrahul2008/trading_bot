@@ -182,6 +182,76 @@ class GenericRunner:
                 pass
         return n
 
+    def _ensure_lots(self, ss) -> None:
+        lots = getattr(ss, "lots", None)
+        if lots is None:
+            ss.lots = []
+            lots = ss.lots
+        cleaned = []
+        for lot in (lots or []):
+            if not isinstance(lot, dict):
+                continue
+            qty = _dec(lot.get("qty") or lot.get("quantity") or 0)
+            price = _dec(lot.get("price") or lot.get("avg_price") or 0)
+            if qty > 0:
+                cleaned.append({"qty": qty, "price": price})
+        if not cleaned and ss.traded_qty > 0:
+            cleaned = [{"qty": _dec(ss.traded_qty), "price": _dec(ss.traded_avg_price)}]
+        ss.lots = cleaned
+        self._recalc_from_lots(ss)
+
+    def _recalc_from_lots(self, ss) -> None:
+        lots = getattr(ss, "lots", None) or []
+        total_qty = D0
+        total_cost = D0
+        for lot in lots:
+            if not isinstance(lot, dict):
+                continue
+            qty = _dec(lot.get("qty") or 0)
+            price = _dec(lot.get("price") or 0)
+            if qty <= 0:
+                continue
+            total_qty += qty
+            total_cost += qty * price
+        if total_qty <= 0:
+            ss.traded_qty = D0
+            ss.traded_avg_price = D0
+            ss.lots = []
+        else:
+            ss.traded_qty = total_qty
+            ss.traded_avg_price = (total_cost / total_qty) if total_qty > 0 else D0
+
+    def _add_lot(self, ss, qty: Decimal, price: Decimal) -> None:
+        if qty <= 0:
+            return
+        self._ensure_lots(ss)
+        ss.lots.append({"qty": _dec(qty), "price": _dec(price)})
+        self._recalc_from_lots(ss)
+
+    def _consume_lots_lifo(self, ss, qty: Decimal, sell_price: Decimal) -> Decimal:
+        if qty <= 0:
+            return D0
+        self._ensure_lots(ss)
+        remaining = _dec(qty)
+        realized = D0
+        while remaining > 0 and ss.lots:
+            lot = ss.lots[-1]
+            lot_qty = _dec(lot.get("qty") or 0)
+            lot_price = _dec(lot.get("price") or 0)
+            if lot_qty <= 0:
+                ss.lots.pop()
+                continue
+            take = remaining if remaining < lot_qty else lot_qty
+            realized += take * (_dec(sell_price) - lot_price)
+            lot_qty = lot_qty - take
+            remaining = remaining - take
+            if lot_qty <= 0:
+                ss.lots.pop()
+            else:
+                lot["qty"] = lot_qty
+        self._recalc_from_lots(ss)
+        return realized
+
     def _apply_fill(self, symbol: str, side: str, qty: Decimal, price: Decimal, cum_quote: Decimal, *, reason: str, order_id: str, status: str) -> None:
         ss = self.state.symbol_states[symbol]
         realized_delta = D0
@@ -195,16 +265,12 @@ class GenericRunner:
                 proceeds = cum_quote if cum_quote > 0 else (price * qty)
                 self.state.cash += proceeds
 
-                # 1) sell from strategy inventory first
+                # 1) sell from strategy inventory first (LIFO lots)
+                self._ensure_lots(ss)
                 sell_from_traded = min(qty, ss.traded_qty) if ss.traded_qty > 0 else D0
                 if sell_from_traded > 0:
-                    realized_delta = sell_from_traded * (price - ss.traded_avg_price)
+                    realized_delta = self._consume_lots_lifo(ss, sell_from_traded, price)
                     ss.realized_pnl += realized_delta
-
-                    ss.traded_qty = ss.traded_qty - sell_from_traded
-                    if ss.traded_qty <= 0:
-                        ss.traded_qty = D0
-                        ss.traded_avg_price = D0
 
                 # 2) remainder is "borrowed" (sell-first buffer)
                 sell_from_borrow = qty - sell_from_traded
@@ -236,11 +302,7 @@ class GenericRunner:
 
                 # 2) leftover adds to strategy inventory
                 if remaining > 0:
-                    old_qty = ss.traded_qty
-                    new_qty = old_qty + remaining
-                    if new_qty > 0:
-                        ss.traded_avg_price = ((ss.traded_avg_price * old_qty) + (price * remaining)) / new_qty
-                    ss.traded_qty = new_qty
+                    self._add_lot(ss, remaining, price)
 
             ss.reference_price = price
             ss.pending_order_id = None
