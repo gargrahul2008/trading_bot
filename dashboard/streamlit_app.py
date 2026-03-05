@@ -510,6 +510,8 @@ else:
             daily["cycles_est"] = daily["cycle_quote"] / daily["cycle_unit_quote"]
 
         st.dataframe(daily.sort_values(["date_utc", "symbol"]), use_container_width=True)
+    else:
+        st.info("Not enough fields to compute daily summary.")
 
 # -------------------------
 # Manual adjustments (balance reconcile)
@@ -523,8 +525,6 @@ else:
     cols = ["ts", "symbol", "manual_delta", "manual_qty", "base_total", "bot_net_qty", "px", "reason", "_run_dir"]
     cols = [c for c in cols if c in manual_df.columns]
     st.dataframe(manual_df.sort_values("ts")[cols], use_container_width=True)
-    else:
-        st.info("Not enough fields to compute daily summary.")
 
 with st.expander("Raw pnl_summary.json (loaded)"):
     if isinstance(summary, dict):
