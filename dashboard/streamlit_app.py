@@ -845,15 +845,6 @@ if isinstance(summary, dict):
     st_real_all = bot.get("realized_all_time") if bot.get("realized_all_time") is not None else created.get("strategy_realized_all_time")
     st_real_td = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
 
-if capital_flows_path:
-    st.caption(f"Capital flows auto-loaded: {capital_flows_path} | Net used: {_fmt_num(auto_capital_flow)}")
-    st.caption(f"Capital-flow rows used: {capital_flow_rows_used}. `ts` is ignored for PnL calculation (reference only).")
-    st.caption("Effective Initial is driven by capital flows total (not summary start value) when rows exist.")
-if manual_capital_adjustment != 0:
-    st.caption(f"Manual capital adjustment: {_fmt_num(manual_capital_adjustment)}")
-if capital_added_since_start != 0:
-    st.caption(f"Total capital adjustment applied: {_fmt_num(capital_added_since_start)}")
-
 # -------------------------
 # Portfolio views (raw + adjusted)
 # -------------------------
@@ -1017,22 +1008,31 @@ adjusted_pnl = (adjusted_current - adjusted_initial) if (adjusted_current is not
 raw_pnl_pct = (raw_pnl / raw_initial) if (raw_pnl is not None and raw_initial is not None and raw_initial > 0) else None
 adjusted_pnl_pct = (adjusted_pnl / adjusted_initial) if (adjusted_pnl is not None and adjusted_initial is not None and adjusted_initial > 0) else None
 
-m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Portfolio Initial", _fmt_num(raw_initial))
 m2.metric("Portfolio Value", _fmt_num(raw_current))
 m3.metric("Portfolio PnL", _fmt_num(raw_pnl), delta=_pretty_pct(raw_pnl_pct) if raw_pnl_pct is not None else None)
 m4.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
 m5.metric("Adjusted Current", _fmt_num(adjusted_current))
 m6.metric("Adjusted PnL", _fmt_num(adjusted_pnl), delta=_pretty_pct(adjusted_pnl_pct) if adjusted_pnl_pct is not None else None)
-m7.metric("Bot Total (realized)", str(st_real_all) if st_real_all is not None else "—")
-m8.metric("Bot Realized Today (UTC)", str(st_real_td) if st_real_td is not None else "—")
 
-st.caption("Add legacy/manual positions to remove their existing PnL from portfolio metrics.")
-st.caption("`ts` is optional. If timezone is omitted, it is treated as IST (example: `2026-03-09 14:30`).")
-if isinstance(manual_positions_file_path, str) and manual_positions_file_path:
-    st.caption(f"Manual positions file loaded: {manual_positions_file_path}")
-else:
-    st.caption("To persist entries, create `manual_positions.json` or `manual_positions.csv` in your run/state folder.")
+# -------------------------
+# Bot summary panel
+# -------------------------
+
+st.subheader("Bot Summary")
+
+cycles_today = snapshot.get("cycles_today", {}) if isinstance(snapshot, dict) else {}
+cycles_all = snapshot.get("cycles_all_time", {}) if isinstance(snapshot, dict) else {}
+ct_est, ct_quote = _sum_cycles(cycles_today)
+ca_est, ca_quote = _sum_cycles(cycles_all)
+
+s1, s2, s3, s4 = st.columns(4)
+s1.metric("Bot PnL Today (realized)", _fmt_num(st_real_td) if st_real_td is not None else "—")
+s2.metric("Bot PnL All-time (realized)", _fmt_num(st_real_all) if st_real_all is not None else "—")
+s3.metric("Cycles Today (est)", _fmt_num(ct_est) if ct_est is not None else "—")
+s4.metric("Cycles All-time (est)", _fmt_num(ca_est) if ca_est is not None else "—")
+st.caption("Cycles are turnover/execution counts, not profit. They do not map 1:1 to PnL.")
 
 manual_input_new = st.data_editor(
     manual_input,
@@ -1052,16 +1052,6 @@ else:
     if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty:
         show_bad = [c for c in ["ts", "symbol", "qty", "buy_price", "cmp_symbol", "cmp", "status"] if c in manual_eval.columns]
         st.dataframe(manual_eval[show_bad], use_container_width=True)
-
-if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty and "status" in manual_eval.columns:
-    cnt = manual_eval["status"].value_counts(dropna=False).to_dict()
-    st.caption(f"Manual rows status: {cnt}")
-
-if raw_initial is not None and adjusted_current is not None:
-    st.caption(
-        f"Adjusted current value = Raw current value ({_fmt_num(raw_current)}) - "
-        f"legacy PnL ({_fmt_num(manual_pnl_total)}) = {_fmt_num(adjusted_current)}"
-    )
 
 st.subheader("Portfolio Value Curve")
 st.caption("Curve uses daily points (one point per UTC day).")
@@ -1177,34 +1167,6 @@ else:
     st.info("No daily portfolio curve data available yet.")
 
 # -------------------------
-# Bot summary panel
-# -------------------------
-
-st.subheader("Bot Summary")
-
-if isinstance(summary, dict):
-    bot = summary.get("bot") if isinstance(summary.get("bot"), dict) else {}
-    created = summary.get("created") if isinstance(summary.get("created"), dict) else {}
-    bot_total = bot.get("total_now") if bot.get("total_now") is not None else created.get("strategy_total_now")
-    bot_real_today = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
-    bot_real_all = bot.get("realized_all_time") if bot.get("realized_all_time") is not None else created.get("strategy_realized_all_time")
-else:
-    bot_total = bot_real_today = bot_real_all = None
-
-cycles_today = snapshot.get("cycles_today", {}) if isinstance(snapshot, dict) else {}
-cycles_all = snapshot.get("cycles_all_time", {}) if isinstance(snapshot, dict) else {}
-ct_est, ct_quote = _sum_cycles(cycles_today)
-ca_est, ca_quote = _sum_cycles(cycles_all)
-
-s1, s2, s3, s4, s5 = st.columns(5)
-s1.metric("Bot PnL Today (realized)", str(bot_real_today) if bot_real_today is not None else "—")
-s2.metric("Bot PnL All-time (realized)", str(bot_real_all) if bot_real_all is not None else "—")
-s3.metric("Bot Total (realized)", str(bot_real_all) if bot_real_all is not None else "—")
-s4.metric("Cycles Today (est)", f"{ct_est:.4f}" if ct_est is not None else "—")
-s5.metric("Cycles All-time (est)", f"{ca_est:.4f}" if ca_est is not None else "—")
-st.caption("Cycles are turnover/execution counts, not profit. They do not map 1:1 to PnL.")
-
-# -------------------------
 # PnL for selected date
 # -------------------------
 
@@ -1246,11 +1208,11 @@ else:
             buy_q = (fills_day[buys]["qty"] * fills_day[buys]["price"]).sum()
             sells_q = (fills_day[sells]["qty"] * fills_day[sells]["price"]).sum()
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Realized PnL (day)", str(realized_day) if realized_day is not None else "—")
+        c1.metric("Realized PnL (day)", _fmt_num(realized_day) if realized_day is not None else "—")
         c2.metric("Fills (day)", str(len(fills_day)))
-        c3.metric("Buy Quote (day)", str(buy_q) if buy_q is not None else "—")
-        c4.metric("Sell Quote (day)", str(sells_q) if sells_q is not None else "—")
-        c5.metric("Cycles Est (day)", f"{cycles_est_day:.4f}" if cycles_est_day is not None else "—")
+        c3.metric("Buy Quote (day)", _fmt_num(buy_q) if buy_q is not None else "—")
+        c4.metric("Sell Quote (day)", _fmt_num(sells_q) if sells_q is not None else "—")
+        c5.metric("Cycles Est (day)", _fmt_num(cycles_est_day) if cycles_est_day is not None else "—")
 
 
 # -------------------------
