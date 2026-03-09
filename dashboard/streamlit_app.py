@@ -191,25 +191,48 @@ def _load_manual_positions_file(path: str) -> pd.DataFrame:
 
         raw = _safe_json_load(path)
         rows: List[Dict[str, Any]] = []
+        def _append_row(rec: Dict[str, Any], symbol_hint: Any = None) -> None:
+            sym = rec.get("symbol") if rec.get("symbol") is not None else symbol_hint
+            qty = rec.get("qty") if rec.get("qty") is not None else rec.get("quantity")
+            bp = rec.get("buy_price")
+            if bp is None:
+                bp = rec.get("price")
+            if bp is None:
+                bp = rec.get("avg_price")
+            rows.append({"symbol": sym, "qty": qty, "buy_price": bp})
+
         if isinstance(raw, list):
             for rec in raw:
-                if not isinstance(rec, dict):
-                    continue
-                rows.append({
-                    "symbol": rec.get("symbol"),
-                    "qty": rec.get("qty") if rec.get("qty") is not None else rec.get("quantity"),
-                    "buy_price": rec.get("buy_price") if rec.get("buy_price") is not None else (rec.get("price") if rec.get("price") is not None else rec.get("avg_price")),
-                })
-        elif isinstance(raw, dict):
-            for sym, rec in raw.items():
                 if isinstance(rec, dict):
+                    _append_row(rec)
+        elif isinstance(raw, dict):
+            # supported wrappers
+            for k in ["positions", "manual_positions", "data", "lots"]:
+                v = raw.get(k)
+                if isinstance(v, list):
+                    for rec in v:
+                        if isinstance(rec, dict):
+                            _append_row(rec)
+                    break
+            # symbol->record map (including symbol->list-of-lots)
+            for sym, rec in raw.items():
+                if sym in {"positions", "manual_positions", "data", "lots"}:
+                    continue
+                if isinstance(rec, dict):
+                    _append_row(rec, sym)
+                elif isinstance(rec, list):
+                    if len(rec) >= 2 and not any(isinstance(lot, dict) for lot in rec):
+                        rows.append({"symbol": sym, "qty": rec[0], "buy_price": rec[1]})
+                    else:
+                        for lot in rec:
+                            if isinstance(lot, dict):
+                                _append_row(lot, sym)
+                elif isinstance(rec, tuple) and len(rec) >= 2:
                     rows.append({
                         "symbol": sym,
-                        "qty": rec.get("qty") if rec.get("qty") is not None else rec.get("quantity"),
-                        "buy_price": rec.get("buy_price") if rec.get("buy_price") is not None else (rec.get("price") if rec.get("price") is not None else rec.get("avg_price")),
+                        "qty": rec[0],
+                        "buy_price": rec[1],
                     })
-                elif isinstance(rec, (list, tuple)) and len(rec) >= 2:
-                    rows.append({"symbol": sym, "qty": rec[0], "buy_price": rec[1]})
         out = pd.DataFrame(rows)
         if out.empty:
             return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
@@ -263,7 +286,16 @@ def _coerce_ts(df: pd.DataFrame) -> pd.DataFrame:
 def _to_num(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            s = df[c]
+            if s.dtype == "O":
+                s = (
+                    s.astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace("_", "", regex=False)
+                    .str.strip()
+                )
+                s = s.replace({"": None, "None": None, "nan": None, "NaN": None})
+            df[c] = pd.to_numeric(s, errors="coerce")
     return df
 
 
@@ -284,9 +316,16 @@ def _fmt_num(x: Any, digits: int = 2) -> str:
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
+        if isinstance(x, str):
+            x = x.replace(",", "").replace("_", "").strip()
         return float(x)
     except Exception:
         return None
+
+
+def _norm_symbol(sym: Any) -> str:
+    s = str(sym or "").upper()
+    return "".join(ch for ch in s if ch.isalnum())
 
 def _sum_cycles(store: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     per = store.get("per_symbol", {}) if isinstance(store, dict) else {}
@@ -680,6 +719,13 @@ if isinstance(price_df, pd.DataFrame) and not price_df.empty and "prices" in pri
             if pxf is not None:
                 latest_px_by_symbol[str(sym)] = pxf
 
+# symbol normalization map: helps match ETH/USDT, ethusdt, ETH-USDT, etc.
+latest_px_norm: Dict[str, float] = {}
+for k, v in latest_px_by_symbol.items():
+    nk = _norm_symbol(k)
+    if nk:
+        latest_px_norm[nk] = v
+
 if not st.session_state.get("manual_positions_seeded", False):
     seed_rows: List[Dict[str, Any]] = []
     if isinstance(manual_positions_file_df, pd.DataFrame) and not manual_positions_file_df.empty:
@@ -722,22 +768,29 @@ if isinstance(manual_input, pd.DataFrame):
     st.session_state["manual_positions_input_df"] = manual_input.copy()
 
 manual_calc = pd.DataFrame()
+manual_eval = pd.DataFrame()
 manual_pnl_total = 0.0
 if isinstance(manual_input, pd.DataFrame) and not manual_input.empty:
-    manual_calc = manual_input.copy()
-    if "symbol" in manual_calc.columns:
-        manual_calc["symbol"] = manual_calc["symbol"].astype(str).str.strip()
-        manual_calc = manual_calc[manual_calc["symbol"] != ""]
-    manual_calc = _to_num(manual_calc, ["qty", "buy_price"])
-    manual_calc = manual_calc.dropna(subset=["qty", "buy_price"])
+    manual_eval = manual_input.copy()
+    for c in ["symbol", "qty", "buy_price"]:
+        if c not in manual_eval.columns:
+            manual_eval[c] = None
+    manual_eval["symbol"] = manual_eval["symbol"].astype(str).str.strip()
+    manual_eval = _to_num(manual_eval, ["qty", "buy_price"])
+    manual_eval["symbol_norm"] = manual_eval["symbol"].apply(_norm_symbol)
+    manual_eval["cmp"] = manual_eval["symbol_norm"].map(latest_px_norm)
+    manual_eval["status"] = "ok"
+    manual_eval.loc[manual_eval["symbol_norm"] == "", "status"] = "missing_symbol"
+    manual_eval.loc[manual_eval["qty"].isna(), "status"] = "missing_qty"
+    manual_eval.loc[manual_eval["buy_price"].isna(), "status"] = "missing_buy_price"
+    manual_eval.loc[(manual_eval["status"] == "ok") & (manual_eval["cmp"].isna()), "status"] = "cmp_not_found"
+
+    manual_calc = manual_eval[manual_eval["status"] == "ok"].copy()
     if not manual_calc.empty:
-        manual_calc["cmp"] = manual_calc["symbol"].map(latest_px_by_symbol)
-        manual_calc = manual_calc.dropna(subset=["cmp"])
-        if not manual_calc.empty:
-            manual_calc["manual_cost"] = manual_calc["qty"] * manual_calc["buy_price"]
-            manual_calc["manual_market"] = manual_calc["qty"] * manual_calc["cmp"]
-            manual_calc["manual_pnl"] = manual_calc["manual_market"] - manual_calc["manual_cost"]
-            manual_pnl_total = float(manual_calc["manual_pnl"].sum())
+        manual_calc["manual_cost"] = manual_calc["qty"] * manual_calc["buy_price"]
+        manual_calc["manual_market"] = manual_calc["qty"] * manual_calc["cmp"]
+        manual_calc["manual_pnl"] = manual_calc["manual_market"] - manual_calc["manual_cost"]
+        manual_pnl_total = float(manual_calc["manual_pnl"].sum())
 
 adjusted_current = (raw_current - manual_pnl_total) if raw_current is not None else None
 adjusted_initial = raw_initial
@@ -748,14 +801,17 @@ p1.metric("Raw Initial", _fmt_num(raw_initial))
 p2.metric("Raw Current", _fmt_num(raw_current))
 p3.metric("Raw PnL", _fmt_num(raw_pnl))
 p4.metric("Adjusted Current", _fmt_num(adjusted_current))
-p5.metric("Adjusted PnL", _fmt_num(adjusted_pnl))
+p5.metric("Adjusted PnL (vs raw initial)", _fmt_num(adjusted_pnl))
 p6.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
 
 if not manual_calc.empty:
     show_cols = [c for c in ["symbol", "qty", "buy_price", "cmp", "manual_cost", "manual_market", "manual_pnl"] if c in manual_calc.columns]
     st.dataframe(manual_calc[show_cols], use_container_width=True)
 else:
-    st.info("No valid manual positions with both quantity, buy price, and current price.")
+    st.warning("No valid manual positions could be used for adjusted PnL.")
+    if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty:
+        show_bad = [c for c in ["symbol", "qty", "buy_price", "cmp", "status"] if c in manual_eval.columns]
+        st.dataframe(manual_eval[show_bad], use_container_width=True)
 
 if raw_initial is not None and adjusted_current is not None:
     st.caption(
@@ -883,8 +939,9 @@ if isinstance(summary, dict):
     bot_total = bot.get("total_now") if bot.get("total_now") is not None else created.get("strategy_total_now")
     bot_real_today = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
     bot_real_all = bot.get("realized_all_time") if bot.get("realized_all_time") is not None else created.get("strategy_realized_all_time")
+    bot_unreal_now = bot.get("unrealized_now") if bot.get("unrealized_now") is not None else created.get("strategy_unrealized_now")
 else:
-    bot_total = bot_real_today = bot_real_all = None
+    bot_total = bot_real_today = bot_real_all = bot_unreal_now = None
 
 cycles_today = snapshot.get("cycles_today", {}) if isinstance(snapshot, dict) else {}
 cycles_all = snapshot.get("cycles_all_time", {}) if isinstance(snapshot, dict) else {}
@@ -892,11 +949,12 @@ ct_est, ct_quote = _sum_cycles(cycles_today)
 ca_est, ca_quote = _sum_cycles(cycles_all)
 
 s1, s2, s3, s4, s5 = st.columns(5)
-s1.metric("Bot PnL Today (realized)", str(bot_real_today) if bot_real_today is not None else "—")
-s2.metric("Bot PnL All-time (realized)", str(bot_real_all) if bot_real_all is not None else "—")
+s1.metric("Bot PnL All-time (realized)", str(bot_real_all) if bot_real_all is not None else "—")
+s2.metric("Bot Unrealized (now)", str(bot_unreal_now) if bot_unreal_now is not None else "—")
 s3.metric("Bot Total PnL (now)", str(bot_total) if bot_total is not None else "—")
 s4.metric("Cycles Today (est)", f"{ct_est:.4f}" if ct_est is not None else "—")
 s5.metric("Cycles All-time (est)", f"{ca_est:.4f}" if ca_est is not None else "—")
+st.caption("Cycles are turnover/execution counts, not profit. They do not map 1:1 to PnL.")
 
 # -------------------------
 # PnL for selected date
@@ -935,6 +993,10 @@ else:
                     cycles_sum += float(cycle_q) / float(unit)
                     has_cycles = True
             cycles_est_day = cycles_sum if has_cycles else None
+        elif "qty" in fills_day.columns and "price" in fills_day.columns:
+            # fallback when cum_quote_qty is not logged
+            buy_q = (fills_day[buys]["qty"] * fills_day[buys]["price"]).sum()
+            sells_q = (fills_day[sells]["qty"] * fills_day[sells]["price"]).sum()
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Realized PnL (day)", str(realized_day) if realized_day is not None else "—")
         c2.metric("Fills (day)", str(len(fills_day)))
