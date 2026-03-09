@@ -282,12 +282,13 @@ def _load_capital_flows_file(path: str) -> pd.DataFrame:
             if "delta" in raw_df.columns:
                 out["delta"] = raw_df.get("delta")
             elif "amount" in raw_df.columns:
-                out["delta"] = raw_df.get("amount")
                 if "type" in raw_df.columns:
-                    t = raw_df["type"].astype(str).str.upper().str.strip()
-                    out.loc[t.isin(["REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"]), "delta"] = -pd.to_numeric(
-                        raw_df.loc[t.isin(["REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"]), "amount"], errors="coerce"
-                    )
+                    out["delta"] = [
+                        _normalize_capital_delta(amt, typ)
+                        for amt, typ in zip(raw_df["amount"], raw_df["type"])
+                    ]
+                else:
+                    out["delta"] = raw_df.get("amount")
             else:
                 out["delta"] = None
             out["note"] = raw_df.get("note")
@@ -305,13 +306,7 @@ def _load_capital_flows_file(path: str) -> pd.DataFrame:
                     continue
                 delta = rec.get("delta")
                 if delta is None and rec.get("amount") is not None:
-                    delta = rec.get("amount")
-                    typ = str(rec.get("type") or "").upper().strip()
-                    if typ in {"REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"}:
-                        try:
-                            delta = -float(delta)
-                        except Exception:
-                            pass
+                    delta = _normalize_capital_delta(rec.get("amount"), rec.get("type"))
                 rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
         elif isinstance(raw, dict):
             arr = raw.get("flows") or raw.get("capital_flows") or raw.get("data")
@@ -321,13 +316,7 @@ def _load_capital_flows_file(path: str) -> pd.DataFrame:
                         continue
                     delta = rec.get("delta")
                     if delta is None and rec.get("amount") is not None:
-                        delta = rec.get("amount")
-                        typ = str(rec.get("type") or "").upper().strip()
-                        if typ in {"REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"}:
-                            try:
-                                delta = -float(delta)
-                            except Exception:
-                                pass
+                        delta = _normalize_capital_delta(rec.get("amount"), rec.get("type"))
                     rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
 
         out = pd.DataFrame(rows)
@@ -418,6 +407,26 @@ def _safe_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _normalize_capital_delta(amount: Any, flow_type: Any = None) -> Optional[float]:
+    """
+    Normalize amount sign from optional flow type.
+    - add/deposit/in/credit => +abs(amount)
+    - remove/withdraw/out/debit => -abs(amount)
+    - unknown type => amount as-is
+    """
+    amt = _safe_float(amount)
+    if amt is None:
+        return None
+    t = str(flow_type or "").strip().upper().replace("-", "_").replace(" ", "_")
+    add_types = {"ADD", "ADDED", "DEPOSIT", "DEPOSITED", "IN", "CREDIT", "CR"}
+    remove_types = {"REMOVE", "REMOVED", "WITHDRAW", "WITHDRAWAL", "WITHDRAWN", "OUT", "DEBIT", "DR"}
+    if t in add_types or t.startswith("DEPOSIT"):
+        return abs(amt)
+    if t in remove_types or t.startswith("WITHDRAW"):
+        return -abs(amt)
+    return amt
 
 
 def _parse_ts_user_ist_to_utc(x: Any) -> pd.Timestamp:
@@ -776,9 +785,45 @@ default_cycle_unit = float(st.sidebar.number_input("Default cycle unit quote", m
 manual_capital_adjustment = float(
     st.sidebar.number_input("Manual Capital Adjustment", value=0.0, step=100.0)
 )
+
+# infer strategy start timestamp from persisted pnl history
+strategy_start_ts_utc = pd.NaT
+if isinstance(pnl_daily_df, pd.DataFrame) and not pnl_daily_df.empty and "ts" in pnl_daily_df.columns:
+    ts_hist = pd.to_datetime(pnl_daily_df["ts"], utc=True, errors="coerce").dropna()
+    if not ts_hist.empty:
+        strategy_start_ts_utc = ts_hist.min()
+if pd.isna(strategy_start_ts_utc) and isinstance(pnl_df, pd.DataFrame) and not pnl_df.empty and "ts" in pnl_df.columns:
+    ts_hist2 = pd.to_datetime(pnl_df["ts"], utc=True, errors="coerce").dropna()
+    if not ts_hist2.empty:
+        strategy_start_ts_utc = ts_hist2.min()
+
 auto_capital_flow = 0.0
+capital_flow_rows_used = 0
+capital_flow_rows_excluded = 0
+capital_flow_excluded_sum = 0.0
+capital_flow_rows_bad_ts = 0
 if isinstance(capital_flows_df, pd.DataFrame) and not capital_flows_df.empty and "delta" in capital_flows_df.columns:
-    auto_capital_flow = float(pd.to_numeric(capital_flows_df["delta"], errors="coerce").fillna(0.0).sum())
+    cf = capital_flows_df.copy()
+    cf["delta_num"] = pd.to_numeric(cf["delta"], errors="coerce")
+    cf = cf[cf["delta_num"].notna()]
+    if "ts" in cf.columns:
+        cf["ts_utc"] = pd.to_datetime(cf["ts"], utc=True, errors="coerce")
+    else:
+        cf["ts_utc"] = pd.NaT
+
+    include_mask = pd.Series([True] * len(cf), index=cf.index)
+    if not pd.isna(strategy_start_ts_utc):
+        known_ts_mask = cf["ts_utc"].notna()
+        after_start_mask = known_ts_mask & (cf["ts_utc"] > strategy_start_ts_utc)
+        include_mask = include_mask & after_start_mask
+        excluded_mask = ~after_start_mask
+        capital_flow_rows_bad_ts = int((~known_ts_mask).sum())
+        capital_flow_rows_excluded = int(excluded_mask.sum())
+        if capital_flow_rows_excluded > 0:
+            capital_flow_excluded_sum = float(cf.loc[excluded_mask, "delta_num"].sum())
+
+    capital_flow_rows_used = int(include_mask.sum())
+    auto_capital_flow = float(cf.loc[include_mask, "delta_num"].sum())
 capital_added_since_start = auto_capital_flow + manual_capital_adjustment
 
 def _unit_for(sym: str) -> float:
@@ -843,8 +888,16 @@ else:
     colE.metric("Non-Strategy Value (est)", "—")
 
 if capital_flows_path:
-    st.caption(f"Capital flows auto-loaded: {capital_flows_path} | Net: {_fmt_num(auto_capital_flow)}")
+    st.caption(f"Capital flows auto-loaded: {capital_flows_path} | Net used: {_fmt_num(auto_capital_flow)}")
     st.caption("Capital flow `ts` accepts simple IST datetime like `2026-03-09 14:30`.")
+    if not pd.isna(strategy_start_ts_utc):
+        st.caption(
+            f"Using only flow rows strictly after strategy start ({str(strategy_start_ts_utc)}). "
+            f"Excluded rows: {capital_flow_rows_excluded} (sum {_fmt_num(capital_flow_excluded_sum)}), "
+            f"including bad/missing ts: {capital_flow_rows_bad_ts}."
+        )
+    else:
+        st.caption("Strategy start timestamp not found from history; all capital-flow rows are included.")
 if manual_capital_adjustment != 0:
     st.caption(f"Manual capital adjustment: {_fmt_num(manual_capital_adjustment)}")
 if capital_added_since_start != 0:
