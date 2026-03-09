@@ -327,6 +327,52 @@ def _norm_symbol(sym: Any) -> str:
     s = str(sym or "").upper()
     return "".join(ch for ch in s if ch.isalnum())
 
+
+def _resolve_manual_cmp(symbol: Any, latest_px_norm: Dict[str, float]) -> tuple[Optional[float], Optional[str]]:
+    """
+    Resolve manual symbol to CMP robustly.
+    Handles exact matches and base-symbol inputs like ETH -> ETHUSDT (if unambiguous).
+    """
+    n = _norm_symbol(symbol)
+    if not n:
+        return None, None
+    if n in latest_px_norm:
+        return latest_px_norm[n], n
+
+    def _base_of(symn: str) -> str:
+        for q in ("USDT", "USDC", "USD", "INR", "BTC", "ETH"):
+            if symn.endswith(q) and len(symn) > len(q):
+                return symn[: -len(q)]
+        return symn
+
+    # Base symbol fallback: ETH -> ETHUSDT/ETHINR/... choose only if unambiguous
+    cands = [k for k in latest_px_norm.keys() if k.startswith(n) or n.startswith(k)]
+    if not cands:
+        return None, None
+    if len(cands) == 1:
+        k = cands[0]
+        return latest_px_norm.get(k), k
+
+    # Prefer common quote suffixes if still ambiguous
+    for q in ("USDT", "USDC", "USD", "INR", "BTC", "ETH"):
+        filt = [k for k in cands if k.endswith(q)]
+        if len(filt) == 1:
+            k = filt[0]
+            return latest_px_norm.get(k), k
+
+    # base-asset fallback: ETHUSDC -> ETHUSDT if only one ETH pair is available
+    b = _base_of(n)
+    base_cands = [k for k in latest_px_norm.keys() if _base_of(k) == b]
+    if len(base_cands) == 1:
+        k = base_cands[0]
+        return latest_px_norm.get(k), k
+    for q in ("USDT", "USDC", "USD", "INR", "BTC", "ETH"):
+        filt = [k for k in base_cands if k.endswith(q)]
+        if len(filt) == 1:
+            k = filt[0]
+            return latest_px_norm.get(k), k
+    return None, None
+
 def _sum_cycles(store: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     per = store.get("per_symbol", {}) if isinstance(store, dict) else {}
     total_cycles = 0.0
@@ -786,7 +832,9 @@ if isinstance(manual_input, pd.DataFrame) and not manual_input.empty:
     manual_eval["symbol"] = manual_eval["symbol"].astype(str).str.strip()
     manual_eval = _to_num(manual_eval, ["qty", "buy_price"])
     manual_eval["symbol_norm"] = manual_eval["symbol"].apply(_norm_symbol)
-    manual_eval["cmp"] = manual_eval["symbol_norm"].map(latest_px_norm)
+    resolved = manual_eval["symbol"].apply(lambda s: _resolve_manual_cmp(s, latest_px_norm))
+    manual_eval["cmp"] = resolved.apply(lambda t: t[0] if isinstance(t, tuple) else None)
+    manual_eval["cmp_symbol"] = resolved.apply(lambda t: t[1] if isinstance(t, tuple) else None)
     manual_eval["status"] = "ok"
     manual_eval.loc[manual_eval["symbol_norm"] == "", "status"] = "missing_symbol"
     manual_eval.loc[manual_eval["qty"].isna(), "status"] = "missing_qty"
@@ -834,8 +882,12 @@ if not manual_calc.empty:
 else:
     st.warning("No valid manual positions could be used for adjusted PnL.")
     if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty:
-        show_bad = [c for c in ["symbol", "qty", "buy_price", "cmp", "status"] if c in manual_eval.columns]
+        show_bad = [c for c in ["symbol", "qty", "buy_price", "cmp_symbol", "cmp", "status"] if c in manual_eval.columns]
         st.dataframe(manual_eval[show_bad], use_container_width=True)
+
+if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty and "status" in manual_eval.columns:
+    cnt = manual_eval["status"].value_counts(dropna=False).to_dict()
+    st.caption(f"Manual rows status: {cnt}")
 
 if raw_initial is not None and adjusted_current is not None:
     st.caption(
