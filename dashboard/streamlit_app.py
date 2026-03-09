@@ -811,6 +811,7 @@ if isinstance(capital_flows_df, pd.DataFrame) and not capital_flows_df.empty and
     capital_flow_rows_used = int(len(cf))
     auto_capital_flow = float(cf["delta_num"].sum())
 capital_added_since_start = auto_capital_flow + manual_capital_adjustment
+use_capital_flows_as_effective_initial = capital_flow_rows_used > 0
 
 def _unit_for(sym: str) -> float:
     if sym in cycle_units:
@@ -857,7 +858,10 @@ if isinstance(summary, dict):
     eff_ppct = _safe_float(ppct)
     if pvf is not None and ppnlf is not None:
         raw_start = pvf - ppnlf
-        eff_start = raw_start + float(capital_added_since_start)
+        if use_capital_flows_as_effective_initial:
+            eff_start = float(capital_added_since_start)
+        else:
+            eff_start = raw_start + float(capital_added_since_start)
         eff_ppnl = pvf - eff_start
         eff_ppct = (eff_ppnl / eff_start) if eff_start > 0 else None
 
@@ -876,6 +880,7 @@ else:
 if capital_flows_path:
     st.caption(f"Capital flows auto-loaded: {capital_flows_path} | Net used: {_fmt_num(auto_capital_flow)}")
     st.caption(f"Capital-flow rows used: {capital_flow_rows_used}. `ts` is ignored for PnL calculation (reference only).")
+    st.caption("Effective Initial is driven by capital flows total (not summary start value) when rows exist.")
 if manual_capital_adjustment != 0:
     st.caption(f"Manual capital adjustment: {_fmt_num(manual_capital_adjustment)}")
 if capital_added_since_start != 0:
@@ -918,7 +923,10 @@ if raw_initial_base is None:
     elif not curve_base.empty:
         raw_initial_base = _safe_float(curve_base["portfolio_value"].iloc[0])
 
-raw_initial = (raw_initial_base + float(capital_added_since_start)) if raw_initial_base is not None else None
+if use_capital_flows_as_effective_initial:
+    raw_initial = float(capital_added_since_start)
+else:
+    raw_initial = (raw_initial_base + float(capital_added_since_start)) if raw_initial_base is not None else None
 raw_pnl = (raw_current - raw_initial) if (raw_current is not None and raw_initial is not None) else None
 
 latest_px_by_symbol: Dict[str, float] = {}
