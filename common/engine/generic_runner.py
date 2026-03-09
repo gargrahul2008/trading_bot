@@ -56,6 +56,9 @@ class GenericRunner:
             snapshot_path=os.path.join(base_dir, "positions_snapshot.json"),
             summary_path=os.path.join(base_dir, "pnl_summary.json"),
         )
+        self.price_points_path = os.path.join(base_dir, "price_points.jsonl")
+        self._last_price_point: Dict[str, str] = {}
+        os.makedirs(os.path.dirname(self.price_points_path) or ".", exist_ok=True)
         if self.manual_adjustments_path:
             os.makedirs(os.path.dirname(self.manual_adjustments_path) or ".", exist_ok=True)
 
@@ -65,6 +68,22 @@ class GenericRunner:
                 f.write(json.dumps(rec, default=str) + "\n")
         except Exception as e:
             LOG.warning("Failed writing %s: %s", path, e)
+
+    def _append_price_point(self, *, ts: str) -> None:
+        """Persist symbol price snapshots for exact adjusted-curve reconstruction."""
+        prices: Dict[str, str] = {}
+        for s in self.symbols:
+            px = self.state.last_prices.get(s)
+            if px is None:
+                continue
+            prices[s] = str(_dec(px))
+        if not prices:
+            return
+        # Write only on change to keep file growth under control.
+        if prices == self._last_price_point:
+            return
+        self._last_price_point = dict(prices)
+        self._append_jsonl(self.price_points_path, {"ts": ts, "prices": prices})
 
     def reconcile_from_broker(self) -> None:
         """Sync cash + adopt broker inventory into traded_qty (best-effort).
@@ -782,6 +801,7 @@ class GenericRunner:
                 )
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
+                self._append_price_point(ts=pt.ts)
 
                 manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
                 snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
@@ -1181,6 +1201,7 @@ class GenericRunner:
                 )
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
+                self._append_price_point(ts=pt.ts)
 
                 manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
                 snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),

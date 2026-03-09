@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -114,6 +115,8 @@ class RunFiles:
     summary_path: Optional[str]
     trades_path: Optional[str]
     manual_path: Optional[str]
+    pnl_points_path: Optional[str]
+    price_points_path: Optional[str]
 
 
 def _resolve_run_files(run_dir: str) -> RunFiles:
@@ -121,11 +124,44 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
     summary = _find_file(run_dir, ["pnl_summary.json"], ["*summary*.json", "pnl*.json"])
     trades = _find_file(run_dir, ["trades.jsonl"], ["*trades*.jsonl", "*.jsonl"])
     manual = _find_file(run_dir, ["manual_adjustments.jsonl"], ["*manual*adjust*.jsonl", "*manual*.jsonl"])
+    pnl_points = _find_file(run_dir, ["pnl_points.csv"], ["*pnl*points*.csv"])
+    price_points = _find_file(run_dir, ["price_points.jsonl"], ["*price*points*.jsonl"])
     if trades and "reject" in os.path.basename(trades).lower():
         alt = _find_file(run_dir, [], ["*trades*.jsonl"])
         if alt:
             trades = alt
-    return RunFiles(run_dir, snapshot, summary, trades, manual)
+    return RunFiles(run_dir, snapshot, summary, trades, manual, pnl_points, price_points)
+
+
+def _tail_csv_df(path: str, max_lines: int = 5000) -> pd.DataFrame:
+    """Tail-read a CSV by lines to avoid loading very large files fully."""
+    if not path or not os.path.exists(path):
+        return pd.DataFrame()
+    try:
+        with open(path, "rb") as f:
+            header = f.readline()
+            if not header:
+                return pd.DataFrame()
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = 1024 * 1024
+            data = b""
+            pos = size
+            need_nl = max_lines + 1
+            while pos > 0 and data.count(b"\n") < need_nl:
+                step = chunk if pos >= chunk else pos
+                pos -= step
+                f.seek(pos)
+                data = f.read(step) + data
+        lines = data.splitlines()
+        tail_lines = lines[-max_lines:] if max_lines > 0 else lines
+        h = header.strip()
+        if tail_lines and tail_lines[0].strip() == h:
+            tail_lines = tail_lines[1:]
+        text = header + (b"\n".join(tail_lines) + b"\n" if tail_lines else b"")
+        return pd.read_csv(io.StringIO(text.decode("utf-8", errors="ignore")))
+    except Exception:
+        return pd.DataFrame()
 
 
 def _coerce_ts(df: pd.DataFrame) -> pd.DataFrame:
@@ -148,6 +184,14 @@ def _pretty_pct(x: Any) -> str:
         return f"{v*100:.2f}%"
     except Exception:
         return str(x)
+
+
+def _fmt_num(x: Any, digits: int = 2) -> str:
+    try:
+        return f"{float(x):,.{digits}f}"
+    except Exception:
+        return "—"
+
 
 def _safe_float(x: Any) -> Optional[float]:
     try:
@@ -186,16 +230,22 @@ def _ensure_session_defaults() -> None:
     ss.setdefault("data_summary", None)
     ss.setdefault("data_trades_df", pd.DataFrame())
     ss.setdefault("data_manual_df", pd.DataFrame())
+    ss.setdefault("data_pnl_df", pd.DataFrame())
+    ss.setdefault("data_price_df", pd.DataFrame())
     ss.setdefault("data_cycle_units", {})
     ss.setdefault("data_run_files", {})
     ss.setdefault("last_loaded_at", None)
+    ss.setdefault("manual_positions_input_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"]))
+    ss.setdefault("manual_positions_seeded", False)
 
 
-def _load_all(repo_root: str, selected_runs: List[str], max_lines: int) -> None:
+def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curve_lines: int) -> None:
     run_file_map: Dict[str, RunFiles] = {}
     cycle_units: Dict[str, str] = {}
     trades: List[dict] = []
     manuals: List[dict] = []
+    pnl_frames: List[pd.DataFrame] = []
+    prices: List[dict] = []
 
     for rd in selected_runs:
         rf = _resolve_run_files(rd)
@@ -213,6 +263,21 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int) -> None:
                 r["_run_dir"] = rd
                 r["_manual_file"] = rf.manual_path
             manuals.extend(recs)
+        if rf.pnl_points_path:
+            try:
+                p = _tail_csv_df(rf.pnl_points_path, max_lines=max_curve_lines)
+                if not p.empty:
+                    p["_run_dir"] = rd
+                    p["_pnl_file"] = rf.pnl_points_path
+                    pnl_frames.append(p)
+            except Exception:
+                pass
+        if rf.price_points_path:
+            recs = _tail_jsonl(rf.price_points_path, max_lines=max_curve_lines)
+            for r in recs:
+                r["_run_dir"] = rd
+                r["_price_file"] = rf.price_points_path
+            prices.extend(recs)
 
     df = pd.DataFrame(trades)
     if not df.empty:
@@ -228,15 +293,25 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int) -> None:
     manual_df = pd.DataFrame(manuals)
     if not manual_df.empty:
         manual_df = _coerce_ts(manual_df)
+    pnl_df = pd.concat(pnl_frames, ignore_index=True) if pnl_frames else pd.DataFrame()
+    if not pnl_df.empty:
+        pnl_df = _coerce_ts(pnl_df)
+        pnl_df = _to_num(pnl_df, ["portfolio_value", "portfolio_pnl", "portfolio_pnl_pct", "strategy_total"])
+    price_df = pd.DataFrame(prices)
+    if not price_df.empty:
+        price_df = _coerce_ts(price_df)
 
     st.session_state["loaded"] = True
     st.session_state["data_snapshot"] = snapshot
     st.session_state["data_summary"] = summary
     st.session_state["data_trades_df"] = df
     st.session_state["data_manual_df"] = manual_df
+    st.session_state["data_pnl_df"] = pnl_df
+    st.session_state["data_price_df"] = price_df
     st.session_state["data_cycle_units"] = cycle_units
     st.session_state["data_run_files"] = {k: run_file_map[k].__dict__ for k in run_file_map}
     st.session_state["last_loaded_at"] = pd.Timestamp.utcnow().isoformat() + "Z"
+    st.session_state["manual_positions_seeded"] = False
 
 
 # -------------------------
@@ -272,15 +347,16 @@ selected_runs = st.sidebar.multiselect(
 )
 
 max_lines = int(st.sidebar.number_input("Max trades lines to load (tail)", min_value=1000, value=50000, step=5000))
+max_curve_lines = int(st.sidebar.number_input("Max curve points to load (tail)", min_value=500, value=5000, step=500))
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
 with col_btn1:
     if st.button("Refresh", type="primary"):
         with st.spinner("Loading data..."):
-            _load_all(repo_root, selected_runs, max_lines=max_lines)
+            _load_all(repo_root, selected_runs, max_lines=max_lines, max_curve_lines=max_curve_lines)
 with col_btn2:
     if st.button("Clear"):
-        for k in ["loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df", "data_cycle_units", "data_run_files", "last_loaded_at"]:
+        for k in ["loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df", "data_pnl_df", "data_price_df", "data_cycle_units", "data_run_files", "last_loaded_at", "manual_positions_input_df", "manual_positions_seeded"]:
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
@@ -293,6 +369,8 @@ snapshot = st.session_state.get("data_snapshot")
 summary = st.session_state.get("data_summary")
 df = st.session_state.get("data_trades_df")
 manual_df = st.session_state.get("data_manual_df")
+pnl_df = st.session_state.get("data_pnl_df")
+price_df = st.session_state.get("data_price_df")
 cycle_units = st.session_state.get("data_cycle_units") or {}
 last_loaded_at = st.session_state.get("last_loaded_at")
 
@@ -386,6 +464,218 @@ else:
     colC.metric("Bot Total (now)", "—")
     colD.metric("Bot Realized Today (UTC)", "—")
     colE.metric("Non-Strategy Value (est)", "—")
+
+# -------------------------
+# Portfolio views (raw + adjusted)
+# -------------------------
+
+st.subheader("Portfolio Views")
+
+raw_current = _safe_float(summary.get("portfolio_value")) if isinstance(summary, dict) else None
+summary_pnl = _safe_float(summary.get("portfolio_pnl")) if isinstance(summary, dict) else None
+raw_initial = (raw_current - summary_pnl) if (raw_current is not None and summary_pnl is not None) else None
+
+if isinstance(pnl_df, pd.DataFrame) and not pnl_df.empty:
+    curve_base = pnl_df.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
+    if raw_current is None and not curve_base.empty:
+        raw_current = _safe_float(curve_base["portfolio_value"].iloc[-1])
+    if raw_initial is None and not curve_base.empty:
+        raw_initial = _safe_float(curve_base["portfolio_value"].iloc[0])
+else:
+    curve_base = pd.DataFrame()
+
+raw_pnl = (raw_current - raw_initial) if (raw_current is not None and raw_initial is not None) else None
+
+latest_px_by_symbol: Dict[str, float] = {}
+if isinstance(snapshot, dict):
+    snap_symbols = snapshot.get("symbols") if isinstance(snapshot.get("symbols"), dict) else {}
+    for sym, rec in snap_symbols.items():
+        if isinstance(rec, dict):
+            px = _safe_float(rec.get("px"))
+            if px is not None:
+                latest_px_by_symbol[str(sym)] = px
+
+if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns and "price" in df.columns:
+    latest_trade_rows = df.dropna(subset=["symbol", "price"]).copy()
+    if not latest_trade_rows.empty and "ts" in latest_trade_rows.columns:
+        latest_trade_rows = latest_trade_rows.sort_values("ts")
+    latest_trade_rows = latest_trade_rows.groupby("symbol", dropna=True).tail(1)
+    for _, r in latest_trade_rows.iterrows():
+        sym = str(r.get("symbol"))
+        if sym and sym not in latest_px_by_symbol:
+            px = _safe_float(r.get("price"))
+            if px is not None:
+                latest_px_by_symbol[sym] = px
+
+if isinstance(price_df, pd.DataFrame) and not price_df.empty and "prices" in price_df.columns and "ts" in price_df.columns:
+    psrc = price_df.dropna(subset=["ts"]).copy().sort_values("ts")
+    for _, r in psrc.iterrows():
+        pmap = r.get("prices")
+        if isinstance(pmap, str):
+            try:
+                pmap = json.loads(pmap)
+            except Exception:
+                pmap = None
+        if not isinstance(pmap, dict):
+            continue
+        for sym, px in pmap.items():
+            pxf = _safe_float(px)
+            if pxf is not None:
+                latest_px_by_symbol[str(sym)] = pxf
+
+if not st.session_state.get("manual_positions_seeded", False):
+    seed_rows: List[Dict[str, Any]] = []
+    manual_map: Dict[str, Any] = {}
+    if isinstance(summary, dict) and isinstance(summary.get("manual_inventory_by_symbol"), dict):
+        manual_map = summary.get("manual_inventory_by_symbol") or {}
+    elif isinstance(snapshot, dict) and isinstance(snapshot.get("manual_inventory_by_symbol"), dict):
+        manual_map = snapshot.get("manual_inventory_by_symbol") or {}
+    for sym, qty_raw in manual_map.items():
+        qty = _safe_float(qty_raw)
+        if qty is None or qty == 0:
+            continue
+        seed_rows.append({
+            "symbol": str(sym),
+            "qty": qty,
+            "buy_price": latest_px_by_symbol.get(str(sym)),
+        })
+    st.session_state["manual_positions_input_df"] = pd.DataFrame(seed_rows, columns=["symbol", "qty", "buy_price"])
+    st.session_state["manual_positions_seeded"] = True
+
+st.caption("Add legacy/manual positions to remove their existing PnL from portfolio metrics.")
+manual_input = st.data_editor(
+    st.session_state.get("manual_positions_input_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"])),
+    num_rows="dynamic",
+    hide_index=True,
+    use_container_width=True,
+    key="manual_positions_editor",
+)
+if isinstance(manual_input, pd.DataFrame):
+    st.session_state["manual_positions_input_df"] = manual_input.copy()
+
+manual_calc = pd.DataFrame()
+manual_pnl_total = 0.0
+if isinstance(manual_input, pd.DataFrame) and not manual_input.empty:
+    manual_calc = manual_input.copy()
+    if "symbol" in manual_calc.columns:
+        manual_calc["symbol"] = manual_calc["symbol"].astype(str).str.strip()
+        manual_calc = manual_calc[manual_calc["symbol"] != ""]
+    manual_calc = _to_num(manual_calc, ["qty", "buy_price"])
+    manual_calc = manual_calc.dropna(subset=["qty", "buy_price"])
+    if not manual_calc.empty:
+        manual_calc["cmp"] = manual_calc["symbol"].map(latest_px_by_symbol)
+        manual_calc = manual_calc.dropna(subset=["cmp"])
+        if not manual_calc.empty:
+            manual_calc["manual_cost"] = manual_calc["qty"] * manual_calc["buy_price"]
+            manual_calc["manual_market"] = manual_calc["qty"] * manual_calc["cmp"]
+            manual_calc["manual_pnl"] = manual_calc["manual_market"] - manual_calc["manual_cost"]
+            manual_pnl_total = float(manual_calc["manual_pnl"].sum())
+
+adjusted_current = (raw_current - manual_pnl_total) if raw_current is not None else None
+adjusted_initial = raw_initial
+adjusted_pnl = (adjusted_current - adjusted_initial) if (adjusted_current is not None and adjusted_initial is not None) else None
+
+p1, p2, p3, p4, p5, p6 = st.columns(6)
+p1.metric("Raw Initial", _fmt_num(raw_initial))
+p2.metric("Raw Current", _fmt_num(raw_current))
+p3.metric("Raw PnL", _fmt_num(raw_pnl))
+p4.metric("Adjusted Current", _fmt_num(adjusted_current))
+p5.metric("Adjusted PnL", _fmt_num(adjusted_pnl))
+p6.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
+
+if not manual_calc.empty:
+    show_cols = [c for c in ["symbol", "qty", "buy_price", "cmp", "manual_cost", "manual_market", "manual_pnl"] if c in manual_calc.columns]
+    st.dataframe(manual_calc[show_cols], use_container_width=True)
+else:
+    st.info("No valid manual positions with both quantity, buy price, and current price.")
+
+if raw_initial is not None and adjusted_current is not None:
+    st.caption(
+        f"Adjusted current value = Raw current value ({_fmt_num(raw_current)}) - "
+        f"legacy PnL ({_fmt_num(manual_pnl_total)}) = {_fmt_num(adjusted_current)}"
+    )
+
+st.subheader("Portfolio Value Curve")
+if not curve_base.empty:
+    curve = curve_base[["ts", "portfolio_value"]].copy()
+    curve = curve.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
+    if not curve.empty:
+        exact_adjusted_drawn = False
+        if (
+            not manual_calc.empty
+            and isinstance(price_df, pd.DataFrame)
+            and not price_df.empty
+            and "prices" in price_df.columns
+            and "ts" in price_df.columns
+        ):
+            price_long_rows: List[Dict[str, Any]] = []
+            for _, r in price_df.dropna(subset=["ts"]).iterrows():
+                ts = r.get("ts")
+                pmap = r.get("prices")
+                if isinstance(pmap, str):
+                    try:
+                        pmap = json.loads(pmap)
+                    except Exception:
+                        pmap = None
+                if not isinstance(pmap, dict):
+                    continue
+                for sym, px in pmap.items():
+                    pxf = _safe_float(px)
+                    if pxf is None:
+                        continue
+                    price_long_rows.append({"ts": ts, "symbol": str(sym), "px": pxf})
+
+            price_long = pd.DataFrame(price_long_rows)
+            if not price_long.empty:
+                price_long["ts"] = pd.to_datetime(price_long["ts"], utc=True, errors="coerce")
+                price_long = price_long.dropna(subset=["ts", "symbol", "px"]).sort_values("ts")
+                curve_for_adj = curve[["ts", "portfolio_value"]].copy().sort_values("ts")
+                curve_for_adj["manual_pnl_exact"] = 0.0
+                exact_ok = True
+
+                for _, mr in manual_calc.iterrows():
+                    sym = str(mr.get("symbol"))
+                    qty = _safe_float(mr.get("qty"))
+                    buy_price = _safe_float(mr.get("buy_price"))
+                    if not sym or qty is None or buy_price is None:
+                        continue
+                    sp = price_long[price_long["symbol"] == sym][["ts", "px"]].sort_values("ts")
+                    if sp.empty:
+                        exact_ok = False
+                        break
+                    merged = pd.merge_asof(
+                        curve_for_adj[["ts"]].sort_values("ts"),
+                        sp,
+                        on="ts",
+                        direction="backward",
+                    )
+                    if merged["px"].isna().all():
+                        exact_ok = False
+                        break
+                    merged["px"] = merged["px"].ffill()
+                    if merged["px"].isna().any():
+                        exact_ok = False
+                        break
+                    curve_for_adj["manual_pnl_exact"] += qty * (merged["px"] - buy_price)
+
+                if exact_ok:
+                    curve_for_adj["portfolio_value_adj_exact"] = curve_for_adj["portfolio_value"] - curve_for_adj["manual_pnl_exact"]
+                    st.line_chart(curve_for_adj.set_index("ts")[["portfolio_value", "portfolio_value_adj_exact"]], use_container_width=True)
+                    st.caption("Adjusted curve is exact using timestamped symbol prices from price_points.jsonl.")
+                    exact_adjusted_drawn = True
+
+        if exact_adjusted_drawn:
+            pass
+        elif manual_calc.empty:
+            st.line_chart(curve.set_index("ts")[["portfolio_value"]], use_container_width=True)
+        else:
+            curve["portfolio_value_adj_est"] = curve["portfolio_value"] - manual_pnl_total
+            st.line_chart(curve.set_index("ts")[["portfolio_value", "portfolio_value_adj_est"]], use_container_width=True)
+            st.caption("Exact adjusted curve not available from loaded data. Showing estimate using constant offset from current legacy PnL.")
+    else:
+        st.info("No portfolio curve points available.")
+else:
+    st.info("No pnl_points.csv data found for selected run(s), so curve is unavailable.")
 
 # -------------------------
 # Bot summary panel
