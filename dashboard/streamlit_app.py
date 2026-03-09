@@ -124,6 +124,19 @@ class RunFiles:
 
 
 def _resolve_run_files(run_dir: str) -> RunFiles:
+    state_path = _find_file(run_dir, ["state.json"], ["*state*.json"])
+    state_raw = _safe_json_load(state_path or "")
+    extras = state_raw.get("extras", {}) if isinstance(state_raw, dict) else {}
+
+    def _extra_path(key: str) -> Optional[str]:
+        v = extras.get(key) if isinstance(extras, dict) else None
+        if not isinstance(v, str) or not v.strip():
+            return None
+        p = v.strip()
+        if not os.path.isabs(p):
+            p = os.path.normpath(os.path.join(run_dir, p))
+        return p if os.path.exists(p) else None
+
     snapshot = _find_file(run_dir, ["positions_snapshot.json"], ["*snapshot*.json", "positions*.json"])
     summary = _find_file(run_dir, ["pnl_summary.json"], ["*summary*.json", "pnl*.json"])
     trades = _find_file(run_dir, ["trades.jsonl"], ["*trades*.jsonl", "*.jsonl"])
@@ -132,35 +145,16 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
     price_points = _find_file(run_dir, ["price_points.jsonl"], ["*price*points*.jsonl"])
     pnl_daily = _find_file(run_dir, ["pnl_daily.csv"], ["*pnl*daily*.csv"])
     price_daily = _find_file(run_dir, ["price_daily.csv"], ["*price*daily*.csv"])
-    manual_positions = _find_file(
+    manual_positions = _extra_path("manual_positions_file") or _find_file(
         run_dir,
         ["manual_positions.json", "manual_positions.csv"],
         ["*manual*position*.json", "*manual*position*.csv"],
     )
-    capital_flows = _find_file(
+    capital_flows = _extra_path("capital_flows_file") or _find_file(
         run_dir,
         ["capital_flows.json", "capital_flows.csv"],
         ["*capital*flow*.json", "*capital*flow*.csv"],
     )
-    if not manual_positions:
-        state_path = _find_file(run_dir, ["state.json"], ["*state*.json"])
-        state_raw = _safe_json_load(state_path or "")
-        extras = state_raw.get("extras", {}) if isinstance(state_raw, dict) else {}
-        mpf = extras.get("manual_positions_file") if isinstance(extras, dict) else None
-        if isinstance(mpf, str) and mpf.strip():
-            mpf2 = mpf.strip()
-            if not os.path.isabs(mpf2):
-                mpf2 = os.path.normpath(os.path.join(run_dir, mpf2))
-            if os.path.exists(mpf2):
-                manual_positions = mpf2
-        if not capital_flows:
-            cff = extras.get("capital_flows_file") if isinstance(extras, dict) else None
-            if isinstance(cff, str) and cff.strip():
-                cff2 = cff.strip()
-                if not os.path.isabs(cff2):
-                    cff2 = os.path.normpath(os.path.join(run_dir, cff2))
-                if os.path.exists(cff2):
-                    capital_flows = cff2
     if trades and "reject" in os.path.basename(trades).lower():
         alt = _find_file(run_dir, [], ["*trades*.jsonl"])
         if alt:
@@ -656,9 +650,21 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     price_daily_df = pd.concat(price_daily_frames, ignore_index=True) if price_daily_frames else pd.DataFrame()
     if not price_daily_df.empty:
         price_daily_df = _coerce_ts(price_daily_df)
-    manual_positions_path = _latest_by_mtime(manual_positions_paths)
+    manual_positions_path: Optional[str] = None
+    capital_flows_path: Optional[str] = None
+    # First selected run is authoritative for external/manual files.
+    for rd in selected_runs:
+        rf = run_file_map.get(rd)
+        if rf and not manual_positions_path and rf.manual_positions_path:
+            manual_positions_path = rf.manual_positions_path
+        if rf and not capital_flows_path and rf.capital_flows_path:
+            capital_flows_path = rf.capital_flows_path
+    if not manual_positions_path:
+        manual_positions_path = _latest_by_mtime(manual_positions_paths)
+    if not capital_flows_path:
+        capital_flows_path = _latest_by_mtime(capital_flows_paths)
+
     manual_positions_df = _load_manual_positions_file(manual_positions_path or "")
-    capital_flows_path = _latest_by_mtime(capital_flows_paths)
     capital_flows_df = _load_capital_flows_file(capital_flows_path or "")
 
     st.session_state["loaded"] = True
