@@ -84,7 +84,7 @@ ts,symbol,qty,buy_price
   - `paths.capital_flows_file`: `"state/capital_flows.json"` (or `.csv`)
 - Dashboard auto-sums capital flows and adjusts portfolio PnL start accordingly.
 - Use positive `delta` for add, negative `delta` for withdraw.
-- `ts` accepts simple IST datetime (for example `2026-03-09 14:30`).
+- `ts` accepts simple IST datetime (for example `2026-03-09 14:30`), but is currently reference-only for capital-flow PnL math (all `delta` rows are summed).
 - JSON example:
 ```json
 [
