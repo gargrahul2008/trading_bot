@@ -70,3 +70,10 @@ BTCUSDT,0.25,58000
 ETHUSDT,1.5,2800
 ```
 - If config key is not set, dashboard also auto-detects `manual_positions.json` / `manual_positions.csv` in the selected run folder.
+
+## Daily portfolio curve (dashboard)
+- Runner now writes daily files in state/run folder:
+  - `pnl_daily.csv` (one finalized point per UTC day)
+  - `price_daily.csv` (daily symbol prices for exact adjusted curve)
+- Dashboard prefers these daily files, so chart remains fast even when `pnl_points.csv` is very large.
+- On first run after upgrade, runner backfills these daily files from existing `pnl_points.csv` / `price_points.jsonl` when possible.

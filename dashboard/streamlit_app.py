@@ -118,6 +118,8 @@ class RunFiles:
     pnl_points_path: Optional[str]
     price_points_path: Optional[str]
     manual_positions_path: Optional[str]
+    pnl_daily_path: Optional[str]
+    price_daily_path: Optional[str]
 
 
 def _resolve_run_files(run_dir: str) -> RunFiles:
@@ -127,6 +129,8 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
     manual = _find_file(run_dir, ["manual_adjustments.jsonl"], ["*manual*adjust*.jsonl", "*manual*.jsonl"])
     pnl_points = _find_file(run_dir, ["pnl_points.csv"], ["*pnl*points*.csv"])
     price_points = _find_file(run_dir, ["price_points.jsonl"], ["*price*points*.jsonl"])
+    pnl_daily = _find_file(run_dir, ["pnl_daily.csv"], ["*pnl*daily*.csv"])
+    price_daily = _find_file(run_dir, ["price_daily.csv"], ["*price*daily*.csv"])
     manual_positions = _find_file(
         run_dir,
         ["manual_positions.json", "manual_positions.csv"],
@@ -147,7 +151,18 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
         alt = _find_file(run_dir, [], ["*trades*.jsonl"])
         if alt:
             trades = alt
-    return RunFiles(run_dir, snapshot, summary, trades, manual, pnl_points, price_points, manual_positions)
+    return RunFiles(
+        run_dir,
+        snapshot,
+        summary,
+        trades,
+        manual,
+        pnl_points,
+        price_points,
+        manual_positions,
+        pnl_daily,
+        price_daily,
+    )
 
 
 def _load_manual_positions_file(path: str) -> pd.DataFrame:
@@ -306,6 +321,8 @@ def _ensure_session_defaults() -> None:
     ss.setdefault("data_manual_df", pd.DataFrame())
     ss.setdefault("data_pnl_df", pd.DataFrame())
     ss.setdefault("data_price_df", pd.DataFrame())
+    ss.setdefault("data_pnl_daily_df", pd.DataFrame())
+    ss.setdefault("data_price_daily_df", pd.DataFrame())
     ss.setdefault("data_manual_positions_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"]))
     ss.setdefault("data_manual_positions_path", None)
     ss.setdefault("data_cycle_units", {})
@@ -322,6 +339,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     manuals: List[dict] = []
     pnl_frames: List[pd.DataFrame] = []
     prices: List[dict] = []
+    pnl_daily_frames: List[pd.DataFrame] = []
+    price_daily_frames: List[pd.DataFrame] = []
     manual_positions_paths: List[str] = []
 
     for rd in selected_runs:
@@ -355,6 +374,24 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
                 r["_run_dir"] = rd
                 r["_price_file"] = rf.price_points_path
             prices.extend(recs)
+        if rf.pnl_daily_path:
+            try:
+                pday = pd.read_csv(rf.pnl_daily_path)
+                if not pday.empty:
+                    pday["_run_dir"] = rd
+                    pday["_pnl_daily_file"] = rf.pnl_daily_path
+                    pnl_daily_frames.append(pday)
+            except Exception:
+                pass
+        if rf.price_daily_path:
+            try:
+                prday = pd.read_csv(rf.price_daily_path)
+                if not prday.empty:
+                    prday["_run_dir"] = rd
+                    prday["_price_daily_file"] = rf.price_daily_path
+                    price_daily_frames.append(prday)
+            except Exception:
+                pass
         if rf.manual_positions_path:
             manual_positions_paths.append(rf.manual_positions_path)
 
@@ -379,6 +416,13 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     price_df = pd.DataFrame(prices)
     if not price_df.empty:
         price_df = _coerce_ts(price_df)
+    pnl_daily_df = pd.concat(pnl_daily_frames, ignore_index=True) if pnl_daily_frames else pd.DataFrame()
+    if not pnl_daily_df.empty:
+        pnl_daily_df = _coerce_ts(pnl_daily_df)
+        pnl_daily_df = _to_num(pnl_daily_df, ["portfolio_value", "portfolio_pnl", "portfolio_pnl_pct"])
+    price_daily_df = pd.concat(price_daily_frames, ignore_index=True) if price_daily_frames else pd.DataFrame()
+    if not price_daily_df.empty:
+        price_daily_df = _coerce_ts(price_daily_df)
     manual_positions_path = _latest_by_mtime(manual_positions_paths)
     manual_positions_df = _load_manual_positions_file(manual_positions_path or "")
 
@@ -389,6 +433,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     st.session_state["data_manual_df"] = manual_df
     st.session_state["data_pnl_df"] = pnl_df
     st.session_state["data_price_df"] = price_df
+    st.session_state["data_pnl_daily_df"] = pnl_daily_df
+    st.session_state["data_price_daily_df"] = price_daily_df
     st.session_state["data_manual_positions_df"] = manual_positions_df
     st.session_state["data_manual_positions_path"] = manual_positions_path
     st.session_state["data_cycle_units"] = cycle_units
@@ -439,7 +485,13 @@ with col_btn1:
             _load_all(repo_root, selected_runs, max_lines=max_lines, max_curve_lines=max_curve_lines)
 with col_btn2:
     if st.button("Clear"):
-        for k in ["loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df", "data_pnl_df", "data_price_df", "data_manual_positions_df", "data_manual_positions_path", "data_cycle_units", "data_run_files", "last_loaded_at", "manual_positions_input_df", "manual_positions_seeded"]:
+        for k in [
+            "loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df",
+            "data_pnl_df", "data_price_df", "data_pnl_daily_df", "data_price_daily_df",
+            "data_manual_positions_df", "data_manual_positions_path",
+            "data_cycle_units", "data_run_files", "last_loaded_at",
+            "manual_positions_input_df", "manual_positions_seeded",
+        ]:
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
@@ -454,6 +506,8 @@ df = st.session_state.get("data_trades_df")
 manual_df = st.session_state.get("data_manual_df")
 pnl_df = st.session_state.get("data_pnl_df")
 price_df = st.session_state.get("data_price_df")
+pnl_daily_df = st.session_state.get("data_pnl_daily_df")
+price_daily_df = st.session_state.get("data_price_daily_df")
 manual_positions_file_df = st.session_state.get("data_manual_positions_df")
 manual_positions_file_path = st.session_state.get("data_manual_positions_path")
 cycle_units = st.session_state.get("data_cycle_units") or {}
@@ -560,14 +614,32 @@ raw_current = _safe_float(summary.get("portfolio_value")) if isinstance(summary,
 summary_pnl = _safe_float(summary.get("portfolio_pnl")) if isinstance(summary, dict) else None
 raw_initial = (raw_current - summary_pnl) if (raw_current is not None and summary_pnl is not None) else None
 
+if isinstance(pnl_daily_df, pd.DataFrame) and not pnl_daily_df.empty:
+    curve_daily_base = pnl_daily_df.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
+else:
+    curve_daily_base = pd.DataFrame()
+
 if isinstance(pnl_df, pd.DataFrame) and not pnl_df.empty:
     curve_base = pnl_df.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
-    if raw_current is None and not curve_base.empty:
-        raw_current = _safe_float(curve_base["portfolio_value"].iloc[-1])
-    if raw_initial is None and not curve_base.empty:
-        raw_initial = _safe_float(curve_base["portfolio_value"].iloc[0])
 else:
     curve_base = pd.DataFrame()
+
+if curve_daily_base.empty and not curve_base.empty:
+    daily_tmp = curve_base[["ts", "portfolio_value"]].copy()
+    daily_tmp["date_utc"] = daily_tmp["ts"].dt.date.astype(str)
+    curve_daily_base = daily_tmp.sort_values("ts").groupby("date_utc", as_index=False).tail(1)
+
+if raw_current is None:
+    if not curve_daily_base.empty:
+        raw_current = _safe_float(curve_daily_base["portfolio_value"].iloc[-1])
+    elif not curve_base.empty:
+        raw_current = _safe_float(curve_base["portfolio_value"].iloc[-1])
+
+if raw_initial is None:
+    if not curve_daily_base.empty:
+        raw_initial = _safe_float(curve_daily_base["portfolio_value"].iloc[0])
+    elif not curve_base.empty:
+        raw_initial = _safe_float(curve_base["portfolio_value"].iloc[0])
 
 raw_pnl = (raw_current - raw_initial) if (raw_current is not None and raw_initial is not None) else None
 
@@ -692,20 +764,44 @@ if raw_initial is not None and adjusted_current is not None:
     )
 
 st.subheader("Portfolio Value Curve")
-if not curve_base.empty:
-    curve = curve_base[["ts", "portfolio_value"]].copy()
+st.caption("Curve uses daily points (one point per UTC day).")
+curve = curve_daily_base[["ts", "portfolio_value"]].copy() if not curve_daily_base.empty else pd.DataFrame()
+if curve.empty:
+    s_ts = pd.to_datetime(summary.get("ts"), utc=True, errors="coerce") if isinstance(summary, dict) else pd.NaT
+    if pd.isna(s_ts):
+        s_ts = pd.Timestamp.utcnow()
+    s_val = _safe_float(summary.get("portfolio_value")) if isinstance(summary, dict) else None
+    if s_val is not None:
+        curve = pd.DataFrame([{"ts": s_ts, "portfolio_value": s_val}])
+if not curve.empty:
+    # include current day point so today's daily value is visible even before UTC rollover flush.
+    s_ts = pd.to_datetime(summary.get("ts"), utc=True, errors="coerce") if isinstance(summary, dict) else pd.NaT
+    if pd.isna(s_ts):
+        s_ts = pd.Timestamp.utcnow()
+    s_val = _safe_float(summary.get("portfolio_value")) if isinstance(summary, dict) else None
+    if s_val is not None:
+        dcur = str(s_ts.date())
+        curve["date_utc"] = curve["ts"].dt.date.astype(str)
+        if dcur in curve["date_utc"].tolist():
+            idx = curve.index[curve["date_utc"] == dcur][-1]
+            if s_ts >= curve.loc[idx, "ts"]:
+                curve.loc[idx, "ts"] = s_ts
+                curve.loc[idx, "portfolio_value"] = s_val
+        else:
+            curve = pd.concat([curve, pd.DataFrame([{"ts": s_ts, "portfolio_value": s_val, "date_utc": dcur}])], ignore_index=True)
     curve = curve.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
     if not curve.empty:
         exact_adjusted_drawn = False
         if (
             not manual_calc.empty
-            and isinstance(price_df, pd.DataFrame)
-            and not price_df.empty
-            and "prices" in price_df.columns
-            and "ts" in price_df.columns
+            and (
+                (isinstance(price_daily_df, pd.DataFrame) and not price_daily_df.empty and "prices" in price_daily_df.columns and "ts" in price_daily_df.columns)
+                or (isinstance(price_df, pd.DataFrame) and not price_df.empty and "prices" in price_df.columns and "ts" in price_df.columns)
+            )
         ):
-            price_long_rows: List[Dict[str, Any]] = []
-            for _, r in price_df.dropna(subset=["ts"]).iterrows():
+            price_source = price_daily_df if isinstance(price_daily_df, pd.DataFrame) and not price_daily_df.empty else price_df
+            price_rows: List[Dict[str, Any]] = []
+            for _, r in price_source.dropna(subset=["ts"]).iterrows():
                 ts = r.get("ts")
                 pmap = r.get("prices")
                 if isinstance(pmap, str):
@@ -719,12 +815,13 @@ if not curve_base.empty:
                     pxf = _safe_float(px)
                     if pxf is None:
                         continue
-                    price_long_rows.append({"ts": ts, "symbol": str(sym), "px": pxf})
+                    price_rows.append({"ts": ts, "symbol": str(sym), "px": pxf})
 
-            price_long = pd.DataFrame(price_long_rows)
+            price_long = pd.DataFrame(price_rows)
             if not price_long.empty:
                 price_long["ts"] = pd.to_datetime(price_long["ts"], utc=True, errors="coerce")
                 price_long = price_long.dropna(subset=["ts", "symbol", "px"]).sort_values("ts")
+
                 curve_for_adj = curve[["ts", "portfolio_value"]].copy().sort_values("ts")
                 curve_for_adj["manual_pnl_exact"] = 0.0
                 exact_ok = True
@@ -757,7 +854,8 @@ if not curve_base.empty:
                 if exact_ok:
                     curve_for_adj["portfolio_value_adj_exact"] = curve_for_adj["portfolio_value"] - curve_for_adj["manual_pnl_exact"]
                     st.line_chart(curve_for_adj.set_index("ts")[["portfolio_value", "portfolio_value_adj_exact"]], use_container_width=True)
-                    st.caption("Adjusted curve is exact using timestamped symbol prices from price_points.jsonl.")
+                    src_nm = "price_daily.csv" if price_source is price_daily_df else "price_points.jsonl"
+                    st.caption(f"Adjusted curve is exact using timestamped prices from {src_nm}.")
                     exact_adjusted_drawn = True
 
         if exact_adjusted_drawn:
@@ -771,7 +869,7 @@ if not curve_base.empty:
     else:
         st.info("No portfolio curve points available.")
 else:
-    st.info("No pnl_points.csv data found for selected run(s), so curve is unavailable.")
+    st.info("No daily portfolio curve data available yet.")
 
 # -------------------------
 # Bot summary panel

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import datetime as dt
+import csv
 import os
 import json
 import time
@@ -57,8 +58,13 @@ class GenericRunner:
             summary_path=os.path.join(base_dir, "pnl_summary.json"),
         )
         self.price_points_path = os.path.join(base_dir, "price_points.jsonl")
+        self.pnl_daily_path = os.path.join(base_dir, "pnl_daily.csv")
+        self.price_daily_path = os.path.join(base_dir, "price_daily.csv")
         self._last_price_point: Dict[str, str] = {}
         os.makedirs(os.path.dirname(self.price_points_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(self.pnl_daily_path) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(self.price_daily_path) or ".", exist_ok=True)
+        self._maybe_backfill_daily_files()
         if self.manual_adjustments_path:
             os.makedirs(os.path.dirname(self.manual_adjustments_path) or ".", exist_ok=True)
 
@@ -84,6 +90,154 @@ class GenericRunner:
             return
         self._last_price_point = dict(prices)
         self._append_jsonl(self.price_points_path, {"ts": ts, "prices": prices})
+
+    def _append_daily_csv_row(self, path: str, fieldnames: List[str], row: Dict[str, Any]) -> None:
+        exists = os.path.exists(path)
+        try:
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fieldnames)
+                if not exists:
+                    w.writeheader()
+                w.writerow({k: row.get(k, "") for k in fieldnames})
+        except Exception as e:
+            LOG.warning("Failed writing %s: %s", path, e)
+
+    def _maybe_backfill_daily_files(self) -> None:
+        # One-time backfill so dashboard can show long history immediately.
+        if not os.path.exists(self.pnl_daily_path):
+            src = getattr(self._pnl_writer, "csv_path", "")
+            if src and os.path.exists(src):
+                try:
+                    out_rows: List[Dict[str, str]] = []
+                    prev_date = ""
+                    prev_row: Dict[str, str] | None = None
+                    with open(src, "r", encoding="utf-8", newline="") as f:
+                        r = csv.DictReader(f)
+                        for row in r:
+                            ts = str(row.get("ts") or "")
+                            if len(ts) < 10:
+                                continue
+                            d = ts[:10]
+                            slim = {
+                                "date_utc": d,
+                                "ts": ts,
+                                "portfolio_value": str(row.get("portfolio_value") or ""),
+                                "portfolio_pnl": str(row.get("portfolio_pnl") or ""),
+                                "portfolio_pnl_pct": str(row.get("portfolio_pnl_pct") or ""),
+                            }
+                            if not prev_date:
+                                prev_date = d
+                                prev_row = slim
+                                continue
+                            if d != prev_date and prev_row:
+                                out_rows.append(prev_row)
+                            prev_date = d
+                            prev_row = slim
+                    if prev_row:
+                        out_rows.append(prev_row)
+                    if out_rows:
+                        with open(self.pnl_daily_path, "w", encoding="utf-8", newline="") as f:
+                            w = csv.DictWriter(f, fieldnames=["date_utc", "ts", "portfolio_value", "portfolio_pnl", "portfolio_pnl_pct"])
+                            w.writeheader()
+                            for rr in out_rows:
+                                w.writerow(rr)
+                        LOG.info("Backfilled %s daily portfolio points into %s", len(out_rows), self.pnl_daily_path)
+                except Exception as e:
+                    LOG.warning("Daily pnl backfill failed: %s", e)
+
+        if not os.path.exists(self.price_daily_path) and os.path.exists(self.price_points_path):
+            try:
+                out_rows2: List[Dict[str, str]] = []
+                prev_date = ""
+                prev_row: Dict[str, str] | None = None
+                with open(self.price_points_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        ts = str(rec.get("ts") or "")
+                        prices = rec.get("prices")
+                        if len(ts) < 10 or not isinstance(prices, dict):
+                            continue
+                        d = ts[:10]
+                        slim = {"date_utc": d, "ts": ts, "prices": json.dumps(prices)}
+                        if not prev_date:
+                            prev_date = d
+                            prev_row = slim
+                            continue
+                        if d != prev_date and prev_row:
+                            out_rows2.append(prev_row)
+                        prev_date = d
+                        prev_row = slim
+                if prev_row:
+                    out_rows2.append(prev_row)
+                if out_rows2:
+                    with open(self.price_daily_path, "w", encoding="utf-8", newline="") as f:
+                        w = csv.DictWriter(f, fieldnames=["date_utc", "ts", "prices"])
+                        w.writeheader()
+                        for rr in out_rows2:
+                            w.writerow(rr)
+                    LOG.info("Backfilled %s daily price points into %s", len(out_rows2), self.price_daily_path)
+            except Exception as e:
+                LOG.warning("Daily price backfill failed: %s", e)
+
+    def _update_daily_points(self, *, pt: PnLPoint) -> None:
+        """
+        Keep one finalized point per UTC day.
+        We flush previous day when a new UTC day starts.
+        """
+        try:
+            dt_utc = dt.datetime.fromisoformat(str(pt.ts))
+        except Exception:
+            dt_utc = utcnow()
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=dt.timezone.utc)
+        date_utc = dt_utc.date().isoformat()
+
+        prices: Dict[str, str] = {}
+        for s in self.symbols:
+            px = self.state.last_prices.get(s)
+            if px is not None:
+                prices[s] = str(_dec(px))
+
+        pending_date = str(self.state.extras.get("pnl_daily_pending_date") or "")
+        if pending_date and pending_date != date_utc:
+            prev_row = {
+                "date_utc": pending_date,
+                "ts": str(self.state.extras.get("pnl_daily_pending_ts") or ""),
+                "portfolio_value": str(self.state.extras.get("pnl_daily_pending_portfolio_value") or ""),
+                "portfolio_pnl": str(self.state.extras.get("pnl_daily_pending_portfolio_pnl") or ""),
+                "portfolio_pnl_pct": str(self.state.extras.get("pnl_daily_pending_portfolio_pnl_pct") or ""),
+            }
+            if prev_row["portfolio_value"]:
+                self._append_daily_csv_row(
+                    self.pnl_daily_path,
+                    ["date_utc", "ts", "portfolio_value", "portfolio_pnl", "portfolio_pnl_pct"],
+                    prev_row,
+                )
+
+            prev_prices_json = str(self.state.extras.get("pnl_daily_pending_prices_json") or "")
+            if prev_prices_json:
+                self._append_daily_csv_row(
+                    self.price_daily_path,
+                    ["date_utc", "ts", "prices"],
+                    {
+                        "date_utc": pending_date,
+                        "ts": str(self.state.extras.get("pnl_daily_pending_ts") or ""),
+                        "prices": prev_prices_json,
+                    },
+                )
+
+        self.state.extras["pnl_daily_pending_date"] = date_utc
+        self.state.extras["pnl_daily_pending_ts"] = str(pt.ts)
+        self.state.extras["pnl_daily_pending_portfolio_value"] = str(pt.portfolio_value)
+        self.state.extras["pnl_daily_pending_portfolio_pnl"] = str(pt.portfolio_pnl)
+        self.state.extras["pnl_daily_pending_portfolio_pnl_pct"] = str(pt.portfolio_pnl_pct)
+        self.state.extras["pnl_daily_pending_prices_json"] = json.dumps(prices)
 
     def reconcile_from_broker(self) -> None:
         """Sync cash + adopt broker inventory into traded_qty (best-effort).
@@ -802,6 +956,7 @@ class GenericRunner:
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
                 self._append_price_point(ts=pt.ts)
+                self._update_daily_points(pt=pt)
 
                 manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
                 snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
@@ -1202,6 +1357,7 @@ class GenericRunner:
                 if self._pnl_writer:
                     self._pnl_writer.append(pt)
                 self._append_price_point(ts=pt.ts)
+                self._update_daily_points(pt=pt)
 
                 manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
                 snap = {"ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
