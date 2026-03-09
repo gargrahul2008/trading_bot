@@ -280,7 +280,13 @@ def _load_capital_flows_file(path: str) -> pd.DataFrame:
             out = pd.DataFrame()
             out["ts"] = raw_df.get("ts") if "ts" in raw_df.columns else raw_df.get("date")
             if "delta" in raw_df.columns:
-                out["delta"] = raw_df.get("delta")
+                if "type" in raw_df.columns:
+                    out["delta"] = [
+                        _normalize_capital_delta(d, typ)
+                        for d, typ in zip(raw_df["delta"], raw_df["type"])
+                    ]
+                else:
+                    out["delta"] = raw_df.get("delta")
             elif "amount" in raw_df.columns:
                 if "type" in raw_df.columns:
                     out["delta"] = [
@@ -305,7 +311,9 @@ def _load_capital_flows_file(path: str) -> pd.DataFrame:
                 if not isinstance(rec, dict):
                     continue
                 delta = rec.get("delta")
-                if delta is None and rec.get("amount") is not None:
+                if delta is not None:
+                    delta = _normalize_capital_delta(delta, rec.get("type"))
+                elif rec.get("amount") is not None:
                     delta = _normalize_capital_delta(rec.get("amount"), rec.get("type"))
                 rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
         elif isinstance(raw, dict):
@@ -315,7 +323,9 @@ def _load_capital_flows_file(path: str) -> pd.DataFrame:
                     if not isinstance(rec, dict):
                         continue
                     delta = rec.get("delta")
-                    if delta is None and rec.get("amount") is not None:
+                    if delta is not None:
+                        delta = _normalize_capital_delta(delta, rec.get("type"))
+                    elif rec.get("amount") is not None:
                         delta = _normalize_capital_delta(rec.get("amount"), rec.get("type"))
                     rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
 
