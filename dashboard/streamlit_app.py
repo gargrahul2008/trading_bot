@@ -834,48 +834,16 @@ def _unit_for(sym: str) -> float:
 
 
 # -------------------------
-# Top metrics
+# Summary context
 # -------------------------
 
-colA, colB, colC, colD, colE = st.columns(5)
-
+st_real_all = None
+st_real_td = None
 if isinstance(summary, dict):
-    pv = summary.get("portfolio_value")
-    ppnl = summary.get("portfolio_pnl")
-    ppct = summary.get("portfolio_pnl_pct")
     created = summary.get("created") if isinstance(summary.get("created"), dict) else {}
     bot = summary.get("bot") if isinstance(summary.get("bot"), dict) else {}
-    non_strategy = summary.get("non_strategy") if isinstance(summary.get("non_strategy"), dict) else {}
-
     st_real_all = bot.get("realized_all_time") if bot.get("realized_all_time") is not None else created.get("strategy_realized_all_time")
     st_real_td = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
-    nsv = non_strategy.get("value_est")
-    nsp = non_strategy.get("value_pct_est")
-
-    pvf = _safe_float(pv)
-    ppnlf = _safe_float(ppnl)
-    eff_ppnl = ppnlf
-    eff_ppct = _safe_float(ppct)
-    if pvf is not None and ppnlf is not None:
-        raw_start = pvf - ppnlf
-        if use_capital_flows_as_effective_initial:
-            eff_start = float(capital_added_since_start)
-        else:
-            eff_start = raw_start + float(capital_added_since_start)
-        eff_ppnl = pvf - eff_start
-        eff_ppct = (eff_ppnl / eff_start) if eff_start > 0 else None
-
-    colA.metric("Portfolio Value", str(pv) if pv is not None else "—")
-    colB.metric("Portfolio PnL", _fmt_num(eff_ppnl), delta=_pretty_pct(eff_ppct) if eff_ppct is not None else None)
-    colC.metric("Bot Total (realized)", str(st_real_all) if st_real_all is not None else "—")
-    colD.metric("Bot Realized Today (UTC)", str(st_real_td) if st_real_td is not None else "—")
-    colE.metric("Non-Strategy Value (est)", str(nsv) if nsv is not None else "—", delta=_pretty_pct(nsp) if nsp is not None else None)
-else:
-    colA.metric("Portfolio Value", "—")
-    colB.metric("Portfolio PnL", "—")
-    colC.metric("Bot Total (realized)", "—")
-    colD.metric("Bot Realized Today (UTC)", "—")
-    colE.metric("Non-Strategy Value (est)", "—")
 
 if capital_flows_path:
     st.caption(f"Capital flows auto-loaded: {capital_flows_path} | Net used: {_fmt_num(auto_capital_flow)}")
@@ -1046,13 +1014,18 @@ adjusted_current = (raw_current - manual_pnl_total) if raw_current is not None e
 adjusted_initial = raw_initial
 adjusted_pnl = (adjusted_current - adjusted_initial) if (adjusted_current is not None and adjusted_initial is not None) else None
 
-p1, p2, p3, p4, p5, p6 = st.columns(6)
-p1.metric("Effective Initial", _fmt_num(raw_initial))
-p2.metric("Raw Current", _fmt_num(raw_current))
-p3.metric("Portfolio PnL (effective)", _fmt_num(raw_pnl))
-p4.metric("Adjusted Current", _fmt_num(adjusted_current))
-p5.metric("Adjusted PnL (vs effective initial)", _fmt_num(adjusted_pnl))
-p6.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
+raw_pnl_pct = (raw_pnl / raw_initial) if (raw_pnl is not None and raw_initial is not None and raw_initial > 0) else None
+adjusted_pnl_pct = (adjusted_pnl / adjusted_initial) if (adjusted_pnl is not None and adjusted_initial is not None and adjusted_initial > 0) else None
+
+m1, m2, m3, m4, m5, m6, m7, m8 = st.columns(8)
+m1.metric("Portfolio Initial", _fmt_num(raw_initial))
+m2.metric("Portfolio Value", _fmt_num(raw_current))
+m3.metric("Portfolio PnL", _fmt_num(raw_pnl), delta=_pretty_pct(raw_pnl_pct) if raw_pnl_pct is not None else None)
+m4.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
+m5.metric("Adjusted Current", _fmt_num(adjusted_current))
+m6.metric("Adjusted PnL", _fmt_num(adjusted_pnl), delta=_pretty_pct(adjusted_pnl_pct) if adjusted_pnl_pct is not None else None)
+m7.metric("Bot Total (realized)", str(st_real_all) if st_real_all is not None else "—")
+m8.metric("Bot Realized Today (UTC)", str(st_real_td) if st_real_td is not None else "—")
 
 st.caption("Add legacy/manual positions to remove their existing PnL from portfolio metrics.")
 st.caption("`ts` is optional. If timezone is omitted, it is treated as IST (example: `2026-03-09 14:30`).")
@@ -1306,8 +1279,6 @@ if isinstance(snapshot, dict):
     with c2:
         st.markdown("**Bot**")
         st.json(snapshot.get("bot", {}))
-        st.markdown("**Non-Strategy (est)**")
-        st.json(snapshot.get("non_strategy", {}))
         st.markdown("**Manual Inventory**")
         st.json(snapshot.get("manual_inventory_by_symbol", {}))
         st.markdown("**Created**")
