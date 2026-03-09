@@ -120,6 +120,7 @@ class RunFiles:
     manual_positions_path: Optional[str]
     pnl_daily_path: Optional[str]
     price_daily_path: Optional[str]
+    capital_flows_path: Optional[str]
 
 
 def _resolve_run_files(run_dir: str) -> RunFiles:
@@ -136,6 +137,11 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
         ["manual_positions.json", "manual_positions.csv"],
         ["*manual*position*.json", "*manual*position*.csv"],
     )
+    capital_flows = _find_file(
+        run_dir,
+        ["capital_flows.json", "capital_flows.csv"],
+        ["*capital*flow*.json", "*capital*flow*.csv"],
+    )
     if not manual_positions:
         state_path = _find_file(run_dir, ["state.json"], ["*state*.json"])
         state_raw = _safe_json_load(state_path or "")
@@ -147,6 +153,14 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
                 mpf2 = os.path.normpath(os.path.join(run_dir, mpf2))
             if os.path.exists(mpf2):
                 manual_positions = mpf2
+        if not capital_flows:
+            cff = extras.get("capital_flows_file") if isinstance(extras, dict) else None
+            if isinstance(cff, str) and cff.strip():
+                cff2 = cff.strip()
+                if not os.path.isabs(cff2):
+                    cff2 = os.path.normpath(os.path.join(run_dir, cff2))
+                if os.path.exists(cff2):
+                    capital_flows = cff2
     if trades and "reject" in os.path.basename(trades).lower():
         alt = _find_file(run_dir, [], ["*trades*.jsonl"])
         if alt:
@@ -162,19 +176,21 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
         manual_positions,
         pnl_daily,
         price_daily,
+        capital_flows,
     )
 
 
 def _load_manual_positions_file(path: str) -> pd.DataFrame:
     if not path or not os.path.exists(path):
-        return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+        return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
     ext = Path(path).suffix.lower()
     try:
         if ext == ".csv":
             raw_df = pd.read_csv(path)
             if raw_df.empty:
-                return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+                return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
             out = pd.DataFrame()
+            out["ts"] = raw_df.get("ts") if "ts" in raw_df.columns else raw_df.get("date")
             out["symbol"] = raw_df.get("symbol")
             out["qty"] = raw_df.get("qty") if "qty" in raw_df.columns else raw_df.get("quantity")
             if "buy_price" in raw_df.columns:
@@ -187,7 +203,7 @@ def _load_manual_positions_file(path: str) -> pd.DataFrame:
             out["symbol"] = out["symbol"].astype(str).str.strip()
             out = _to_num(out, ["qty", "buy_price"])
             out = out.dropna(subset=["qty", "buy_price"])
-            return out[["symbol", "qty", "buy_price"]]
+            return out[["ts", "symbol", "qty", "buy_price"]]
 
         raw = _safe_json_load(path)
         rows: List[Dict[str, Any]] = []
@@ -199,7 +215,7 @@ def _load_manual_positions_file(path: str) -> pd.DataFrame:
                 bp = rec.get("price")
             if bp is None:
                 bp = rec.get("avg_price")
-            rows.append({"symbol": sym, "qty": qty, "buy_price": bp})
+            rows.append({"ts": rec.get("ts") or rec.get("date"), "symbol": sym, "qty": qty, "buy_price": bp})
 
         if isinstance(raw, list):
             for rec in raw:
@@ -222,27 +238,108 @@ def _load_manual_positions_file(path: str) -> pd.DataFrame:
                     _append_row(rec, sym)
                 elif isinstance(rec, list):
                     if len(rec) >= 2 and not any(isinstance(lot, dict) for lot in rec):
-                        rows.append({"symbol": sym, "qty": rec[0], "buy_price": rec[1]})
+                        rows.append({"ts": None, "symbol": sym, "qty": rec[0], "buy_price": rec[1]})
                     else:
                         for lot in rec:
                             if isinstance(lot, dict):
                                 _append_row(lot, sym)
                 elif isinstance(rec, tuple) and len(rec) >= 2:
                     rows.append({
+                        "ts": None,
                         "symbol": sym,
                         "qty": rec[0],
                         "buy_price": rec[1],
                     })
         out = pd.DataFrame(rows)
         if out.empty:
-            return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+            return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
         out = out.dropna(subset=["symbol", "qty", "buy_price"])
         out["symbol"] = out["symbol"].astype(str).str.strip()
         out = _to_num(out, ["qty", "buy_price"])
         out = out.dropna(subset=["qty", "buy_price"])
-        return out[["symbol", "qty", "buy_price"]]
+        return out[["ts", "symbol", "qty", "buy_price"]]
     except Exception:
-        return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+        return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
+
+
+def _load_capital_flows_file(path: str) -> pd.DataFrame:
+    """
+    Returns normalized columns:
+      - ts (optional)
+      - delta (positive add, negative remove)
+      - note (optional)
+    """
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(columns=["ts", "delta", "note"])
+    ext = Path(path).suffix.lower()
+    try:
+        if ext == ".csv":
+            raw_df = pd.read_csv(path)
+            if raw_df.empty:
+                return pd.DataFrame(columns=["ts", "delta", "note"])
+            out = pd.DataFrame()
+            out["ts"] = raw_df.get("ts") if "ts" in raw_df.columns else raw_df.get("date")
+            if "delta" in raw_df.columns:
+                out["delta"] = raw_df.get("delta")
+            elif "amount" in raw_df.columns:
+                out["delta"] = raw_df.get("amount")
+                if "type" in raw_df.columns:
+                    t = raw_df["type"].astype(str).str.upper().str.strip()
+                    out.loc[t.isin(["REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"]), "delta"] = -pd.to_numeric(
+                        raw_df.loc[t.isin(["REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"]), "amount"], errors="coerce"
+                    )
+            else:
+                out["delta"] = None
+            out["note"] = raw_df.get("note")
+            out = _to_num(out, ["delta"])
+            out = out.dropna(subset=["delta"])
+            out["ts_utc"] = out["ts"].apply(_parse_ts_user_ist_to_utc)
+            out.loc[out["ts_utc"].notna(), "ts"] = out.loc[out["ts_utc"].notna(), "ts_utc"].astype(str)
+            return out[["ts", "delta", "note"]]
+
+        raw = _safe_json_load(path)
+        rows: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            for rec in raw:
+                if not isinstance(rec, dict):
+                    continue
+                delta = rec.get("delta")
+                if delta is None and rec.get("amount") is not None:
+                    delta = rec.get("amount")
+                    typ = str(rec.get("type") or "").upper().strip()
+                    if typ in {"REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"}:
+                        try:
+                            delta = -float(delta)
+                        except Exception:
+                            pass
+                rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
+        elif isinstance(raw, dict):
+            arr = raw.get("flows") or raw.get("capital_flows") or raw.get("data")
+            if isinstance(arr, list):
+                for rec in arr:
+                    if not isinstance(rec, dict):
+                        continue
+                    delta = rec.get("delta")
+                    if delta is None and rec.get("amount") is not None:
+                        delta = rec.get("amount")
+                        typ = str(rec.get("type") or "").upper().strip()
+                        if typ in {"REMOVE", "WITHDRAW", "WITHDRAWAL", "OUT"}:
+                            try:
+                                delta = -float(delta)
+                            except Exception:
+                                pass
+                    rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
+
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return pd.DataFrame(columns=["ts", "delta", "note"])
+        out = _to_num(out, ["delta"])
+        out = out.dropna(subset=["delta"])
+        out["ts_utc"] = out["ts"].apply(_parse_ts_user_ist_to_utc)
+        out.loc[out["ts_utc"].notna(), "ts"] = out.loc[out["ts_utc"].notna(), "ts_utc"].astype(str)
+        return out[["ts", "delta", "note"]]
+    except Exception:
+        return pd.DataFrame(columns=["ts", "delta", "note"])
 
 
 def _tail_csv_df(path: str, max_lines: int = 5000) -> pd.DataFrame:
@@ -321,6 +418,33 @@ def _safe_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+
+def _parse_ts_user_ist_to_utc(x: Any) -> pd.Timestamp:
+    """
+    Parse user-entered timestamp.
+    If timezone is missing, treat it as IST (Asia/Kolkata), then convert to UTC.
+    Accepted examples:
+      - 2026-03-09 14:30
+      - 2026-03-09 14:30:45
+      - 2026-03-09T14:30
+      - 2026-03-09 14:30 IST
+    """
+    if x is None:
+        return pd.NaT
+    s = str(x).strip()
+    if not s or s.lower() in {"none", "nan", "nat"}:
+        return pd.NaT
+    s = s.replace(" IST", "").replace(" ist", "").replace("IST", "").strip()
+    ts = pd.to_datetime(s, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    if ts.tzinfo is None:
+        try:
+            ts = ts.tz_localize("Asia/Kolkata")
+        except Exception:
+            return pd.NaT
+    return ts.tz_convert("UTC")
 
 
 def _norm_symbol(sym: Any) -> str:
@@ -408,12 +532,14 @@ def _ensure_session_defaults() -> None:
     ss.setdefault("data_price_df", pd.DataFrame())
     ss.setdefault("data_pnl_daily_df", pd.DataFrame())
     ss.setdefault("data_price_daily_df", pd.DataFrame())
-    ss.setdefault("data_manual_positions_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"]))
+    ss.setdefault("data_manual_positions_df", pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"]))
     ss.setdefault("data_manual_positions_path", None)
+    ss.setdefault("data_capital_flows_df", pd.DataFrame(columns=["ts", "delta", "note"]))
+    ss.setdefault("data_capital_flows_path", None)
     ss.setdefault("data_cycle_units", {})
     ss.setdefault("data_run_files", {})
     ss.setdefault("last_loaded_at", None)
-    ss.setdefault("manual_positions_input_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"]))
+    ss.setdefault("manual_positions_input_df", pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"]))
     ss.setdefault("manual_positions_seeded", False)
 
 
@@ -427,6 +553,7 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     pnl_daily_frames: List[pd.DataFrame] = []
     price_daily_frames: List[pd.DataFrame] = []
     manual_positions_paths: List[str] = []
+    capital_flows_paths: List[str] = []
 
     for rd in selected_runs:
         rf = _resolve_run_files(rd)
@@ -479,6 +606,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
                 pass
         if rf.manual_positions_path:
             manual_positions_paths.append(rf.manual_positions_path)
+        if rf.capital_flows_path:
+            capital_flows_paths.append(rf.capital_flows_path)
 
     df = pd.DataFrame(trades)
     if not df.empty:
@@ -510,6 +639,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
         price_daily_df = _coerce_ts(price_daily_df)
     manual_positions_path = _latest_by_mtime(manual_positions_paths)
     manual_positions_df = _load_manual_positions_file(manual_positions_path or "")
+    capital_flows_path = _latest_by_mtime(capital_flows_paths)
+    capital_flows_df = _load_capital_flows_file(capital_flows_path or "")
 
     st.session_state["loaded"] = True
     st.session_state["data_snapshot"] = snapshot
@@ -522,6 +653,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     st.session_state["data_price_daily_df"] = price_daily_df
     st.session_state["data_manual_positions_df"] = manual_positions_df
     st.session_state["data_manual_positions_path"] = manual_positions_path
+    st.session_state["data_capital_flows_df"] = capital_flows_df
+    st.session_state["data_capital_flows_path"] = capital_flows_path
     st.session_state["data_cycle_units"] = cycle_units
     st.session_state["data_run_files"] = {k: run_file_map[k].__dict__ for k in run_file_map}
     st.session_state["last_loaded_at"] = pd.Timestamp.utcnow().isoformat() + "Z"
@@ -574,6 +707,7 @@ with col_btn2:
             "loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df",
             "data_pnl_df", "data_price_df", "data_pnl_daily_df", "data_price_daily_df",
             "data_manual_positions_df", "data_manual_positions_path",
+            "data_capital_flows_df", "data_capital_flows_path",
             "data_cycle_units", "data_run_files", "last_loaded_at",
             "manual_positions_input_df", "manual_positions_seeded",
         ]:
@@ -595,6 +729,8 @@ pnl_daily_df = st.session_state.get("data_pnl_daily_df")
 price_daily_df = st.session_state.get("data_price_daily_df")
 manual_positions_file_df = st.session_state.get("data_manual_positions_df")
 manual_positions_file_path = st.session_state.get("data_manual_positions_path")
+capital_flows_df = st.session_state.get("data_capital_flows_df")
+capital_flows_path = st.session_state.get("data_capital_flows_path")
 cycle_units = st.session_state.get("data_cycle_units") or {}
 last_loaded_at = st.session_state.get("last_loaded_at")
 
@@ -637,9 +773,13 @@ else:
     pnl_date = pd.Timestamp.utcnow().date()
 
 default_cycle_unit = float(st.sidebar.number_input("Default cycle unit quote", min_value=1.0, value=1500.0, step=100.0))
-capital_added_since_start = float(
-    st.sidebar.number_input("Capital Added Since Start", min_value=0.0, value=0.0, step=100.0)
+manual_capital_adjustment = float(
+    st.sidebar.number_input("Manual Capital Adjustment", value=0.0, step=100.0)
 )
+auto_capital_flow = 0.0
+if isinstance(capital_flows_df, pd.DataFrame) and not capital_flows_df.empty and "delta" in capital_flows_df.columns:
+    auto_capital_flow = float(pd.to_numeric(capital_flows_df["delta"], errors="coerce").fillna(0.0).sum())
+capital_added_since_start = auto_capital_flow + manual_capital_adjustment
 
 def _unit_for(sym: str) -> float:
     if sym in cycle_units:
@@ -702,8 +842,13 @@ else:
     colD.metric("Bot Realized Today (UTC)", "—")
     colE.metric("Non-Strategy Value (est)", "—")
 
-if capital_added_since_start > 0:
-    st.caption(f"Portfolio PnL adjusted for additional capital added since start: {_fmt_num(capital_added_since_start)}")
+if capital_flows_path:
+    st.caption(f"Capital flows auto-loaded: {capital_flows_path} | Net: {_fmt_num(auto_capital_flow)}")
+    st.caption("Capital flow `ts` accepts simple IST datetime like `2026-03-09 14:30`.")
+if manual_capital_adjustment != 0:
+    st.caption(f"Manual capital adjustment: {_fmt_num(manual_capital_adjustment)}")
+if capital_added_since_start != 0:
+    st.caption(f"Total capital adjustment applied: {_fmt_num(capital_added_since_start)}")
 
 # -------------------------
 # Portfolio views (raw + adjusted)
@@ -793,7 +938,7 @@ if not st.session_state.get("manual_positions_seeded", False):
     seed_rows: List[Dict[str, Any]] = []
     if isinstance(manual_positions_file_df, pd.DataFrame) and not manual_positions_file_df.empty:
         mdf = manual_positions_file_df.copy()
-        mdf = mdf[[c for c in ["symbol", "qty", "buy_price"] if c in mdf.columns]]
+        mdf = mdf[[c for c in ["ts", "symbol", "qty", "buy_price"] if c in mdf.columns]]
         mdf = _to_num(mdf, ["qty", "buy_price"])
         mdf = mdf.dropna(subset=["symbol", "qty", "buy_price"])
         seed_rows = mdf.to_dict(orient="records")
@@ -808,29 +953,35 @@ if not st.session_state.get("manual_positions_seeded", False):
             if qty is None or qty == 0:
                 continue
             seed_rows.append({
+                "ts": None,
                 "symbol": str(sym),
                 "qty": qty,
                 "buy_price": latest_px_by_symbol.get(str(sym)),
             })
-    st.session_state["manual_positions_input_df"] = pd.DataFrame(seed_rows, columns=["symbol", "qty", "buy_price"])
+    st.session_state["manual_positions_input_df"] = pd.DataFrame(seed_rows, columns=["ts", "symbol", "qty", "buy_price"])
     st.session_state["manual_positions_seeded"] = True
 
 manual_input = st.session_state.get("manual_positions_editor")
 if not isinstance(manual_input, pd.DataFrame):
-    manual_input = st.session_state.get("manual_positions_input_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"]))
+    manual_input = st.session_state.get("manual_positions_input_df", pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"]))
 if not isinstance(manual_input, pd.DataFrame):
-    manual_input = pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+    manual_input = pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
 
 manual_calc = pd.DataFrame()
 manual_eval = pd.DataFrame()
 manual_pnl_total = 0.0
 if isinstance(manual_input, pd.DataFrame) and not manual_input.empty:
     manual_eval = manual_input.copy()
-    for c in ["symbol", "qty", "buy_price"]:
+    for c in ["ts", "symbol", "qty", "buy_price"]:
         if c not in manual_eval.columns:
             manual_eval[c] = None
     manual_eval["symbol"] = manual_eval["symbol"].astype(str).str.strip()
     manual_eval = _to_num(manual_eval, ["qty", "buy_price"])
+    manual_eval["ts_text"] = manual_eval["ts"].astype(str).str.strip()
+    manual_eval.loc[manual_eval["ts"].isna(), "ts_text"] = ""
+    manual_eval["ts_text"] = manual_eval["ts_text"].replace({"None": "", "none": "", "NaN": "", "nan": "", "NaT": "", "nat": ""})
+    manual_eval["ts_utc"] = manual_eval["ts"].apply(_parse_ts_user_ist_to_utc)
+    manual_eval["ts_provided"] = manual_eval["ts_text"] != ""
     manual_eval["symbol_norm"] = manual_eval["symbol"].apply(_norm_symbol)
     resolved = manual_eval["symbol"].apply(lambda s: _resolve_manual_cmp(s, latest_px_norm))
     manual_eval["cmp"] = resolved.apply(lambda t: t[0] if isinstance(t, tuple) else None)
@@ -839,7 +990,11 @@ if isinstance(manual_input, pd.DataFrame) and not manual_input.empty:
     manual_eval.loc[manual_eval["symbol_norm"] == "", "status"] = "missing_symbol"
     manual_eval.loc[manual_eval["qty"].isna(), "status"] = "missing_qty"
     manual_eval.loc[manual_eval["buy_price"].isna(), "status"] = "missing_buy_price"
+    manual_eval.loc[(manual_eval["status"] == "ok") & manual_eval["ts_provided"] & manual_eval["ts_utc"].isna(), "status"] = "bad_ts"
     manual_eval.loc[(manual_eval["status"] == "ok") & (manual_eval["cmp"].isna()), "status"] = "cmp_not_found"
+    now_utc = pd.Timestamp.now(tz="UTC")
+    manual_eval["active_now"] = manual_eval["ts_utc"].isna() | (manual_eval["ts_utc"] <= now_utc)
+    manual_eval.loc[(manual_eval["status"] == "ok") & (~manual_eval["active_now"]), "status"] = "not_active_yet"
 
     manual_calc = manual_eval[manual_eval["status"] == "ok"].copy()
     if not manual_calc.empty:
@@ -861,6 +1016,7 @@ p5.metric("Adjusted PnL (vs effective initial)", _fmt_num(adjusted_pnl))
 p6.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
 
 st.caption("Add legacy/manual positions to remove their existing PnL from portfolio metrics.")
+st.caption("`ts` is optional. If timezone is omitted, it is treated as IST (example: `2026-03-09 14:30`).")
 if isinstance(manual_positions_file_path, str) and manual_positions_file_path:
     st.caption(f"Manual positions file loaded: {manual_positions_file_path}")
 else:
@@ -877,12 +1033,12 @@ if isinstance(manual_input_new, pd.DataFrame):
     st.session_state["manual_positions_input_df"] = manual_input_new.copy()
 
 if not manual_calc.empty:
-    show_cols = [c for c in ["symbol", "qty", "buy_price", "cmp", "manual_cost", "manual_market", "manual_pnl"] if c in manual_calc.columns]
+    show_cols = [c for c in ["ts", "symbol", "qty", "buy_price", "cmp_symbol", "cmp", "manual_cost", "manual_market", "manual_pnl"] if c in manual_calc.columns]
     st.dataframe(manual_calc[show_cols], use_container_width=True)
 else:
     st.warning("No valid manual positions could be used for adjusted PnL.")
     if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty:
-        show_bad = [c for c in ["symbol", "qty", "buy_price", "cmp_symbol", "cmp", "status"] if c in manual_eval.columns]
+        show_bad = [c for c in ["ts", "symbol", "qty", "buy_price", "cmp_symbol", "cmp", "status"] if c in manual_eval.columns]
         st.dataframe(manual_eval[show_bad], use_container_width=True)
 
 if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty and "status" in manual_eval.columns:
@@ -959,9 +1115,11 @@ if not curve.empty:
                 exact_ok = True
 
                 for _, mr in manual_calc.iterrows():
-                    sym = str(mr.get("symbol"))
+                    sym = str(mr.get("cmp_symbol") or mr.get("symbol"))
                     qty = _safe_float(mr.get("qty"))
                     buy_price = _safe_float(mr.get("buy_price"))
+                    lot_ts = mr.get("ts_utc")
+                    lot_ts = pd.to_datetime(lot_ts, utc=True, errors="coerce")
                     if not sym or qty is None or buy_price is None:
                         continue
                     sp = price_long[price_long["symbol"] == sym][["ts", "px"]].sort_values("ts")
@@ -981,7 +1139,10 @@ if not curve.empty:
                     if merged["px"].isna().any():
                         exact_ok = False
                         break
-                    curve_for_adj["manual_pnl_exact"] += qty * (merged["px"] - buy_price)
+                    contrib = qty * (merged["px"] - buy_price)
+                    if not pd.isna(lot_ts):
+                        contrib = contrib.where(curve_for_adj["ts"] >= lot_ts, 0.0)
+                    curve_for_adj["manual_pnl_exact"] += contrib
 
                 if exact_ok:
                     curve_for_adj["portfolio_value_adj_exact"] = curve_for_adj["portfolio_value"] - curve_for_adj["manual_pnl_exact"]

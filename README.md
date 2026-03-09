@@ -59,16 +59,17 @@ it's fine to keep a custom runner inside the strategy folder while still reusing
 - Supported JSON format:
 ```json
 [
-  {"symbol": "BTCUSDT", "qty": 0.25, "buy_price": 58000},
-  {"symbol": "ETHUSDT", "qty": 1.5, "buy_price": 2800}
+  {"ts": "2026-03-01 09:15", "symbol": "BTCUSDT", "qty": 0.25, "buy_price": 58000},
+  {"ts": "2026-03-05 14:30 IST", "symbol": "ETHUSDT", "qty": 1.5, "buy_price": 2800}
 ]
 ```
 - Supported CSV format (header required):
 ```csv
-symbol,qty,buy_price
-BTCUSDT,0.25,58000
-ETHUSDT,1.5,2800
+ts,symbol,qty,buy_price
+2026-03-01 09:15,BTCUSDT,0.25,58000
+2026-03-05 14:30 IST,ETHUSDT,1.5,2800
 ```
+- `ts` is optional. If timezone is omitted, dashboard treats it as IST.
 - If config key is not set, dashboard also auto-detects `manual_positions.json` / `manual_positions.csv` in the selected run folder.
 
 ## Daily portfolio curve (dashboard)
@@ -77,3 +78,23 @@ ETHUSDT,1.5,2800
   - `price_daily.csv` (daily symbol prices for exact adjusted curve)
 - Dashboard prefers these daily files, so chart remains fast even when `pnl_points.csv` is very large.
 - On first run after upgrade, runner backfills these daily files from existing `pnl_points.csv` / `price_points.jsonl` when possible.
+
+## Capital flows (auto portfolio-start adjustment)
+- Optional config path:
+  - `paths.capital_flows_file`: `"state/capital_flows.json"` (or `.csv`)
+- Dashboard auto-sums capital flows and adjusts portfolio PnL start accordingly.
+- Use positive `delta` for add, negative `delta` for withdraw.
+- `ts` accepts simple IST datetime (for example `2026-03-09 14:30`).
+- JSON example:
+```json
+[
+  {"ts":"2026-03-01T09:00:00Z","delta":5000,"note":"added funds"},
+  {"ts":"2026-03-05T13:15:00Z","delta":-1500,"note":"withdrawn"}
+]
+```
+- CSV example:
+```csv
+ts,delta,note
+2026-03-01T09:00:00Z,5000,added funds
+2026-03-05T13:15:00Z,-1500,withdrawn
+```

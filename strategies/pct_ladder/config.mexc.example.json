@@ -35,6 +35,7 @@
     "trades_path": "state/mexc_trades.jsonl",
     "rejects_path": "state/mexc_rejects.jsonl",
     "manual_adjustments_path": "state/manual_adjustments.jsonl",
-    "manual_positions_file": "state/manual_positions.json"
+    "manual_positions_file": "state/manual_positions.json",
+    "capital_flows_file": "state/capital_flows.json"
   }
 }

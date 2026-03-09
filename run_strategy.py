@@ -103,6 +103,8 @@ def main() -> None:
     manual_adjustments_path = _abs(str(paths.get("manual_adjustments_path") or "manual_adjustments.jsonl"), base_dir)
     manual_positions_file = paths.get("manual_positions_file")
     manual_positions_path = _abs(str(manual_positions_file), base_dir) if manual_positions_file else None
+    capital_flows_file = paths.get("capital_flows_file")
+    capital_flows_path = _abs(str(capital_flows_file), base_dir) if capital_flows_file else None
 
     os.makedirs(os.path.dirname(state_path), exist_ok=True)
 
@@ -124,6 +126,8 @@ def main() -> None:
     state = GlobalState.load(state_path)
     if manual_positions_path:
         state.extras["manual_positions_file"] = manual_positions_path
+    if capital_flows_path:
+        state.extras["capital_flows_file"] = capital_flows_path
     symbols = list((cfg.get("strategy") or {}).get("symbols") or [])
     if not symbols:
         raise SystemExit("Config must include strategy.symbols list.")
