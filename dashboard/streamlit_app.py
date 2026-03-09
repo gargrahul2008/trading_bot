@@ -117,6 +117,7 @@ class RunFiles:
     manual_path: Optional[str]
     pnl_points_path: Optional[str]
     price_points_path: Optional[str]
+    manual_positions_path: Optional[str]
 
 
 def _resolve_run_files(run_dir: str) -> RunFiles:
@@ -126,11 +127,84 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
     manual = _find_file(run_dir, ["manual_adjustments.jsonl"], ["*manual*adjust*.jsonl", "*manual*.jsonl"])
     pnl_points = _find_file(run_dir, ["pnl_points.csv"], ["*pnl*points*.csv"])
     price_points = _find_file(run_dir, ["price_points.jsonl"], ["*price*points*.jsonl"])
+    manual_positions = _find_file(
+        run_dir,
+        ["manual_positions.json", "manual_positions.csv"],
+        ["*manual*position*.json", "*manual*position*.csv"],
+    )
+    if not manual_positions:
+        state_path = _find_file(run_dir, ["state.json"], ["*state*.json"])
+        state_raw = _safe_json_load(state_path or "")
+        extras = state_raw.get("extras", {}) if isinstance(state_raw, dict) else {}
+        mpf = extras.get("manual_positions_file") if isinstance(extras, dict) else None
+        if isinstance(mpf, str) and mpf.strip():
+            mpf2 = mpf.strip()
+            if not os.path.isabs(mpf2):
+                mpf2 = os.path.normpath(os.path.join(run_dir, mpf2))
+            if os.path.exists(mpf2):
+                manual_positions = mpf2
     if trades and "reject" in os.path.basename(trades).lower():
         alt = _find_file(run_dir, [], ["*trades*.jsonl"])
         if alt:
             trades = alt
-    return RunFiles(run_dir, snapshot, summary, trades, manual, pnl_points, price_points)
+    return RunFiles(run_dir, snapshot, summary, trades, manual, pnl_points, price_points, manual_positions)
+
+
+def _load_manual_positions_file(path: str) -> pd.DataFrame:
+    if not path or not os.path.exists(path):
+        return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+    ext = Path(path).suffix.lower()
+    try:
+        if ext == ".csv":
+            raw_df = pd.read_csv(path)
+            if raw_df.empty:
+                return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+            out = pd.DataFrame()
+            out["symbol"] = raw_df.get("symbol")
+            out["qty"] = raw_df.get("qty") if "qty" in raw_df.columns else raw_df.get("quantity")
+            if "buy_price" in raw_df.columns:
+                out["buy_price"] = raw_df.get("buy_price")
+            elif "price" in raw_df.columns:
+                out["buy_price"] = raw_df.get("price")
+            else:
+                out["buy_price"] = raw_df.get("avg_price")
+            out = out.dropna(subset=["symbol", "qty", "buy_price"])
+            out["symbol"] = out["symbol"].astype(str).str.strip()
+            out = _to_num(out, ["qty", "buy_price"])
+            out = out.dropna(subset=["qty", "buy_price"])
+            return out[["symbol", "qty", "buy_price"]]
+
+        raw = _safe_json_load(path)
+        rows: List[Dict[str, Any]] = []
+        if isinstance(raw, list):
+            for rec in raw:
+                if not isinstance(rec, dict):
+                    continue
+                rows.append({
+                    "symbol": rec.get("symbol"),
+                    "qty": rec.get("qty") if rec.get("qty") is not None else rec.get("quantity"),
+                    "buy_price": rec.get("buy_price") if rec.get("buy_price") is not None else (rec.get("price") if rec.get("price") is not None else rec.get("avg_price")),
+                })
+        elif isinstance(raw, dict):
+            for sym, rec in raw.items():
+                if isinstance(rec, dict):
+                    rows.append({
+                        "symbol": sym,
+                        "qty": rec.get("qty") if rec.get("qty") is not None else rec.get("quantity"),
+                        "buy_price": rec.get("buy_price") if rec.get("buy_price") is not None else (rec.get("price") if rec.get("price") is not None else rec.get("avg_price")),
+                    })
+                elif isinstance(rec, (list, tuple)) and len(rec) >= 2:
+                    rows.append({"symbol": sym, "qty": rec[0], "buy_price": rec[1]})
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
+        out = out.dropna(subset=["symbol", "qty", "buy_price"])
+        out["symbol"] = out["symbol"].astype(str).str.strip()
+        out = _to_num(out, ["qty", "buy_price"])
+        out = out.dropna(subset=["qty", "buy_price"])
+        return out[["symbol", "qty", "buy_price"]]
+    except Exception:
+        return pd.DataFrame(columns=["symbol", "qty", "buy_price"])
 
 
 def _tail_csv_df(path: str, max_lines: int = 5000) -> pd.DataFrame:
@@ -232,6 +306,8 @@ def _ensure_session_defaults() -> None:
     ss.setdefault("data_manual_df", pd.DataFrame())
     ss.setdefault("data_pnl_df", pd.DataFrame())
     ss.setdefault("data_price_df", pd.DataFrame())
+    ss.setdefault("data_manual_positions_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"]))
+    ss.setdefault("data_manual_positions_path", None)
     ss.setdefault("data_cycle_units", {})
     ss.setdefault("data_run_files", {})
     ss.setdefault("last_loaded_at", None)
@@ -246,6 +322,7 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     manuals: List[dict] = []
     pnl_frames: List[pd.DataFrame] = []
     prices: List[dict] = []
+    manual_positions_paths: List[str] = []
 
     for rd in selected_runs:
         rf = _resolve_run_files(rd)
@@ -278,6 +355,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
                 r["_run_dir"] = rd
                 r["_price_file"] = rf.price_points_path
             prices.extend(recs)
+        if rf.manual_positions_path:
+            manual_positions_paths.append(rf.manual_positions_path)
 
     df = pd.DataFrame(trades)
     if not df.empty:
@@ -300,6 +379,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     price_df = pd.DataFrame(prices)
     if not price_df.empty:
         price_df = _coerce_ts(price_df)
+    manual_positions_path = _latest_by_mtime(manual_positions_paths)
+    manual_positions_df = _load_manual_positions_file(manual_positions_path or "")
 
     st.session_state["loaded"] = True
     st.session_state["data_snapshot"] = snapshot
@@ -308,6 +389,8 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
     st.session_state["data_manual_df"] = manual_df
     st.session_state["data_pnl_df"] = pnl_df
     st.session_state["data_price_df"] = price_df
+    st.session_state["data_manual_positions_df"] = manual_positions_df
+    st.session_state["data_manual_positions_path"] = manual_positions_path
     st.session_state["data_cycle_units"] = cycle_units
     st.session_state["data_run_files"] = {k: run_file_map[k].__dict__ for k in run_file_map}
     st.session_state["last_loaded_at"] = pd.Timestamp.utcnow().isoformat() + "Z"
@@ -356,7 +439,7 @@ with col_btn1:
             _load_all(repo_root, selected_runs, max_lines=max_lines, max_curve_lines=max_curve_lines)
 with col_btn2:
     if st.button("Clear"):
-        for k in ["loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df", "data_pnl_df", "data_price_df", "data_cycle_units", "data_run_files", "last_loaded_at", "manual_positions_input_df", "manual_positions_seeded"]:
+        for k in ["loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df", "data_pnl_df", "data_price_df", "data_manual_positions_df", "data_manual_positions_path", "data_cycle_units", "data_run_files", "last_loaded_at", "manual_positions_input_df", "manual_positions_seeded"]:
             if k in st.session_state:
                 del st.session_state[k]
         st.rerun()
@@ -371,6 +454,8 @@ df = st.session_state.get("data_trades_df")
 manual_df = st.session_state.get("data_manual_df")
 pnl_df = st.session_state.get("data_pnl_df")
 price_df = st.session_state.get("data_price_df")
+manual_positions_file_df = st.session_state.get("data_manual_positions_df")
+manual_positions_file_path = st.session_state.get("data_manual_positions_path")
 cycle_units = st.session_state.get("data_cycle_units") or {}
 last_loaded_at = st.session_state.get("last_loaded_at")
 
@@ -525,24 +610,35 @@ if isinstance(price_df, pd.DataFrame) and not price_df.empty and "prices" in pri
 
 if not st.session_state.get("manual_positions_seeded", False):
     seed_rows: List[Dict[str, Any]] = []
-    manual_map: Dict[str, Any] = {}
-    if isinstance(summary, dict) and isinstance(summary.get("manual_inventory_by_symbol"), dict):
-        manual_map = summary.get("manual_inventory_by_symbol") or {}
-    elif isinstance(snapshot, dict) and isinstance(snapshot.get("manual_inventory_by_symbol"), dict):
-        manual_map = snapshot.get("manual_inventory_by_symbol") or {}
-    for sym, qty_raw in manual_map.items():
-        qty = _safe_float(qty_raw)
-        if qty is None or qty == 0:
-            continue
-        seed_rows.append({
-            "symbol": str(sym),
-            "qty": qty,
-            "buy_price": latest_px_by_symbol.get(str(sym)),
-        })
+    if isinstance(manual_positions_file_df, pd.DataFrame) and not manual_positions_file_df.empty:
+        mdf = manual_positions_file_df.copy()
+        mdf = mdf[[c for c in ["symbol", "qty", "buy_price"] if c in mdf.columns]]
+        mdf = _to_num(mdf, ["qty", "buy_price"])
+        mdf = mdf.dropna(subset=["symbol", "qty", "buy_price"])
+        seed_rows = mdf.to_dict(orient="records")
+    else:
+        manual_map: Dict[str, Any] = {}
+        if isinstance(summary, dict) and isinstance(summary.get("manual_inventory_by_symbol"), dict):
+            manual_map = summary.get("manual_inventory_by_symbol") or {}
+        elif isinstance(snapshot, dict) and isinstance(snapshot.get("manual_inventory_by_symbol"), dict):
+            manual_map = snapshot.get("manual_inventory_by_symbol") or {}
+        for sym, qty_raw in manual_map.items():
+            qty = _safe_float(qty_raw)
+            if qty is None or qty == 0:
+                continue
+            seed_rows.append({
+                "symbol": str(sym),
+                "qty": qty,
+                "buy_price": latest_px_by_symbol.get(str(sym)),
+            })
     st.session_state["manual_positions_input_df"] = pd.DataFrame(seed_rows, columns=["symbol", "qty", "buy_price"])
     st.session_state["manual_positions_seeded"] = True
 
 st.caption("Add legacy/manual positions to remove their existing PnL from portfolio metrics.")
+if isinstance(manual_positions_file_path, str) and manual_positions_file_path:
+    st.caption(f"Manual positions file loaded: {manual_positions_file_path}")
+else:
+    st.caption("To persist entries, create `manual_positions.json` or `manual_positions.csv` in your run/state folder.")
 manual_input = st.data_editor(
     st.session_state.get("manual_positions_input_df", pd.DataFrame(columns=["symbol", "qty", "buy_price"])),
     num_rows="dynamic",

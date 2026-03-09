@@ -51,3 +51,22 @@ it's fine to keep a custom runner inside the strategy folder while still reusing
 ## Proactive levels from previous close
 - Strategy: strategies/prevclose_levels (runner_type: managed)
 - Example config: strategies/prevclose_levels/config.fyers.rajoo.example.json
+
+## Dashboard manual positions (persistent)
+- You can persist legacy/manual holdings (for adjusted portfolio metrics/curve) using a file.
+- Configure optional path in your strategy config:
+  - `paths.manual_positions_file`: `"state/manual_positions.json"` (or `.csv`)
+- Supported JSON format:
+```json
+[
+  {"symbol": "BTCUSDT", "qty": 0.25, "buy_price": 58000},
+  {"symbol": "ETHUSDT", "qty": 1.5, "buy_price": 2800}
+]
+```
+- Supported CSV format (header required):
+```csv
+symbol,qty,buy_price
+BTCUSDT,0.25,58000
+ETHUSDT,1.5,2800
+```
+- If config key is not set, dashboard also auto-detects `manual_positions.json` / `manual_positions.csv` in the selected run folder.
