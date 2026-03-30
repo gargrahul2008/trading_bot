@@ -1,0 +1,46 @@
+{
+  "ts": "2026-03-28T00:29:52.782120+00:00",
+  "broker": "fyers",
+  "quote_asset": "INR",
+  "portfolio_value": "3592857.9995",
+  "portfolio_pnl": "2096590.9395",
+  "portfolio_pnl_pct": "1.401214392502899849977316215",
+  "drawdown_pct": "0.03673773079572230196565844743",
+  "bot": {
+    "equity": "3560652.67",
+    "realized_today": "0.00",
+    "realized_all_time": "54205.00",
+    "unrealized_now": "-136947.35",
+    "total_now": "-82742.35"
+  },
+  "non_strategy": {
+    "value_est": "32205.3295",
+    "value_pct_est": "0.008963707862788302218288101314"
+  },
+  "deployed": {
+    "deployed_cost_strategy_now": "1524586.15",
+    "quote_asset": "INR"
+  },
+  "symbols": {
+    "NSE:INDOTHAI-EQ": {
+      "ltp": "288.85",
+      "mode": "sell_first",
+      "sell_level": "298.95",
+      "buy_level": "278.75",
+      "prev_close": "288.85",
+      "sell_oid": null,
+      "buy_oid": null,
+      "realized_pnl": "111225.00"
+    },
+    "BSE:ARL-B": {
+      "ltp": "65.9",
+      "mode": "sell_first",
+      "sell_level": "68.20",
+      "buy_level": "63.60",
+      "prev_close": "65.9",
+      "sell_oid": null,
+      "buy_oid": null,
+      "realized_pnl": "0"
+    }
+  }
+}

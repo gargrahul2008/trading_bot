@@ -113,6 +113,17 @@ class GlobalState:
         )
 
     def dump(self, path: str) -> None:
+        # Preserve realized_pnl_carry from the existing file when not already in memory.
+        # This ensures a carry value written externally survives subsequent bot dumps.
+        if "realized_pnl_carry" not in self.extras:
+            try:
+                with open(path, "r", encoding="utf-8") as _f:
+                    _existing = json.load(_f)
+                _carry = (_existing.get("extras") or {}).get("realized_pnl_carry")
+                if _carry is not None:
+                    self.extras["realized_pnl_carry"] = _carry
+            except Exception:
+                pass
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(dataclasses.asdict(self), f, indent=2, default=str)
@@ -145,7 +156,11 @@ class GlobalState:
         return _dec(eq)
 
     def total_realized(self) -> Decimal:
-        return sum((ss.realized_pnl for ss in self.symbol_states.values()), D0)
+        # ss.realized_pnl resets to 0 on each bot restart (new trade file).
+        # realized_pnl_carry in extras accumulates previous runs' totals so the
+        # dashboard always shows the true all-time figure across all trade files.
+        carry = _dec(self.extras.get("realized_pnl_carry") or "0")
+        return sum((ss.realized_pnl for ss in self.symbol_states.values()), D0) + carry
 
     def total_unrealized(self) -> Decimal:
         total = D0

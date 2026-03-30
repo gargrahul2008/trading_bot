@@ -81,8 +81,8 @@ def _find_file(run_dir: str, preferred_names: List[str], patterns: List[str]) ->
 
 def _discover_state_dirs(repo_root: str) -> List[str]:
     candidates: List[str] = []
+    # Only look directly under strategies/*/state — never recurse into env/, node_modules/, etc.
     candidates += [p for p in glob.glob(os.path.join(repo_root, "strategies", "*", "state")) if os.path.isdir(p)]
-    candidates += [p for p in glob.glob(os.path.join(repo_root, "**", "state"), recursive=True) if os.path.isdir(p)]
     return sorted(set(candidates))
 
 
@@ -113,7 +113,7 @@ class RunFiles:
     run_dir: str
     snapshot_path: Optional[str]
     summary_path: Optional[str]
-    trades_path: Optional[str]
+    trades_paths: List[str]          # all trades files in run_dir
     manual_path: Optional[str]
     pnl_points_path: Optional[str]
     price_points_path: Optional[str]
@@ -139,7 +139,11 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
 
     snapshot = _find_file(run_dir, ["positions_snapshot.json"], ["*snapshot*.json", "positions*.json"])
     summary = _find_file(run_dir, ["pnl_summary.json"], ["*summary*.json", "pnl*.json"])
-    trades = _find_file(run_dir, ["trades.jsonl"], ["*trades*.jsonl", "*.jsonl"])
+    # Collect ALL trades files — not just the latest — so multiple strategies in the same dir are all loaded
+    all_trades = sorted([
+        p for p in glob.glob(os.path.join(run_dir, "*trades*.jsonl"))
+        if "reject" not in os.path.basename(p).lower()
+    ])
     manual = _find_file(run_dir, ["manual_adjustments.jsonl"], ["*manual*adjust*.jsonl", "*manual*.jsonl"])
     pnl_points = _find_file(run_dir, ["pnl_points.csv"], ["*pnl*points*.csv"])
     price_points = _find_file(run_dir, ["price_points.jsonl"], ["*price*points*.jsonl"])
@@ -155,15 +159,11 @@ def _resolve_run_files(run_dir: str) -> RunFiles:
         ["capital_flows.json", "capital_flows.csv"],
         ["*capital*flow*.json", "*capital*flow*.csv"],
     )
-    if trades and "reject" in os.path.basename(trades).lower():
-        alt = _find_file(run_dir, [], ["*trades*.jsonl"])
-        if alt:
-            trades = alt
     return RunFiles(
         run_dir,
         snapshot,
         summary,
-        trades,
+        all_trades,
         manual,
         pnl_points,
         price_points,
@@ -510,6 +510,35 @@ def _resolve_manual_cmp(symbol: Any, latest_px_norm: Dict[str, float]) -> tuple[
             return latest_px_norm.get(k), k
     return None, None
 
+def _formula_pnl(df_trades: pd.DataFrame, today_date=None):
+    """
+    Formula PnL = sum(cum_quote_qty * pct / 100) over sell legs (non-rebalance).
+    Returns (today_pnl, alltime_pnl).  pct extracted from reason field (e.g. 'ltp>=ref+0.4%').
+    """
+    import re
+    if not isinstance(df_trades, pd.DataFrame) or df_trades.empty:
+        return None, None
+    sells = df_trades[
+        (df_trades["side"].astype(str).str.upper() == "SELL") &
+        (~df_trades["reason"].astype(str).str.startswith("rebalance_"))
+    ].copy()
+    if sells.empty:
+        return None, None
+    pct_series = sells["reason"].astype(str).str.extract(r"ref\+(\d+\.?\d*)%")[0]
+    sells["_pct"] = pd.to_numeric(pct_series, errors="coerce")
+    sells["_quote"] = pd.to_numeric(sells.get("cum_quote_qty", pd.Series(dtype=float)), errors="coerce").fillna(0)
+    sells = sells.dropna(subset=["_pct"])
+    if sells.empty:
+        return None, None
+    sells["_cycle_pnl"] = sells["_quote"] * sells["_pct"] / 100
+    alltime = round(float(sells["_cycle_pnl"].sum()), 2)
+    today = None
+    if today_date is not None and "ts" in sells.columns:
+        td = sells[sells["ts"].dt.date == today_date]
+        today = round(float(td["_cycle_pnl"].sum()), 2) if not td.empty else 0.0
+    return today, alltime
+
+
 def _sum_cycles(store: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
     per = store.get("per_symbol", {}) if isinstance(store, dict) else {}
     total_cycles = 0.0
@@ -528,6 +557,71 @@ def _sum_cycles(store: Dict[str, Any]) -> tuple[Optional[float], Optional[float]
             total_cycle_quote += cq
             has_quote = True
     return (total_cycles if has_cycles else None, total_cycle_quote if has_quote else None)
+
+
+def _compute_config_cycles(df: pd.DataFrame) -> pd.DataFrame:
+    """Break down trades by symbol + config (pct%, buy_quote) inferred from reason field.
+    Cycles = min(buy_count, sell_count) per group.
+    Expected PnL = cycles * buy_quote * upper_pct / 100.
+    Rebalance trades (reason starts with 'rebalance_') are excluded.
+    """
+    import re
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    rows = []
+    for _, row in df.iterrows():
+        reason = str(row.get("reason", "") or "")
+        if reason.startswith("rebalance_"):
+            continue
+        m = re.search(r'ref[+-](\d+\.?\d*)%', reason)
+        if not m:
+            continue
+        pct = float(m.group(1))
+        quote = row.get("cum_quote_qty", 0)
+        try:
+            quote = float(quote) if quote is not None else 0.0
+        except (TypeError, ValueError):
+            continue
+        import math
+        if math.isnan(quote) or quote < 100:
+            continue
+        size = round(quote / 100) * 100
+        side = str(row.get("side", "")).upper()
+        if side not in ("BUY", "SELL"):
+            continue
+        symbol = str(row.get("symbol", "") or "")
+        ts = row.get("ts")
+        rows.append({"symbol": symbol, "pct": pct, "size": size, "side": side, "ts": ts})
+    if not rows:
+        return pd.DataFrame()
+    tmp = pd.DataFrame(rows)
+    tmp["ts"] = pd.to_datetime(tmp["ts"], utc=True, errors="coerce")
+    result = []
+    for (symbol, pct, size), grp in tmp.groupby(["symbol", "pct", "size"]):
+        buys = int((grp["side"] == "BUY").sum())
+        sells = int((grp["side"] == "SELL").sum())
+        cycles = min(buys, sells)
+        per_cycle = round(size * pct / 100, 2)
+        expected_pnl = round(cycles * per_cycle, 2)
+        ts_valid = grp["ts"].dropna()
+        if len(ts_valid) >= 2:
+            days = max((ts_valid.max() - ts_valid.min()).days, 1)
+        else:
+            days = 1
+        daily_avg = round(cycles / days, 1)
+        result.append({
+            "Symbol": symbol,
+            "Config": f"{pct}% / ${size:.0f}",
+            "Buys": buys,
+            "Sells": sells,
+            "Cycles (min)": cycles,
+            "Daily Avg Cycles": daily_avg,
+            "Per Cycle ($)": per_cycle,
+            "Expected PnL ($)": expected_pnl,
+        })
+    if not result:
+        return pd.DataFrame()
+    return pd.DataFrame(result).sort_values(["Symbol", "Config"], ascending=[True, False]).reset_index(drop=True)
 
 
 # -------------------------
@@ -572,11 +666,11 @@ def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curv
         rf = _resolve_run_files(rd)
         run_file_map[rd] = rf
         cycle_units.update(_read_cycle_units_from_state_json(rd))
-        if rf.trades_path:
-            recs = _tail_jsonl(rf.trades_path, max_lines=max_lines)
+        for trades_path in (rf.trades_paths or []):
+            recs = _tail_jsonl(trades_path, max_lines=max_lines)
             for r in recs:
                 r["_run_dir"] = rd
-                r["_trades_file"] = rf.trades_path
+                r["_trades_file"] = trades_path
             trades.extend(recs)
         if rf.manual_path:
             recs = _tail_jsonl(rf.manual_path, max_lines=max_lines)
@@ -703,7 +797,9 @@ if not state_dirs:
     st.warning("No state directories found. Set 'Repo root' to your trading_bot folder.")
     st.stop()
 
-state_dir = st.sidebar.selectbox("Strategy state directory", options=state_dirs, index=0)
+# Default to pct_ladder/state if present, otherwise first
+_default_state_idx = next((i for i, d in enumerate(state_dirs) if "pct_ladder" in d and "managed" not in d), 0)
+state_dir = st.sidebar.selectbox("Strategy state directory", options=state_dirs, index=_default_state_idx)
 run_dirs = _discover_run_dirs(state_dir)
 
 def _label_run(p: str) -> str:
@@ -1027,12 +1123,63 @@ cycles_all = snapshot.get("cycles_all_time", {}) if isinstance(snapshot, dict) e
 ct_est, ct_quote = _sum_cycles(cycles_today)
 ca_est, ca_quote = _sum_cycles(cycles_all)
 
+# Formula PnL from filtered trades: cycles × buy_quote × pct%
+_today_date = pd.Timestamp.now(tz="UTC").date()
+fp_today, fp_alltime = _formula_pnl(dff, today_date=_today_date)
+
+# Avg buy_quote and pct for caption
+_sells = dff[(dff["side"].astype(str).str.upper() == "SELL") &
+             (~dff["reason"].astype(str).str.startswith("rebalance_"))] if not dff.empty else pd.DataFrame()
+_avg_quote = pd.to_numeric(_sells.get("cum_quote_qty", pd.Series(dtype=float)), errors="coerce").mean() if not _sells.empty else None
+_avg_pct   = pd.to_numeric(_sells["reason"].astype(str).str.extract(r"ref\+(\d+\.?\d*)%")[0], errors="coerce").mean() if not _sells.empty else None
+
 s1, s2, s3, s4 = st.columns(4)
-s1.metric("Bot PnL Today (realized)", _fmt_num(st_real_td) if st_real_td is not None else "—")
-s2.metric("Bot PnL All-time (realized)", _fmt_num(st_real_all) if st_real_all is not None else "—")
+s1.metric("Bot PnL Today (formula)", _fmt_num(fp_today) if fp_today is not None else "—")
+s2.metric("Bot PnL All-time (formula)", _fmt_num(fp_alltime) if fp_alltime is not None else "—")
 s3.metric("Cycles Today (est)", _fmt_num(ct_est) if ct_est is not None else "—")
 s4.metric("Cycles All-time (est)", _fmt_num(ca_est) if ca_est is not None else "—")
-st.caption("Cycles are turnover/execution counts, not profit. They do not map 1:1 to PnL.")
+_cap = "Formula PnL = cycles × buy_quote × pct%."
+if _avg_quote is not None and _avg_pct is not None:
+    _cap += f"  Avg buy_quote: ${_avg_quote:,.0f} | Avg pct: {_avg_pct:.2f}%"
+st.caption(_cap)
+
+# --- Cycles by Config breakdown ---
+st.markdown("**Cycles by Config (Actual Round Trips)**")
+config_cycles_df = _compute_config_cycles(dff)
+if not config_cycles_df.empty:
+    st.dataframe(config_cycles_df, use_container_width=True, hide_index=True)
+    total_cycles_actual = int(config_cycles_df["Cycles (min)"].sum())
+    total_expected_pnl = round(float(config_cycles_df["Expected PnL ($)"].sum()), 2)
+    cc1, cc2, cc3 = st.columns(3)
+    cc1.metric("Total Cycles (actual)", total_cycles_actual)
+    cc2.metric("Expected PnL (formula)", f"${total_expected_pnl:.2f}")
+    cc3.metric("Actual Realized PnL", _fmt_num(st_real_all) if st_real_all is not None else "—")
+    st.caption("Expected PnL = cycles × buy_quote × pct%. Actual realized may differ due to weighted avg cost basis.")
+else:
+    st.info("No config breakdown available — trades may lack pct in reason field.")
+
+# --- Rebalance Trades ---
+st.markdown("**Rebalance Trades**")
+if isinstance(df, pd.DataFrame) and not df.empty and "reason" in df.columns:
+    reb_df = dff[dff["reason"].astype(str).str.startswith("rebalance_")].copy()
+    if not reb_df.empty:
+        cols_show = [c for c in ["ts", "symbol", "side", "reason", "qty", "price", "cum_quote_qty"] if c in reb_df.columns]
+        reb_display = reb_df[cols_show].copy()
+        if "ts" in reb_display.columns:
+            reb_display["ts"] = pd.to_datetime(reb_display["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        for col in ["qty", "price", "cum_quote_qty"]:
+            if col in reb_display.columns:
+                reb_display[col] = pd.to_numeric(reb_display[col], errors="coerce").round(4 if col == "qty" else 2)
+        reb_display = reb_display.sort_values("ts", ascending=False).reset_index(drop=True)
+        st.dataframe(reb_display, use_container_width=True, hide_index=True)
+        r1, r2 = st.columns(2)
+        r1.metric("Total Rebalances", len(reb_df))
+        notional = pd.to_numeric(reb_df.get("cum_quote_qty", pd.Series(dtype=float)), errors="coerce").sum()
+        r2.metric("Total Notional", f"${notional:,.2f}")
+    else:
+        st.caption("No rebalance trades recorded.")
+else:
+    st.caption("No trades loaded.")
 
 manual_input_new = st.data_editor(
     manual_input,

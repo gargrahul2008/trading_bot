@@ -44,6 +44,11 @@ class LadderPctConfig:
     qty_step: Decimal = Decimal("1")
     min_qty: Decimal = Decimal("0")
 
+    # Auto-rebalance: emit MARKET order when one side runs low
+    # 0 = disabled; e.g. threshold=4, target=8
+    rebalance_threshold_steps: int = 0
+    rebalance_target_steps: int = 8
+
 class LadderPctStrategy:
     def __init__(self, cfg: LadderPctConfig):
         self.cfg = cfg
@@ -84,6 +89,38 @@ class LadderPctStrategy:
             ltp = _dec(prices[sym])
             buy_thr = ref * (Decimal("1") - self.cfg.lower_pct / Decimal("100"))
             sell_thr = ref * (Decimal("1") + self.cfg.upper_pct / Decimal("100"))
+
+            # --- Auto-rebalance check (takes priority over ladder) ---
+            if self.cfg.rebalance_threshold_steps > 0:
+                buy_quote = _dec(self.cfg.buy_quote)
+                sell_quote = _dec(self.cfg.sell_quote)
+                cash = _dec(state.cash)
+                # Use actual broker balance if available (covers manual/external holdings too)
+                broker_base = state.extras.get(f"broker_base_qty_{sym}")
+                eth_qty = _dec(broker_base) if broker_base is not None else _dec(ss.traded_qty)
+
+                usdc_steps = (cash / buy_quote) if buy_quote > 0 else Decimal("999")
+                eth_steps = (eth_qty * ltp / sell_quote) if sell_quote > 0 and ltp > 0 else Decimal("999")
+                threshold = Decimal(str(self.cfg.rebalance_threshold_steps))
+                target = Decimal(str(self.cfg.rebalance_target_steps))
+
+                if usdc_steps <= threshold:
+                    # Cash running low → sell ETH to restore to target USDC steps
+                    steps_needed = target - usdc_steps
+                    if steps_needed > 0 and ltp > 0:
+                        qty = self._round_qty(steps_needed * buy_quote / ltp)
+                        if qty > 0:
+                            intents.append(OrderIntent(sym, "SELL", qty, "rebalance_sell", order_type="MARKET"))
+                            continue
+
+                elif eth_steps <= threshold:
+                    # ETH inventory low → buy ETH to restore to target ETH steps
+                    steps_needed = target - eth_steps
+                    if steps_needed > 0 and ltp > 0:
+                        qty = self._round_qty(steps_needed * sell_quote / ltp)
+                        if qty > 0:
+                            intents.append(OrderIntent(sym, "BUY", qty, "rebalance_buy", order_type="MARKET"))
+                            continue
 
             if ltp <= buy_thr:
                 qty = D0
@@ -149,5 +186,7 @@ def create_strategy(strategy_cfg: dict) -> LadderPctStrategy:
         sell_percent=_dec(strategy_cfg.get("sell_percent", 0.25)),
         qty_step=_dec(strategy_cfg.get("qty_step", 1)),
         min_qty=_dec(strategy_cfg.get("min_qty", 0)),
+        rebalance_threshold_steps=int(strategy_cfg.get("rebalance_threshold_steps", 0)),
+        rebalance_target_steps=int(strategy_cfg.get("rebalance_target_steps", 8)),
     )
     return LadderPctStrategy(cfg)

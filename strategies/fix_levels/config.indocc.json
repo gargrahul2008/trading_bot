@@ -1,0 +1,71 @@
+{
+  "strategy_name": "fix_levels",
+  "runner_type": "managed",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "db",
+    "user_id": 4,
+    "db_info_file": "/root/trading_bot/common/tr_db",
+    "db_name": "traderealm",
+    "db_table": "nse_usercredential",
+    "log_path": ""
+  },
+  "strategy": {
+    "market_tz": "Asia/Kolkata",
+    "symbols": [
+      "NSE:INDOTHAI-EQ", "NSE:COOLCAPS-SM"
+    ],
+    "defaults": {
+      "buy_levels_pct": [
+        -2.5,
+        -4.5
+      ],
+      "sell_levels_pct": [
+        2.5,
+        4.5
+      ],
+      "mode": "both",
+      "qty_buy": 800,
+      "qty_sell": 800,
+      "price_tick": 0.05,
+      "allow_buy_qty_cap": true
+    },
+    "per_symbol": {
+      "NSE:INDOTHAI-EQ": {
+        "buy_levels_pct": [-2.5, -4.5],
+        "sell_levels_pct": [2.5, 4.5],
+        "mode": "buy_only",
+        "qty_buy": 500,
+        "qty_sell": 500,
+        "price_tick": 0.05
+      },
+      "NSE:COOLCAPS-SM": {
+        "buy_levels_pct": [-3.5],
+        "sell_levels_pct": [3.5],
+        "mode": "both",
+        "qty_buy": 1250,
+        "qty_sell": 1250,
+        "price_tick": 0.05
+      }
+    },
+    "anchor_lookback_days": 10
+  },
+  "execution": {
+    "product_type": "CNC",
+    "allow_btst_auto": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true,
+    "poll_seconds": 15,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": false
+  },
+  "paths": {
+    "state_path": "state/indo_cc_prevclose_levels_state.json",
+    "trades_path": "state/indo_cc_prevclose_levels_trades.jsonl",
+    "rejects_path": "state/indo_cc_prevclose_levels_rejects.jsonl"
+  }
+}

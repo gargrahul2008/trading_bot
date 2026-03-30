@@ -1,0 +1,56 @@
+{
+  "_comment": "India MTF strategy — 3X leverage, ₹2,00,000 capital, ₹15 stock example. Update symbol, user_id, and state paths before running.",
+  "_capital_notes": {
+    "total_capital": 200000,
+    "leverage": "3X MTF",
+    "initial_holding_margin": 66000,
+    "initial_holding_shares": 13200,
+    "trading_cash": 134000,
+    "step_margin": 16750,
+    "step_shares": 3300,
+    "lower_runway": "8% (8 rungs x 1%)",
+    "upper_runway": "4% (4 rungs x 1%)",
+    "profit_per_cycle_inr": 495
+  },
+  "strategy_name": "pct_ladder",
+  "runner_type": "reactive",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "db",
+    "user_id": 4,
+    "db_info_file": "/root/trading_bot/common/tr_db",
+    "db_name": "traderealm",
+    "db_table": "nse_usercredential",
+    "client_id": "",
+    "access_token": "",
+    "log_path": ""
+  },
+  "strategy": {
+    "symbols": ["NSE:SYMBOL-EQ"],
+    "upper_pct": 1.0,
+    "lower_pct": 1.0,
+    "sizing_mode": "fixed_qty",
+    "fixed_qty_buy": 3300,
+    "fixed_qty_sell": 3300,
+    "qty_step": 1,
+    "min_qty": 1
+  },
+  "execution": {
+    "product_type": "MTF",
+    "allow_btst_auto": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true,
+    "poll_seconds": 5,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": false
+  },
+  "paths": {
+    "state_path": "state/india_mtf_state.json",
+    "trades_path": "state/india_mtf_trades.jsonl",
+    "rejects_path": "state/india_mtf_rejects.jsonl"
+  }
+}

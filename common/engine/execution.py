@@ -26,6 +26,7 @@ class ExecutionConfig:
     max_place_retries: int = 3
     quote_reserve: Decimal = D0         # keep some quote cash unused (USDT/INR etc)
     use_inventory_buffer: bool = False
+    price_tick: Decimal = D0            # round limit prices to this tick (e.g. 0.05 for NSE); 0 = no rounding
 
 class OrderExecutor:
     def __init__(self, broker: Broker, state, cfg: ExecutionConfig, *, rejects_path: str):

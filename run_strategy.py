@@ -121,6 +121,7 @@ def main() -> None:
         max_place_retries=int(ex.get("max_place_retries") or 3),
         quote_reserve=to_decimal(ex.get("quote_reserve_usdt") or ex.get("quote_reserve") or 0),
         use_inventory_buffer=bool(ex.get("use_inventory_buffer", False)),
+        price_tick=to_decimal(ex.get("price_tick") or 0),
     )
 
     state = GlobalState.load(state_path)
@@ -128,7 +129,8 @@ def main() -> None:
         state.extras["manual_positions_file"] = manual_positions_path
     if capital_flows_path:
         state.extras["capital_flows_file"] = capital_flows_path
-    symbols = list((cfg.get("strategy") or {}).get("symbols") or [])
+    raw_syms = list((cfg.get("strategy") or {}).get("symbols") or [])
+    symbols = [s["symbol"] if isinstance(s, dict) else s for s in raw_syms]
     if not symbols:
         raise SystemExit("Config must include strategy.symbols list.")
     if hasattr(broker, "self_symbols"):
@@ -185,6 +187,10 @@ def main() -> None:
     runner_type = (cfg.get("runner_type") or "reactive").lower()
     if runner_type == "managed":
         runner.run_managed(strategy, state_path=state_path)
+    elif runner_type == "proactive":
+        runner.run_proactive(strategy, state_path=state_path)
+    elif runner_type == "sell_first":
+        runner.run_sell_first(strategy, state_path=state_path)
     else:
         runner.run_reactive(strategy, state_path=state_path)
 

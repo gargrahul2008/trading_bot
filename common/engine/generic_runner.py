@@ -4,7 +4,7 @@ import csv
 import os
 import json
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List
 
 from common.broker.interfaces import Broker, PlaceOrderRequest, to_decimal, OrderTerminal
@@ -425,7 +425,7 @@ class GenericRunner:
         self._recalc_from_lots(ss)
         return realized
 
-    def _apply_fill(self, symbol: str, side: str, qty: Decimal, price: Decimal, cum_quote: Decimal, *, reason: str, order_id: str, status: str) -> None:
+    def _apply_fill(self, symbol: str, side: str, qty: Decimal, price: Decimal, cum_quote: Decimal, *, reason: str, order_id: str, status: str, skip_ref_update: bool = False) -> None:
         ss = self.state.symbol_states[symbol]
         realized_delta = D0
 
@@ -477,7 +477,8 @@ class GenericRunner:
                 if remaining > 0:
                     self._add_lot(ss, remaining, price)
 
-            ss.reference_price = price
+            if not skip_ref_update and not (reason or "").startswith("rebalance_"):
+                ss.reference_price = price
             ss.pending_order_id = None
             ss.pending_reason = None
             ss.pending_since = None
@@ -518,9 +519,9 @@ class GenericRunner:
         }
         self.state.trades.append(rec)
         self._append_jsonl(self.trades_path, rec)
-        # --- cycles/trade totals today(UTC) + all-time ---
+        # --- cycles/trade totals today(UTC) + all-time (ladder trades only) ---
         try:
-            if qty > 0:
+            if qty > 0 and not (reason or "").startswith("rebalance_"):
                 eff_cum = cum_quote if cum_quote > 0 else (price * qty)
                 update_trade_counters(
                     self.state,
@@ -672,6 +673,7 @@ class GenericRunner:
             base_total = _dec((bals.get(base) or {}).get("free")) + _dec((bals.get(base) or {}).get("locked"))
             total += base_total * _dec(px)
             per_symbol_totals[sym] = {"base": str(base), "base_total": base_total, "px": _dec(px)}
+            self.state.extras[f"broker_base_qty_{sym}"] = str(base_total)
         self.state.extras["portfolio_value"] = str(total)
         self.state.extras["quote_asset"] = str(quote)
         if self.state.extras.get("reconcile_crypto_balances"):
@@ -1050,6 +1052,954 @@ class GenericRunner:
 
             sleep_s = self.poll_seconds if (now >= open_dt and now < close_dt) else self.closed_poll_seconds
             time.sleep(max(int(sleep_s), 1))
+
+    # ================================================================
+    # Proactive runner helpers
+    # ================================================================
+
+    def _get_pro_oids(self, sym: str):
+        """Returns (buy_oid, sell_oid) — None if not placed."""
+        buy_oid = self.state.extras.get(f"pro_buy_oid_{sym}") or None
+        sell_oid = self.state.extras.get(f"pro_sell_oid_{sym}") or None
+        return buy_oid, sell_oid
+
+    def _set_pro_oid(self, sym: str, side: str, oid: str) -> None:
+        key = f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}"
+        self.state.extras[key] = oid
+
+    def _clear_pro_oid(self, sym: str, side: str) -> None:
+        key = f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}"
+        self.state.extras.pop(key, None)
+
+    def _cancel_pro_order(self, sym: str, side: str, partial_reason: str = "") -> None:
+        """
+        Cancel the stored proactive order for this side, then clear it.
+        After cancel, checks for any partial fill and applies it to state.
+        Works for both MEXC (instant snapshot) and Fyers (polls until terminal).
+        skip_ref_update=True so the reference_price set by the triggering fill is preserved.
+        partial_reason: trade reason string to use for the recovered partial fill.
+        """
+        buy_oid, sell_oid = self._get_pro_oids(sym)
+        oid = buy_oid if side == "BUY" else sell_oid
+        if oid:
+            try:
+                self.broker.cancel_order(oid)
+                LOG.info("PRO cancelled %s %s oid=%s", sym, side, oid)
+            except Exception as e:
+                LOG.warning("PRO cancel failed %s %s oid=%s: %s", sym, side, oid, e)
+            # Recover any partial fill on the cancelled order
+            try:
+                if hasattr(self.broker, "get_order_snapshot"):
+                    # MEXC: snapshot is immediately available after cancel
+                    snap = getattr(self.broker, "get_order_snapshot")(oid)
+                    if snap:
+                        executed = _dec(snap.get("executed_qty") or 0)
+                        avg_px   = _dec(snap.get("avg_price") or 0)
+                        cum_q    = _dec(snap.get("cum_quote_qty") or 0)
+                        if executed > D0:
+                            reason = partial_reason or f"pro_{side.lower()}_partial_cancel"
+                            self._apply_fill(sym, side, executed, avg_px, cum_q,
+                                             reason=reason, order_id=oid, status="CANCELLED",
+                                             skip_ref_update=True)
+                            LOG.info("PRO %s %s partial fill recovered: qty=%s @ %s",
+                                     sym, side, executed, avg_px)
+                else:
+                    # Fyers: poll until order reaches terminal state (CANCELLED/FILLED)
+                    # Use short timeout — cancel confirmation on NSE is usually <5s
+                    filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(
+                        sym, oid, timeout_s=10)
+                    if terminal and filled_qty > D0:
+                        reason = partial_reason or f"pro_{side.lower()}_partial_cancel"
+                        self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
+                                         reason=reason, order_id=oid, status="CANCELLED",
+                                         skip_ref_update=True)
+                        LOG.info("PRO %s %s partial fill recovered (Fyers): qty=%s @ %s",
+                                 sym, side, filled_qty, avg_px)
+            except Exception as e:
+                LOG.warning("PRO partial fill check after cancel failed %s %s: %s", sym, side, e)
+        self._clear_pro_oid(sym, side)
+
+    def _cancel_all_pro_orders(self, sym: str) -> None:
+        self._cancel_pro_order(sym, "BUY")
+        self._cancel_pro_order(sym, "SELL")
+
+    def _check_pro_fill(self, sym: str, oid: str):
+        """
+        Poll broker for order status.
+        Returns (filled_qty, avg_price, cum_quote, is_terminal) or None if still open.
+        """
+        if hasattr(self.broker, "get_order_snapshot"):
+            snap = getattr(self.broker, "get_order_snapshot")(oid)
+            if snap is None:
+                return None
+            status = snap["status"]
+            executed = _dec(snap.get("executed_qty") or 0)
+            cum_quote = _dec(snap.get("cum_quote_qty") or 0)
+            avg_price = _dec(snap.get("avg_price") or 0)
+            if status in TERMINAL_STATUSES:
+                return (executed, avg_price, cum_quote, True)
+            return None
+        else:
+            # Fyers path
+            term = self.exec.poll_terminal(oid)
+            if term is None:
+                return None
+            if term.status in TERMINAL_STATUSES:
+                px = term.avg_price if term.avg_price > 0 else D0
+                cum = term.cum_quote_qty if term.cum_quote_qty > 0 else (px * term.filled_qty)
+                return (term.filled_qty, px, cum, True)
+            return None
+
+    def _wait_fill_blocking(self, sym: str, oid: str, timeout_s: int = 60) -> tuple:
+        """Block until the order reaches a terminal state. Returns same tuple as _check_pro_fill."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            result = self._check_pro_fill(sym, oid)
+            if result is not None:
+                return result
+            time.sleep(1)
+        LOG.warning("PRO _wait_fill_blocking: timeout sym=%s oid=%s", sym, oid)
+        return (D0, D0, D0, False)
+
+    def _round_price_to_tick(self, price: Decimal) -> Decimal:
+        """Round price down to nearest tick size. No-op if price_tick not configured."""
+        tick = _dec(self.exec_cfg.price_tick)
+        if tick <= D0:
+            return price
+        return (price / tick).to_integral_value(rounding=ROUND_DOWN) * tick
+
+    def _round_qty_pro(self, qty: Decimal, strategy) -> Decimal:
+        """Round qty down to qty_step, respecting min_qty."""
+        step = strategy.cfg.qty_step if strategy.cfg.qty_step > 0 else Decimal("0.000001")
+        q = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+        if q < strategy.cfg.min_qty:
+            return D0
+        return q
+
+    def _rebalance_sync(self, sym: str, strategy, direction: str, ref: Decimal) -> bool:
+        """
+        Synchronous blocking rebalance (Option B: restore full runway).
+        direction='buy'  → need more cash, sell ETH.
+        direction='sell' → need more ETH, buy with cash.
+        Returns True if the rebalance order filled (or no action needed).
+        """
+        ss = self.state.symbol_states[sym]
+        cfg = strategy.cfg
+        target_steps = cfg.rebalance_target_steps or 8
+        quote_reserve = _dec(self.exec_cfg.quote_reserve)
+
+        if direction == "buy":
+            # Target cash = target_steps × cost_per_buy_trade
+            # fixed_qty: cost = fixed_qty_buy × ref   |   fixed_quote: cost = buy_quote
+            if cfg.sizing_mode == "fixed_qty":
+                if ref <= D0:
+                    return False
+                cost_per_trade = _dec(cfg.fixed_qty_buy) * ref
+            else:
+                cost_per_trade = _dec(cfg.buy_quote)
+            target_cash = _dec(target_steps) * cost_per_trade
+            available_cash = max(self.state.cash - quote_reserve, D0)
+            deficit = target_cash - available_cash
+            if deficit <= D0:
+                return True  # already enough
+            sell_qty = self._round_qty_pro(deficit / ref, strategy)
+            # cap to what we actually hold
+            base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+            sell_qty = min(sell_qty, base_qty)
+            sell_qty = self._round_qty_pro(sell_qty, strategy)
+            if sell_qty <= D0:
+                return False
+            req = PlaceOrderRequest(
+                symbol=sym, side="SELL", qty=sell_qty,
+                product_type=self.exec_cfg.product_type, order_type="MARKET",
+            )
+            oid = self.exec.place_with_adaptive_qty(req, reason="rebalance_restore")
+            if not oid:
+                return False
+            LOG.info("PRO rebalance_sync SELL qty=%s oid=%s", sell_qty, oid)
+            filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid)
+            if terminal and filled_qty > 0:
+                self._apply_fill(sym, "SELL", filled_qty, avg_px if avg_px > D0 else ref, cum_q,
+                                 reason="rebalance_restore", order_id=oid, status="FILLED")
+            return terminal
+
+        else:  # direction == "sell" — need more ETH
+            if cfg.sizing_mode == "fixed_qty":
+                target_eth = _dec(target_steps) * _dec(cfg.fixed_qty_sell)
+            else:
+                if ref <= D0:
+                    return False
+                target_eth = _dec(target_steps) * _dec(cfg.sell_quote) / ref
+                target_eth = self._round_qty_pro(target_eth, strategy)
+            current_eth = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+            deficit_eth = target_eth - current_eth
+            if deficit_eth <= D0:
+                return True  # already enough
+            deficit_eth = self._round_qty_pro(deficit_eth, strategy)
+            if deficit_eth <= D0:
+                return False
+            # Reduce buy qty if we can't afford it
+            available_cash = max(self.state.cash - quote_reserve, D0)
+            if ref > D0 and deficit_eth * ref > available_cash:
+                deficit_eth = self._round_qty_pro(available_cash / ref, strategy)
+            if deficit_eth <= D0:
+                return False
+            req = PlaceOrderRequest(
+                symbol=sym, side="BUY", qty=deficit_eth,
+                product_type=self.exec_cfg.product_type, order_type="MARKET",
+            )
+            oid = self.exec.place_with_adaptive_qty(req, reason="rebalance_restore")
+            if not oid:
+                return False
+            LOG.info("PRO rebalance_sync BUY qty=%s oid=%s", deficit_eth, oid)
+            filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid)
+            if terminal and filled_qty > 0:
+                self._apply_fill(sym, "BUY", filled_qty, avg_px if avg_px > D0 else ref, cum_q,
+                                 reason="rebalance_restore", order_id=oid, status="FILLED")
+            return terminal
+
+    def _place_proactive_orders(self, sym: str, strategy, price: Decimal) -> None:
+        """
+        Place resting GTC LIMIT BUY and SELL orders if not already in the book.
+        Pre-validates funds; triggers synchronous rebalance (Option B) if needed.
+        Works for both fixed_quote (crypto) and fixed_qty (India equity) modes.
+        """
+        ss = self.state.symbol_states[sym]
+        cfg = strategy.cfg
+        ref = _dec(ss.reference_price) if ss.reference_price is not None else price
+        quote_reserve = _dec(self.exec_cfg.quote_reserve)
+
+        buy_level  = self._round_price_to_tick(ref * (Decimal("1") - cfg.lower_pct / Decimal("100")))
+        sell_level = self._round_price_to_tick(ref * (Decimal("1") + cfg.upper_pct / Decimal("100")))
+
+        # ---- BUY side ----
+        buy_oid, _ = self._get_pro_oids(sym)
+        if not buy_oid and buy_level > D0:
+            if cfg.sizing_mode == "fixed_qty":
+                buy_qty = _dec(cfg.fixed_qty_buy)
+            else:
+                buy_qty = self._round_qty_pro(_dec(cfg.buy_quote) / buy_level, strategy)
+
+            buy_cost = buy_qty * buy_level
+            available_cash = max(self.state.cash - quote_reserve, D0)
+            if buy_qty > D0 and buy_cost > available_cash:
+                if cfg.rebalance_threshold_steps > 0:
+                    LOG.info("PRO %s BUY: insufficient cash (need=%s have=%s), rebalancing", sym, buy_cost, available_cash)
+                    self._rebalance_sync(sym, strategy, "buy", ref)
+                    # Refresh balances after market rebalance order
+                    self._update_extras_crypto({sym: price})
+                    available_cash = max(self.state.cash - quote_reserve, D0)
+                if buy_cost > available_cash:
+                    LOG.warning("PRO %s BUY: insufficient cash after rebalance, skipping", sym)
+                    buy_qty = D0
+
+            if buy_qty > D0:
+                req = PlaceOrderRequest(
+                    symbol=sym, side="BUY", qty=buy_qty,
+                    product_type=self.exec_cfg.product_type,
+                    order_type="LIMIT", limit_price=buy_level, time_in_force="GTC",
+                )
+                oid = self.exec.place_with_adaptive_qty(req, reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+                if oid:
+                    self._set_pro_oid(sym, "BUY", oid)
+                    LOG.info("PRO %s BUY placed oid=%s qty=%s @ %s", sym, oid, buy_qty, buy_level)
+
+        # ---- SELL side ----
+        _, sell_oid = self._get_pro_oids(sym)
+        if not sell_oid and sell_level > D0:
+            if cfg.sizing_mode == "fixed_qty":
+                sell_qty = _dec(cfg.fixed_qty_sell)
+            else:
+                sell_qty = self._round_qty_pro(_dec(cfg.sell_quote) / sell_level, strategy)
+
+            base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+            if sell_qty > D0 and base_qty < sell_qty:
+                if cfg.rebalance_threshold_steps > 0:
+                    LOG.info("PRO %s SELL: insufficient ETH (need=%s have=%s), rebalancing", sym, sell_qty, base_qty)
+                    self._rebalance_sync(sym, strategy, "sell", ref)
+                    self._update_extras_crypto({sym: price})
+                    base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+                if base_qty < sell_qty:
+                    LOG.warning("PRO %s SELL: insufficient inventory after rebalance, skipping", sym)
+                    sell_qty = D0
+
+            if sell_qty > D0:
+                req = PlaceOrderRequest(
+                    symbol=sym, side="SELL", qty=sell_qty,
+                    product_type=self.exec_cfg.product_type,
+                    order_type="LIMIT", limit_price=sell_level, time_in_force="GTC",
+                )
+                oid = self.exec.place_with_adaptive_qty(req, reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+                if oid:
+                    self._set_pro_oid(sym, "SELL", oid)
+                    LOG.info("PRO %s SELL placed oid=%s qty=%s @ %s", sym, oid, sell_qty, sell_level)
+
+    def _poll_proactive_symbol(self, sym: str, strategy, price: Decimal, allow_new: bool = True) -> None:
+        """
+        Check BUY and SELL proactive orders for fills.
+        On fill: record trade, cancel other side, guard re-center, place fresh orders immediately.
+        Also handles drift: if price drifts > 2*pct from ref, cancel stale orders and re-center.
+        """
+        ss = self.state.symbol_states[sym]
+        cfg = strategy.cfg
+        ref = _dec(ss.reference_price) if ss.reference_price is not None else price
+
+        buy_oid, sell_oid = self._get_pro_oids(sym)
+
+        # Check BUY fill
+        filled_buy = False
+        if buy_oid:
+            result = self._check_pro_fill(sym, buy_oid)
+            if result is not None:
+                filled_qty, avg_px, cum_q, _ = result
+                self._clear_pro_oid(sym, "BUY")
+                if filled_qty > 0:
+                    fill_px = avg_px if avg_px > D0 else price
+                    self._apply_fill(sym, "BUY", filled_qty, fill_px, cum_q,
+                                     reason=f"pro_buy|ref-{float(cfg.lower_pct)}%",
+                                     order_id=buy_oid, status="FILLED")
+                    filled_buy = True
+                else:
+                    LOG.info("PRO %s BUY terminal (no fill) oid=%s", sym, buy_oid)
+
+        # Check SELL fill (re-read sell_oid in case BUY clear above changed extras)
+        filled_sell = False
+        _, sell_oid = self._get_pro_oids(sym)
+        if sell_oid:
+            result = self._check_pro_fill(sym, sell_oid)
+            if result is not None:
+                filled_qty, avg_px, cum_q, _ = result
+                self._clear_pro_oid(sym, "SELL")
+                if filled_qty > 0:
+                    fill_px = avg_px if avg_px > D0 else price
+                    self._apply_fill(sym, "SELL", filled_qty, fill_px, cum_q,
+                                     reason=f"pro_sell|ref+{float(cfg.upper_pct)}%",
+                                     order_id=sell_oid, status="FILLED")
+                    filled_sell = True
+                else:
+                    LOG.info("PRO %s SELL terminal (no fill) oid=%s", sym, sell_oid)
+
+        # Drift check — only if no fills this iteration (fills take priority)
+        if not filled_buy and not filled_sell and ref > D0:
+            drift_pct = abs(price - ref) / ref * Decimal("100")
+            drift_threshold = cfg.lower_pct + cfg.upper_pct
+            if drift_pct > drift_threshold:
+                LOG.info("PRO %s drift=%.4f%% > threshold=%.4f%%, re-centering ref=%s->%s",
+                         sym, float(drift_pct), float(drift_threshold), ref, price)
+                self._cancel_all_pro_orders(sym)
+                ss.reference_price = price
+                return
+
+        # Post-fill: cancel opposite side + guard re-center + immediately place fresh orders
+        if filled_buy and not filled_sell:
+            self._cancel_pro_order(sym, "SELL",
+                                   partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+            new_ref = _dec(ss.reference_price)
+            new_sell_level = new_ref * (Decimal("1") + cfg.upper_pct / Decimal("100"))
+            if price >= new_sell_level:
+                LOG.info("PRO %s BUY filled, price=%s >= new_sell=%s, re-centering", sym, price, new_sell_level)
+                ss.reference_price = price
+            if allow_new:
+                self._place_proactive_orders(sym, strategy, price)
+
+        elif filled_sell and not filled_buy:
+            self._cancel_pro_order(sym, "BUY",
+                                   partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+            new_ref = _dec(ss.reference_price)
+            new_buy_level = new_ref * (Decimal("1") - cfg.lower_pct / Decimal("100"))
+            if price <= new_buy_level:
+                LOG.info("PRO %s SELL filled, price=%s <= new_buy=%s, re-centering", sym, price, new_buy_level)
+                ss.reference_price = price
+            if allow_new:
+                self._place_proactive_orders(sym, strategy, price)
+
+        elif filled_buy and filled_sell:
+            # Both filled in same poll (big move) — re-center on current price
+            LOG.info("PRO %s both BUY+SELL filled, re-centering ref on price=%s", sym, price)
+            ss.reference_price = price
+            if allow_new:
+                self._place_proactive_orders(sym, strategy, price)
+
+    def run_proactive(self, strategy, *, state_path: str) -> None:
+        """
+        Proactive runner: keeps resting GTC LIMIT BUY and SELL orders in the book at all times.
+        On fill: cancels other side, handles guard re-center, places fresh orders.
+        Works for both India (Fyers, fixed_qty) and crypto (MEXC, fixed_quote).
+        """
+        self.state.ensure_symbols(self.symbols)
+
+        if self.sync_on_start:
+            try:
+                self.reconcile_from_broker()
+            except Exception as e:
+                LOG.warning("Sync-on-start failed: %s", e)
+
+        LOG.info("PROACTIVE started symbols=%s", ",".join(self.symbols))
+
+        while True:
+            now = now_local(self.market_tz)
+            today = now.date().isoformat()
+
+            if self.state.session_date != today:
+                self.state.session_date = today
+                self.state.reject_events = []
+                self.state.cooldown_until = None
+                self.state.halted_until = None
+                self.state.halt_reason = None
+                self.state.last_eod_cancel_date = None
+
+            open_dt = now.replace(hour=self.open_t.hour, minute=self.open_t.minute, second=self.open_t.second, microsecond=0)
+            close_dt = now.replace(hour=self.close_t.hour, minute=self.close_t.minute, second=self.close_t.second, microsecond=0)
+            eod_cancel_dt = now.replace(hour=self.eod_cancel_t.hour, minute=self.eod_cancel_t.minute, second=self.eod_cancel_t.second, microsecond=0)
+
+            # EOD cancel: pull all proactive orders off the book
+            if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:
+                for sym in self.symbols:
+                    self._cancel_all_pro_orders(sym)
+                n = self.cancel_open_orders(cancel_all=self.cancel_all_open_orders)
+                self.state.last_eod_cancel_date = today
+                self.state.halted_until = close_dt.astimezone(dt.timezone.utc).isoformat()
+                self.state.halt_reason = "EOD_CANCEL"
+                LOG.warning("PRO EOD cancel done: cancelled=%d", n)
+
+            allow_new = (now >= open_dt) and (now < eod_cancel_dt)
+
+            try:
+                prices = self.broker.get_ltps(self.symbols)
+                for sym, px in prices.items():
+                    self.state.last_prices[sym] = _dec(px)
+                    self.state.symbol_states[sym].last_mark_price = _dec(px)
+
+                self._update_extras_crypto(prices)
+
+                # Init references on first run
+                for sym in self.symbols:
+                    self._init_reference(sym, _dec(prices[sym]))
+
+                for sym in self.symbols:
+                    price = _dec(prices[sym])
+                    # Check fills, handle drift, place fresh orders immediately on fill
+                    self._poll_proactive_symbol(sym, strategy, price, allow_new=allow_new)
+                    # Safety net: place any still-missing orders (drift re-center, startup, etc.)
+                    if allow_new:
+                        self._place_proactive_orders(sym, strategy, price)
+
+                # --- Status log ---
+                parts = []
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    px = self.state.last_prices.get(s, D0)
+                    ref = ss.reference_price or D0
+                    buy_oid, sell_oid = self._get_pro_oids(s)
+                    parts.append(f"{s} px={px} ref={ref} buy_oid={buy_oid} sell_oid={sell_oid} traded={ss.traded_qty} R={ss.realized_pnl}")
+
+                # --- PnL persistence (identical to run_reactive) ---
+                broker_name = infer_broker_name(self.broker)
+                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+                start_val = ensure_portfolio_start(self.state, port_val)
+                port_pnl = port_val - start_val
+                port_pnl_pct = (port_pnl / start_val) if start_val > 0 else D0
+                dd = update_drawdown(self.state, port_val)
+
+                se, realized, unreal, st_total, exposure, exp_pct = compute_strategy_pnl(self.state)
+                ensure_today_buckets(self.state, realized_now=realized)
+                realized_td = realized_today(self.state, realized_now=realized)
+                non_strategy_value = port_val - se
+                non_strategy_pct = (non_strategy_value / port_val) if port_val > 0 else D0
+
+                deployed_market = D0
+                if isinstance(port_details, dict) and port_details.get("quote_total") is not None:
+                    quote_total = Decimal(str(port_details.get("quote_total") or "0"))
+                    deployed_market = port_val - quote_total
+                else:
+                    per = (port_details.get("per_symbol") or {}) if isinstance(port_details, dict) else {}
+                    for _, d in per.items():
+                        try:
+                            deployed_market += Decimal(str(d.get("qty_used") or "0")) * Decimal(str(d.get("px") or "0"))
+                        except Exception:
+                            pass
+
+                peak = Decimal(str(self.state.extras.get("deployed_market_peak") or "0"))
+                if deployed_market > peak:
+                    self.state.extras["deployed_market_peak"] = str(deployed_market)
+
+                deployed_cost_strategy = D0
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    deployed_cost_strategy += Decimal(str(ss.traded_qty)) * Decimal(str(ss.traded_avg_price))
+                unit_map = self.state.extras.get("cycle_unit_quote_by_symbol") or {}
+
+                def _cycles_block(store: dict) -> dict:
+                    out = {"per_symbol": {}}
+                    per = (store.get("per_symbol") or {})
+                    for sym_k, rec in per.items():
+                        buy_q = Decimal(str(rec.get("buy_quote") or "0"))
+                        sell_q = Decimal(str(rec.get("sell_quote") or "0"))
+                        cycle_q = min(buy_q, sell_q)
+                        unit = unit_map.get(sym_k)
+                        cycles_est = (cycle_q / Decimal(str(unit))) if unit else None
+                        out["per_symbol"][sym_k] = {
+                            "buy_quote": str(buy_q), "sell_quote": str(sell_q),
+                            "buy_qty": str(rec.get("buy_qty") or "0"),
+                            "sell_qty": str(rec.get("sell_qty") or "0"),
+                            "cycle_quote": str(cycle_q),
+                            "cycle_unit_quote": str(unit) if unit else None,
+                            "cycles_est": str(cycles_est) if cycles_est is not None else None,
+                        }
+                    return out
+
+                cycles_today_store = self.state.extras.get("cycles_today") or {"per_symbol": {}}
+                cycles_all_store = self.state.extras.get("cycles_all_time") or {"per_symbol": {}}
+                cycles_today_out = {"date_utc": self.state.extras.get("cycles_today_utc_date"), **_cycles_block(cycles_today_store)}
+                cycles_all_out = _cycles_block(cycles_all_store)
+                holdings_out = {
+                    "quote_total": str(port_details.get("quote_total")) if isinstance(port_details, dict) and port_details.get("quote_total") is not None else None,
+                    "per_symbol": (port_details.get("per_symbol") if isinstance(port_details, dict) else {}),
+                }
+
+                pt = PnLPoint(
+                    ts=utcnow().isoformat(), broker=broker_name, quote_asset=str(quote_asset),
+                    portfolio_value=port_val, portfolio_pnl=port_pnl, portfolio_pnl_pct=port_pnl_pct,
+                    strategy_equity=se, strategy_realized=realized, strategy_unrealized=unreal,
+                    strategy_total=st_total, drawdown_pct=dd, exposure=exposure, exposure_pct=exp_pct,
+                )
+                if self._pnl_writer:
+                    self._pnl_writer.append(pt)
+                self._append_price_point(ts=pt.ts)
+                self._update_daily_points(pt=pt)
+
+                manual_map = self.state.extras.get("manual_inventory_by_symbol") or {}
+                snap = {
+                    "ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
+                    "portfolio_value": str(port_val), "portfolio_pnl": str(port_pnl),
+                    "portfolio_pnl_pct": str(port_pnl_pct), "drawdown_pct": str(dd),
+                    "portfolio_details": port_details, "symbols": {},
+                    "created": {
+                        "strategy_realized_today": str(realized_td),
+                        "strategy_realized_all_time": str(realized),
+                        "strategy_unrealized_now": str(unreal),
+                        "strategy_total_now": str(st_total),
+                    },
+                    "bot": {
+                        "equity": str(se), "realized_today": str(realized_td),
+                        "realized_all_time": str(realized), "unrealized_now": str(unreal),
+                        "total_now": str(st_total),
+                    },
+                    "non_strategy": {"value_est": str(non_strategy_value), "value_pct_est": str(non_strategy_pct)},
+                    "manual_inventory_by_symbol": manual_map,
+                    "deployed": {
+                        "deployed_market_now": str(deployed_market),
+                        "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
+                        "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                        "quote_asset": str(quote_asset),
+                    },
+                    "cycles_today": cycles_today_out, "cycles_all_time": cycles_all_out, "holdings": holdings_out,
+                }
+                for s in self.symbols:
+                    ss = self.state.symbol_states[s]
+                    px = self.state.last_prices.get(s, D0)
+                    buy_oid_s, sell_oid_s = self._get_pro_oids(s)
+                    snap["symbols"][s] = {
+                        "px": str(px),
+                        "ref": str(ss.reference_price) if ss.reference_price is not None else None,
+                        "traded_qty": str(ss.traded_qty), "avg_price": str(ss.traded_avg_price),
+                        "realized": str(ss.realized_pnl),
+                        "unrealized": str((ss.traded_qty * (px - ss.traded_avg_price)) if px is not None else D0),
+                        "pro_buy_oid": buy_oid_s, "pro_sell_oid": sell_oid_s,
+                        "borrowed_qty": str(ss.borrowed_qty), "borrowed_avg_sell": str(ss.borrowed_avg_sell),
+                        "net_qty": str(ss.traded_qty - ss.borrowed_qty),
+                    }
+                if self._pnl_writer:
+                    self._pnl_writer.write_snapshot(snap)
+                    summary_out = {
+                        "ts": pt.ts, "portfolio_value": str(port_val),
+                        "portfolio_pnl": str(port_pnl), "portfolio_pnl_pct": str(port_pnl_pct),
+                        "max_dd": str(self.state.extras.get("pnl_max_dd") or "0"),
+                        "quote_asset": str(quote_asset),
+                        "created": {
+                            "strategy_realized_today": str(realized_td),
+                            "strategy_realized_all_time": str(realized),
+                            "strategy_unrealized_now": str(unreal),
+                            "strategy_total_now": str(st_total),
+                        },
+                        "bot": {
+                            "equity": str(se), "realized_today": str(realized_td),
+                            "realized_all_time": str(realized), "unrealized_now": str(unreal),
+                            "total_now": str(st_total),
+                        },
+                        "non_strategy": {"value_est": str(non_strategy_value), "value_pct_est": str(non_strategy_pct)},
+                        "manual_inventory_by_symbol": manual_map,
+                        "deployed": {
+                            "deployed_market_now": str(deployed_market),
+                            "deployed_market_peak": str(self.state.extras.get("deployed_market_peak") or "0"),
+                            "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                            "quote_asset": str(quote_asset),
+                        },
+                        "cycles_today": cycles_today_out, "cycles_all_time": cycles_all_out, "holdings": holdings_out,
+                    }
+                    self._pnl_writer.write_summary(summary_out)
+                LOG.info("PRO cash=%s eq=%s | %s", str(self.state.cash), str(self.state.strategy_equity()), " | ".join(parts))
+
+            except KeyboardInterrupt:
+                LOG.info("PRO stopped by user.")
+                for sym in self.symbols:
+                    self._cancel_all_pro_orders(sym)
+                break
+            except Exception as e:
+                LOG.exception("PRO loop error: %s", e)
+
+            self.state.last_update_ts = utcnow().isoformat()
+            self.state.dump(state_path)
+
+            sleep_s = self.poll_seconds if (now >= open_dt and now < close_dt) else self.closed_poll_seconds
+            try:
+                time.sleep(max(int(sleep_s), 1))
+            except KeyboardInterrupt:
+                LOG.info("PRO stopped by user (during sleep).")
+                for sym in self.symbols:
+                    self._cancel_all_pro_orders(sym)
+                break
+
+    # =========================================================
+    # SELL-FIRST RUNNER HELPERS
+    # =========================================================
+
+    def _sf_state(self, symbol: str) -> dict:
+        """Get or init per-symbol sell_first state from extras."""
+        sf: Dict[str, Any] = self.state.extras.setdefault("sf", {})
+        if symbol not in sf or not isinstance(sf.get(symbol), dict):
+            sf[symbol] = {
+                "mode": "sell_first",   # "sell_first" | "waiting_buy"
+                "sell_oid": None,
+                "buy_oid": None,
+                "prev_close": None,
+                "sell_level": None,
+                "buy_level": None,
+                "level_date": None,
+            }
+        return sf[symbol]
+
+    def _sf_cancel(self, symbol: str, oid: str) -> None:
+        """Best-effort cancel an order."""
+        try:
+            self.broker.cancel_order(oid)
+            LOG.info("SF %s cancelled oid=%s", symbol, oid)
+        except Exception as e:
+            LOG.warning("SF %s cancel oid=%s failed: %s", symbol, oid, e)
+
+    def _sf_check_fill(self, oid: str):
+        """Returns OrderTerminal if terminal, else None."""
+        try:
+            return self.exec.poll_terminal(oid)
+        except Exception:
+            return None
+
+    def _sf_place_order(self, symbol: str, side: str, price: Decimal,
+                        qty: int, disclosed: int, product_type: str, *, reason: str):
+        """Place a DAY LIMIT order with disclosed qty. Returns order_id or None."""
+        req = PlaceOrderRequest(
+            symbol=symbol,
+            side=side,
+            qty=Decimal(str(qty)),
+            product_type=product_type,
+            order_type="LIMIT",
+            limit_price=price,
+            validity="DAY",
+            disclosed_qty=disclosed,
+        )
+        return self.exec.place_with_adaptive_qty(req, reason=reason)
+
+    def _sf_refresh_levels(self, symbol: str, sym_cfg, today: str, lookback_days: int) -> bool:
+        """Fetch prev_close and compute sell/buy levels. Returns True on success."""
+        from common.engine.anchors import fetch_prev_close
+        try:
+            prev_close = fetch_prev_close(
+                self.broker, symbol=symbol,
+                market_tz=self.market_tz, lookback_days=lookback_days,
+            )
+        except Exception as e:
+            LOG.warning("SF %s fetch_prev_close failed: %s", symbol, e)
+            return False
+        sell_level, buy_level = sym_cfg.compute_levels(prev_close)
+        ss = self._sf_state(symbol)
+        ss["prev_close"]  = str(prev_close)
+        ss["sell_level"]  = str(sell_level)
+        ss["buy_level"]   = str(buy_level)
+        ss["level_date"]  = today
+        LOG.info("SF %s levels refreshed prev_close=%s sell=%s buy=%s disclosed=%s",
+                 symbol, prev_close, sell_level, buy_level, sym_cfg.disclosed_qty)
+        return True
+
+    def _sf_poll_symbol(self, symbol: str, sym_cfg, *,
+                        allow_place: bool, today: str,
+                        product_type: str, lookback_days: int) -> None:
+        """Core per-symbol state machine for sell-first strategy."""
+        ss = self._sf_state(symbol)
+
+        # --- New trading day: cancel stale orders and refresh levels ---
+        if ss.get("level_date") != today:
+            for oid_key in ("sell_oid", "buy_oid"):
+                oid = ss.get(oid_key)
+                if oid:
+                    self._sf_cancel(symbol, oid)
+                    ss[oid_key] = None
+            ok = self._sf_refresh_levels(symbol, sym_cfg, today, lookback_days)
+            if not ok:
+                return
+            ss["mode"] = "sell_first"
+            ss["sell_oid"] = None
+            ss["buy_oid"]  = None
+
+        sell_level = _dec(ss.get("sell_level") or "0")
+        buy_level  = _dec(ss.get("buy_level")  or "0")
+        if sell_level <= D0 or buy_level <= D0:
+            return
+
+        mode     = ss.get("mode", "sell_first")
+        disc     = sym_cfg.disclosed_qty
+        qty      = sym_cfg.qty
+
+        # ---- SELL_FIRST: waiting for sell to fill ----
+        if mode == "sell_first":
+            sell_oid = ss.get("sell_oid")
+            if sell_oid:
+                term = self._sf_check_fill(sell_oid)
+                if term is None:
+                    return  # still live in book
+                if term.status == "FILLED" and term.filled_qty > D0:
+                    px  = term.avg_price if term.avg_price > D0 else sell_level
+                    cum = term.cum_quote_qty if term.cum_quote_qty > D0 else (px * term.filled_qty)
+                    LOG.info("SF %s SELL filled qty=%s @ %s", symbol, term.filled_qty, px)
+                    self._apply_fill(symbol, "SELL", term.filled_qty, px, cum,
+                                     reason="sf_sell", order_id=sell_oid, status="FILLED")
+                    ss["sell_oid"] = None
+                    ss["mode"] = "waiting_buy"
+                    if allow_place:
+                        oid = self._sf_place_order(symbol, "BUY", buy_level, qty, disc, product_type, reason="sf_buy")
+                        if oid:
+                            ss["buy_oid"] = oid
+                            LOG.info("SF %s BUY placed oid=%s qty=%s @ %s disc=%s", symbol, oid, qty, buy_level, disc)
+                elif term.status in ("CANCELLED", "REJECTED"):
+                    LOG.warning("SF %s SELL oid=%s %s — re-placing", symbol, sell_oid, term.status)
+                    ss["sell_oid"] = None
+                    if allow_place:
+                        oid = self._sf_place_order(symbol, "SELL", sell_level, qty, disc, product_type, reason="sf_sell")
+                        if oid:
+                            ss["sell_oid"] = oid
+                            LOG.info("SF %s SELL re-placed oid=%s qty=%s @ %s disc=%s", symbol, oid, qty, sell_level, disc)
+            elif allow_place:
+                oid = self._sf_place_order(symbol, "SELL", sell_level, qty, disc, product_type, reason="sf_sell")
+                if oid:
+                    ss["sell_oid"] = oid
+                    LOG.info("SF %s SELL placed oid=%s qty=%s @ %s disc=%s", symbol, oid, qty, sell_level, disc)
+
+        # ---- WAITING_BUY: sell filled, waiting for buy ----
+        elif mode == "waiting_buy":
+            buy_oid = ss.get("buy_oid")
+            if buy_oid:
+                term = self._sf_check_fill(buy_oid)
+                if term is None:
+                    return  # still live in book
+                if term.status == "FILLED" and term.filled_qty > D0:
+                    px  = term.avg_price if term.avg_price > D0 else buy_level
+                    cum = term.cum_quote_qty if term.cum_quote_qty > D0 else (px * term.filled_qty)
+                    LOG.info("SF %s BUY filled qty=%s @ %s", symbol, term.filled_qty, px)
+                    self._apply_fill(symbol, "BUY", term.filled_qty, px, cum,
+                                     reason="sf_buy", order_id=buy_oid, status="FILLED")
+                    ss["buy_oid"] = None
+                    ss["mode"] = "sell_first"
+                    if allow_place:
+                        oid = self._sf_place_order(symbol, "SELL", sell_level, qty, disc, product_type, reason="sf_sell")
+                        if oid:
+                            ss["sell_oid"] = oid
+                            LOG.info("SF %s SELL placed oid=%s qty=%s @ %s disc=%s", symbol, oid, qty, sell_level, disc)
+                elif term.status in ("CANCELLED", "REJECTED"):
+                    LOG.warning("SF %s BUY oid=%s %s — re-placing", symbol, buy_oid, term.status)
+                    ss["buy_oid"] = None
+                    if allow_place:
+                        oid = self._sf_place_order(symbol, "BUY", buy_level, qty, disc, product_type, reason="sf_buy")
+                        if oid:
+                            ss["buy_oid"] = oid
+                            LOG.info("SF %s BUY re-placed oid=%s qty=%s @ %s disc=%s", symbol, oid, qty, buy_level, disc)
+            elif allow_place:
+                oid = self._sf_place_order(symbol, "BUY", buy_level, qty, disc, product_type, reason="sf_buy")
+                if oid:
+                    ss["buy_oid"] = oid
+                    LOG.info("SF %s BUY placed oid=%s qty=%s @ %s disc=%s", symbol, oid, qty, buy_level, disc)
+
+    def run_sell_first(self, strategy, *, state_path: str) -> None:
+        """
+        Sell-first proactive runner.
+        Keeps one resting DAY LIMIT order per symbol: SELL first, then BUY after fill,
+        then SELL again. Levels recalculated from prev_close each morning.
+        Uses disclosed quantity (10% of total, rounded to lot_size).
+        """
+        self.state.ensure_symbols(self.symbols)
+
+        if self.sync_on_start:
+            try:
+                self.reconcile_from_broker()
+            except Exception as e:
+                LOG.warning("Sync-on-start failed: %s", e)
+
+        product_type  = self.exec_cfg.product_type
+        lookback_days = int(getattr(strategy, "lookback_days", 10))
+
+        LOG.info("SELL_FIRST started symbols=%s", ",".join(self.symbols))
+
+        while True:
+            now   = now_local(self.market_tz)
+            today = now.date().isoformat()
+
+            if self.state.session_date != today:
+                self.state.session_date       = today
+                self.state.reject_events      = []
+                self.state.cooldown_until     = None
+                self.state.halted_until       = None
+                self.state.halt_reason        = None
+                self.state.last_eod_cancel_date = None
+
+            open_dt       = now.replace(hour=self.open_t.hour,       minute=self.open_t.minute,       second=self.open_t.second,       microsecond=0)
+            close_dt      = now.replace(hour=self.close_t.hour,      minute=self.close_t.minute,      second=self.close_t.second,      microsecond=0)
+            eod_cancel_dt = now.replace(hour=self.eod_cancel_t.hour, minute=self.eod_cancel_t.minute, second=self.eod_cancel_t.second, microsecond=0)
+
+            # --- EOD cancel ---
+            if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:
+                for sym in self.symbols:
+                    ss = self._sf_state(sym)
+                    for oid_key in ("sell_oid", "buy_oid"):
+                        oid = ss.get(oid_key)
+                        if oid:
+                            self._sf_cancel(sym, oid)
+                            ss[oid_key] = None
+                n = self.cancel_open_orders(cancel_all=self.cancel_all_open_orders)
+                self.state.last_eod_cancel_date = today
+                self.state.halted_until = close_dt.astimezone(dt.timezone.utc).isoformat()
+                self.state.halt_reason  = "EOD_CANCEL"
+                LOG.warning("SF EOD cancel done: cancelled=%d", n)
+
+            allow_place = (now >= open_dt) and (now < eod_cancel_dt)
+
+            try:
+                prices = self.broker.get_ltps(self.symbols)
+                for sym, px in prices.items():
+                    self.state.last_prices[sym]                      = _dec(px)
+                    self.state.symbol_states[sym].last_mark_price    = _dec(px)
+
+                for sym in self.symbols:
+                    sym_cfg = strategy.get(sym)
+                    if sym_cfg is None:
+                        continue
+                    self._sf_poll_symbol(
+                        sym, sym_cfg,
+                        allow_place=allow_place,
+                        today=today,
+                        product_type=product_type,
+                        lookback_days=lookback_days,
+                    )
+
+                # --- Status log ---
+                parts = []
+                for sym in self.symbols:
+                    ss  = self._sf_state(sym)
+                    px  = self.state.last_prices.get(sym, D0)
+                    parts.append(
+                        f"{sym} px={px} mode={ss.get('mode')} "
+                        f"sell_lvl={ss.get('sell_level')} buy_lvl={ss.get('buy_level')} "
+                        f"sell_oid={ss.get('sell_oid')} buy_oid={ss.get('buy_oid')}"
+                    )
+                LOG.info("SF | %s", " | ".join(parts))
+
+                # --- PnL ---
+                broker_name = infer_broker_name(self.broker)
+                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(
+                    self.broker, self.symbols, prices, self.state)
+                start_val      = ensure_portfolio_start(self.state, port_val)
+                port_pnl       = port_val - start_val
+                port_pnl_pct   = (port_pnl / start_val) if start_val > 0 else D0
+                dd             = update_drawdown(self.state, port_val)
+
+                se, realized, unreal, st_total, exposure, exp_pct = compute_strategy_pnl(self.state)
+                ensure_today_buckets(self.state, realized_now=realized)
+                realized_td       = realized_today(self.state, realized_now=realized)
+                non_strategy_value = port_val - se
+                non_strategy_pct   = (non_strategy_value / port_val) if port_val > 0 else D0
+
+                deployed_cost_strategy = D0
+                for s in self.symbols:
+                    ss2 = self.state.symbol_states[s]
+                    deployed_cost_strategy += Decimal(str(ss2.traded_qty)) * Decimal(str(ss2.traded_avg_price))
+
+                pt = PnLPoint(
+                    ts=utcnow().isoformat(), broker=broker_name, quote_asset=str(quote_asset),
+                    portfolio_value=port_val, portfolio_pnl=port_pnl, portfolio_pnl_pct=port_pnl_pct,
+                    strategy_equity=se, strategy_realized=realized, strategy_unrealized=unreal,
+                    strategy_total=st_total, drawdown_pct=dd, exposure=exposure, exposure_pct=exp_pct,
+                )
+                if self._pnl_writer:
+                    self._pnl_writer.append(pt)
+                self._append_price_point(ts=pt.ts)
+                self._update_daily_points(pt=pt)
+
+                summary_out = {
+                    "ts": pt.ts, "broker": broker_name, "quote_asset": str(quote_asset),
+                    "portfolio_value": str(port_val), "portfolio_pnl": str(port_pnl),
+                    "portfolio_pnl_pct": str(port_pnl_pct), "drawdown_pct": str(dd),
+                    "bot": {
+                        "equity": str(se), "realized_today": str(realized_td),
+                        "realized_all_time": str(realized), "unrealized_now": str(unreal),
+                        "total_now": str(st_total),
+                    },
+                    "non_strategy": {"value_est": str(non_strategy_value), "value_pct_est": str(non_strategy_pct)},
+                    "deployed": {
+                        "deployed_cost_strategy_now": str(deployed_cost_strategy),
+                        "quote_asset": str(quote_asset),
+                    },
+                }
+                for s in self.symbols:
+                    ss2 = self.state.symbol_states[s]
+                    sf_ss = self._sf_state(s)
+                    summary_out.setdefault("symbols", {})[s] = {
+                        "ltp": str(self.state.last_prices.get(s, D0)),
+                        "mode": sf_ss.get("mode"),
+                        "sell_level": sf_ss.get("sell_level"),
+                        "buy_level": sf_ss.get("buy_level"),
+                        "prev_close": sf_ss.get("prev_close"),
+                        "sell_oid": sf_ss.get("sell_oid"),
+                        "buy_oid": sf_ss.get("buy_oid"),
+                        "realized_pnl": str(ss2.realized_pnl),
+                    }
+                self._pnl_writer.write_summary(summary_out)
+
+            except KeyboardInterrupt:
+                LOG.info("SF stopped by user.")
+                for sym in self.symbols:
+                    ss = self._sf_state(sym)
+                    for oid_key in ("sell_oid", "buy_oid"):
+                        oid = ss.get(oid_key)
+                        if oid:
+                            self._sf_cancel(sym, oid)
+                            ss[oid_key] = None
+                break
+            except Exception as e:
+                LOG.exception("SF loop error: %s", e)
+
+            self.state.last_update_ts = utcnow().isoformat()
+            self.state.dump(state_path)
+
+            sleep_s = self.poll_seconds if (now >= open_dt and now < close_dt) else self.closed_poll_seconds
+            try:
+                time.sleep(max(int(sleep_s), 1))
+            except KeyboardInterrupt:
+                LOG.info("SF stopped by user (sleep).")
+                for sym in self.symbols:
+                    ss = self._sf_state(sym)
+                    for oid_key in ("sell_oid", "buy_oid"):
+                        oid = ss.get(oid_key)
+                        if oid:
+                            self._sf_cancel(sym, oid)
+                            ss[oid_key] = None
+                break
 
     def run_managed(self, strategy: ManagedOrderStrategy, *, state_path: str) -> None:
         self.state.ensure_symbols(self.symbols)
