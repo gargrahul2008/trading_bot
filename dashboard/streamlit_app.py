@@ -1,35 +1,69 @@
-# streamlit_app.py  (MANUAL REFRESH ONLY)
+"""
+MEXC Trading Bot Dashboard — simple, correct, fresh-start aware.
 
+Loads:
+  - pnl_summary.json       → portfolio value, realized PnL, cycle counts
+  - mexc_state_*_v1.json   → newest state file → extras (compound info, LIFO lots)
+  - mexc_trades_*_v1.jsonl → newest trades file only (fresh-start safe)
+
+Math:
+  - Portfolio value = pnl_summary.portfolio_value (computed by bot: USDC + ETH×price)
+  - PnL since start = portfolio_value − compound_initial_equity (from state extras)
+  - Bot realized PnL = pnl_summary.bot.realized_all_time (avg-cost basis, updated per fill)
+  - Cycles = pnl_summary.cycles_today / cycles_all_time
+  - LIFO compound PnL = state.extras.compound_last_actual_pnl (written daily by compound cron)
+"""
 from __future__ import annotations
 
 import glob
 import io
 import json
 import os
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import streamlit as st
 
+# ── Config ───────────────────────────────────────────────────────────────────
 
-# -------------------------
-# Helpers
-# -------------------------
+REPO_ROOT  = os.getenv("TRADING_BOT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+STATE_DIR  = os.path.join(REPO_ROOT, "strategies", "pct_ladder", "state")
+SUMMARY_FILE = os.path.join(STATE_DIR, "pnl_summary.json")
 
-def _safe_json_load(path: str) -> Optional[dict]:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _jload(path: str) -> Optional[dict]:
     try:
         if not path or not os.path.exists(path):
             return None
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
 
 
-def _tail_jsonl(path: str, max_lines: int = 50000) -> List[dict]:
-    """Tail last max_lines of a jsonl file without reading whole file."""
+def _newest(pattern: str) -> Optional[str]:
+    files = [p for p in glob.glob(pattern) if os.path.isfile(p)]
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def _sf(x: Any) -> Optional[float]:
+    try:
+        if isinstance(x, str):
+            x = x.replace(",", "").strip()
+        return float(x)
+    except Exception:
+        return None
+
+
+def _fmt(x: Any, digits: int = 2, prefix: str = "$") -> str:
+    v = _sf(x)
+    if v is None:
+        return "—"
+    return f"{prefix}{v:,.{digits}f}" if prefix else f"{v:,.{digits}f}"
+
+
+def _load_trades(path: str, max_lines: int = 50_000) -> List[dict]:
     if not path or not os.path.exists(path):
         return []
     out: List[dict] = []
@@ -37,306 +71,30 @@ def _tail_jsonl(path: str, max_lines: int = 50000) -> List[dict]:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            chunk = 1024 * 1024  # 1MB
+            chunk = 1024 * 1024
             data = b""
-            pos = size
+            pos  = size
             while pos > 0 and data.count(b"\n") < max_lines:
-                step = chunk if pos >= chunk else pos
+                step = min(chunk, pos)
                 pos -= step
                 f.seek(pos)
                 data = f.read(step) + data
-            text = data.decode("utf-8", errors="ignore")
-            lines = text.splitlines()[-max_lines:]
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except Exception:
-                    pass
+        for line in data.decode("utf-8", errors="ignore").splitlines()[-max_lines:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                if r.get("event") == "FILL":
+                    out.append(r)
+            except Exception:
+                pass
     except Exception:
-        return []
+        pass
     return out
 
 
-def _latest_by_mtime(paths: List[str]) -> Optional[str]:
-    paths2 = [p for p in paths if p and os.path.exists(p)]
-    if not paths2:
-        return None
-    paths2.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return paths2[0]
-
-
-def _find_file(run_dir: str, preferred_names: List[str], patterns: List[str]) -> Optional[str]:
-    for nm in preferred_names:
-        p = os.path.join(run_dir, nm)
-        if os.path.exists(p):
-            return p
-    hits: List[str] = []
-    for pat in patterns:
-        hits.extend(glob.glob(os.path.join(run_dir, pat)))
-    return _latest_by_mtime(hits)
-
-
-def _discover_state_dirs(repo_root: str) -> List[str]:
-    candidates: List[str] = []
-    # Only look directly under strategies/*/state — never recurse into env/, node_modules/, etc.
-    candidates += [p for p in glob.glob(os.path.join(repo_root, "strategies", "*", "state")) if os.path.isdir(p)]
-    return sorted(set(candidates))
-
-
-def _discover_run_dirs(state_dir: str) -> List[str]:
-    runs = [state_dir]
-    for p in sorted(glob.glob(os.path.join(state_dir, "*"))):
-        if os.path.isdir(p):
-            runs.append(p)
-    return runs
-
-
-def _read_cycle_units_from_state_json(run_dir: str) -> Dict[str, str]:
-    state_path = _find_file(run_dir, preferred_names=["state.json"], patterns=["*state*.json"])
-    raw = _safe_json_load(state_path or "")
-    if not isinstance(raw, dict):
-        return {}
-    extras = raw.get("extras")
-    if not isinstance(extras, dict):
-        return {}
-    m = extras.get("cycle_unit_quote_by_symbol")
-    if isinstance(m, dict):
-        return {str(k): str(v) for k, v in m.items()}
-    return {}
-
-
-@dataclass
-class RunFiles:
-    run_dir: str
-    snapshot_path: Optional[str]
-    summary_path: Optional[str]
-    trades_paths: List[str]          # all trades files in run_dir
-    manual_path: Optional[str]
-    pnl_points_path: Optional[str]
-    price_points_path: Optional[str]
-    manual_positions_path: Optional[str]
-    pnl_daily_path: Optional[str]
-    price_daily_path: Optional[str]
-    capital_flows_path: Optional[str]
-
-
-def _resolve_run_files(run_dir: str) -> RunFiles:
-    state_path = _find_file(run_dir, ["state.json"], ["*state*.json"])
-    state_raw = _safe_json_load(state_path or "")
-    extras = state_raw.get("extras", {}) if isinstance(state_raw, dict) else {}
-
-    def _extra_path(key: str) -> Optional[str]:
-        v = extras.get(key) if isinstance(extras, dict) else None
-        if not isinstance(v, str) or not v.strip():
-            return None
-        p = v.strip()
-        if not os.path.isabs(p):
-            p = os.path.normpath(os.path.join(run_dir, p))
-        return p if os.path.exists(p) else None
-
-    snapshot = _find_file(run_dir, ["positions_snapshot.json"], ["*snapshot*.json", "positions*.json"])
-    summary = _find_file(run_dir, ["pnl_summary.json"], ["*summary*.json", "pnl*.json"])
-    # Collect ALL trades files — not just the latest — so multiple strategies in the same dir are all loaded
-    all_trades = sorted([
-        p for p in glob.glob(os.path.join(run_dir, "*trades*.jsonl"))
-        if "reject" not in os.path.basename(p).lower()
-    ])
-    manual = _find_file(run_dir, ["manual_adjustments.jsonl"], ["*manual*adjust*.jsonl", "*manual*.jsonl"])
-    pnl_points = _find_file(run_dir, ["pnl_points.csv"], ["*pnl*points*.csv"])
-    price_points = _find_file(run_dir, ["price_points.jsonl"], ["*price*points*.jsonl"])
-    pnl_daily = _find_file(run_dir, ["pnl_daily.csv"], ["*pnl*daily*.csv"])
-    price_daily = _find_file(run_dir, ["price_daily.csv"], ["*price*daily*.csv"])
-    manual_positions = _extra_path("manual_positions_file") or _find_file(
-        run_dir,
-        ["manual_positions.json", "manual_positions.csv"],
-        ["*manual*position*.json", "*manual*position*.csv"],
-    )
-    capital_flows = _extra_path("capital_flows_file") or _find_file(
-        run_dir,
-        ["capital_flows.json", "capital_flows.csv"],
-        ["*capital*flow*.json", "*capital*flow*.csv"],
-    )
-    return RunFiles(
-        run_dir,
-        snapshot,
-        summary,
-        all_trades,
-        manual,
-        pnl_points,
-        price_points,
-        manual_positions,
-        pnl_daily,
-        price_daily,
-        capital_flows,
-    )
-
-
-def _load_manual_positions_file(path: str) -> pd.DataFrame:
-    if not path or not os.path.exists(path):
-        return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
-    ext = Path(path).suffix.lower()
-    try:
-        if ext == ".csv":
-            raw_df = pd.read_csv(path)
-            if raw_df.empty:
-                return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
-            out = pd.DataFrame()
-            out["ts"] = raw_df.get("ts") if "ts" in raw_df.columns else raw_df.get("date")
-            out["symbol"] = raw_df.get("symbol")
-            out["qty"] = raw_df.get("qty") if "qty" in raw_df.columns else raw_df.get("quantity")
-            if "buy_price" in raw_df.columns:
-                out["buy_price"] = raw_df.get("buy_price")
-            elif "price" in raw_df.columns:
-                out["buy_price"] = raw_df.get("price")
-            else:
-                out["buy_price"] = raw_df.get("avg_price")
-            out = out.dropna(subset=["symbol", "qty", "buy_price"])
-            out["symbol"] = out["symbol"].astype(str).str.strip()
-            out = _to_num(out, ["qty", "buy_price"])
-            out = out.dropna(subset=["qty", "buy_price"])
-            return out[["ts", "symbol", "qty", "buy_price"]]
-
-        raw = _safe_json_load(path)
-        rows: List[Dict[str, Any]] = []
-        def _append_row(rec: Dict[str, Any], symbol_hint: Any = None) -> None:
-            sym = rec.get("symbol") if rec.get("symbol") is not None else symbol_hint
-            qty = rec.get("qty") if rec.get("qty") is not None else rec.get("quantity")
-            bp = rec.get("buy_price")
-            if bp is None:
-                bp = rec.get("price")
-            if bp is None:
-                bp = rec.get("avg_price")
-            rows.append({"ts": rec.get("ts") or rec.get("date"), "symbol": sym, "qty": qty, "buy_price": bp})
-
-        if isinstance(raw, list):
-            for rec in raw:
-                if isinstance(rec, dict):
-                    _append_row(rec)
-        elif isinstance(raw, dict):
-            # supported wrappers
-            for k in ["positions", "manual_positions", "data", "lots"]:
-                v = raw.get(k)
-                if isinstance(v, list):
-                    for rec in v:
-                        if isinstance(rec, dict):
-                            _append_row(rec)
-                    break
-            # symbol->record map (including symbol->list-of-lots)
-            for sym, rec in raw.items():
-                if sym in {"positions", "manual_positions", "data", "lots"}:
-                    continue
-                if isinstance(rec, dict):
-                    _append_row(rec, sym)
-                elif isinstance(rec, list):
-                    if len(rec) >= 2 and not any(isinstance(lot, dict) for lot in rec):
-                        rows.append({"ts": None, "symbol": sym, "qty": rec[0], "buy_price": rec[1]})
-                    else:
-                        for lot in rec:
-                            if isinstance(lot, dict):
-                                _append_row(lot, sym)
-                elif isinstance(rec, tuple) and len(rec) >= 2:
-                    rows.append({
-                        "ts": None,
-                        "symbol": sym,
-                        "qty": rec[0],
-                        "buy_price": rec[1],
-                    })
-        out = pd.DataFrame(rows)
-        if out.empty:
-            return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
-        out = out.dropna(subset=["symbol", "qty", "buy_price"])
-        out["symbol"] = out["symbol"].astype(str).str.strip()
-        out = _to_num(out, ["qty", "buy_price"])
-        out = out.dropna(subset=["qty", "buy_price"])
-        return out[["ts", "symbol", "qty", "buy_price"]]
-    except Exception:
-        return pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
-
-
-def _load_capital_flows_file(path: str) -> pd.DataFrame:
-    """
-    Returns normalized columns:
-      - ts (optional)
-      - delta (positive add, negative remove)
-      - note (optional)
-    """
-    if not path or not os.path.exists(path):
-        return pd.DataFrame(columns=["ts", "delta", "note"])
-    ext = Path(path).suffix.lower()
-    try:
-        if ext == ".csv":
-            raw_df = pd.read_csv(path)
-            if raw_df.empty:
-                return pd.DataFrame(columns=["ts", "delta", "note"])
-            out = pd.DataFrame()
-            out["ts"] = raw_df.get("ts") if "ts" in raw_df.columns else raw_df.get("date")
-            if "delta" in raw_df.columns:
-                if "type" in raw_df.columns:
-                    out["delta"] = [
-                        _normalize_capital_delta(d, typ)
-                        for d, typ in zip(raw_df["delta"], raw_df["type"])
-                    ]
-                else:
-                    out["delta"] = raw_df.get("delta")
-            elif "amount" in raw_df.columns:
-                if "type" in raw_df.columns:
-                    out["delta"] = [
-                        _normalize_capital_delta(amt, typ)
-                        for amt, typ in zip(raw_df["amount"], raw_df["type"])
-                    ]
-                else:
-                    out["delta"] = raw_df.get("amount")
-            else:
-                out["delta"] = None
-            out["note"] = raw_df.get("note")
-            out = _to_num(out, ["delta"])
-            out = out.dropna(subset=["delta"])
-            out["ts_utc"] = out["ts"].apply(_parse_ts_user_ist_to_utc)
-            out.loc[out["ts_utc"].notna(), "ts"] = out.loc[out["ts_utc"].notna(), "ts_utc"].astype(str)
-            return out[["ts", "delta", "note"]]
-
-        raw = _safe_json_load(path)
-        rows: List[Dict[str, Any]] = []
-        if isinstance(raw, list):
-            for rec in raw:
-                if not isinstance(rec, dict):
-                    continue
-                delta = rec.get("delta")
-                if delta is not None:
-                    delta = _normalize_capital_delta(delta, rec.get("type"))
-                elif rec.get("amount") is not None:
-                    delta = _normalize_capital_delta(rec.get("amount"), rec.get("type"))
-                rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
-        elif isinstance(raw, dict):
-            arr = raw.get("flows") or raw.get("capital_flows") or raw.get("data")
-            if isinstance(arr, list):
-                for rec in arr:
-                    if not isinstance(rec, dict):
-                        continue
-                    delta = rec.get("delta")
-                    if delta is not None:
-                        delta = _normalize_capital_delta(delta, rec.get("type"))
-                    elif rec.get("amount") is not None:
-                        delta = _normalize_capital_delta(rec.get("amount"), rec.get("type"))
-                    rows.append({"ts": rec.get("ts") or rec.get("date"), "delta": delta, "note": rec.get("note")})
-
-        out = pd.DataFrame(rows)
-        if out.empty:
-            return pd.DataFrame(columns=["ts", "delta", "note"])
-        out = _to_num(out, ["delta"])
-        out = out.dropna(subset=["delta"])
-        out["ts_utc"] = out["ts"].apply(_parse_ts_user_ist_to_utc)
-        out.loc[out["ts_utc"].notna(), "ts"] = out.loc[out["ts_utc"].notna(), "ts_utc"].astype(str)
-        return out[["ts", "delta", "note"]]
-    except Exception:
-        return pd.DataFrame(columns=["ts", "delta", "note"])
-
-
-def _tail_csv_df(path: str, max_lines: int = 5000) -> pd.DataFrame:
-    """Tail-read a CSV by lines to avoid loading very large files fully."""
+def _tail_csv(path: str, max_lines: int = 5000) -> pd.DataFrame:
     if not path or not os.path.exists(path):
         return pd.DataFrame()
     try:
@@ -348,19 +106,16 @@ def _tail_csv_df(path: str, max_lines: int = 5000) -> pd.DataFrame:
             size = f.tell()
             chunk = 1024 * 1024
             data = b""
-            pos = size
-            need_nl = max_lines + 1
-            while pos > 0 and data.count(b"\n") < need_nl:
-                step = chunk if pos >= chunk else pos
+            pos  = size
+            while pos > 0 and data.count(b"\n") < max_lines + 1:
+                step = min(chunk, pos)
                 pos -= step
                 f.seek(pos)
                 data = f.read(step) + data
-        lines = data.splitlines()
-        tail_lines = lines[-max_lines:] if max_lines > 0 else lines
-        h = header.strip()
-        if tail_lines and tail_lines[0].strip() == h:
-            tail_lines = tail_lines[1:]
-        text = header + (b"\n".join(tail_lines) + b"\n" if tail_lines else b"")
+        lines = data.splitlines()[-max_lines:]
+        if lines and lines[0].strip() == header.strip():
+            lines = lines[1:]
+        text = header + b"\n".join(lines) + b"\n"
         return pd.read_csv(io.StringIO(text.decode("utf-8", errors="ignore")))
     except Exception:
         return pd.DataFrame()
@@ -376,1141 +131,491 @@ def _coerce_ts(df: pd.DataFrame) -> pd.DataFrame:
 def _to_num(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
-            s = df[c]
-            if s.dtype == "O":
-                s = (
-                    s.astype(str)
-                    .str.replace(",", "", regex=False)
-                    .str.replace("_", "", regex=False)
-                    .str.strip()
-                )
-                s = s.replace({"": None, "None": None, "nan": None, "NaN": None})
+            s = df[c].astype(str).str.replace(",", "", regex=False).str.strip()
+            s = s.replace({"": None, "None": None, "nan": None, "NaN": None, "NaT": None})
             df[c] = pd.to_numeric(s, errors="coerce")
     return df
 
 
-def _pretty_pct(x: Any) -> str:
-    try:
-        v = float(x)
-        return f"{v*100:.2f}%"
-    except Exception:
-        return str(x)
-
-
-def _fmt_num(x: Any, digits: int = 2) -> str:
-    try:
-        return f"{float(x):,.{digits}f}"
-    except Exception:
-        return "—"
-
-
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if isinstance(x, str):
-            x = x.replace(",", "").replace("_", "").strip()
-        return float(x)
-    except Exception:
-        return None
-
-
-def _normalize_capital_delta(amount: Any, flow_type: Any = None) -> Optional[float]:
+def _count_cycles(store: dict, step: float = 0.0) -> int:
     """
-    Normalize amount sign from optional flow type.
-    - add/deposit/in/credit => +abs(amount)
-    - remove/withdraw/out/debit => -abs(amount)
-    - unknown type => amount as-is
+    Count cycles from pnl_summary cycles_today / cycles_all_time dict.
+    Tries cycles_est first; falls back to cycle_quote / step_size.
     """
-    amt = _safe_float(amount)
-    if amt is None:
-        return None
-    t = str(flow_type or "").strip().upper().replace("-", "_").replace(" ", "_")
-    add_types = {"ADD", "ADDED", "DEPOSIT", "DEPOSITED", "IN", "CREDIT", "CR"}
-    remove_types = {"REMOVE", "REMOVED", "WITHDRAW", "WITHDRAWAL", "WITHDRAWN", "OUT", "DEBIT", "DR"}
-    if t in add_types or t.startswith("DEPOSIT"):
-        return abs(amt)
-    if t in remove_types or t.startswith("WITHDRAW"):
-        return -abs(amt)
-    return amt
-
-
-def _parse_ts_user_ist_to_utc(x: Any) -> pd.Timestamp:
-    """
-    Parse user-entered timestamp.
-    If timezone is missing, treat it as IST (Asia/Kolkata), then convert to UTC.
-    Accepted examples:
-      - 2026-03-09 14:30
-      - 2026-03-09 14:30:45
-      - 2026-03-09T14:30
-      - 2026-03-09 14:30 IST
-    """
-    if x is None:
-        return pd.NaT
-    s = str(x).strip()
-    if not s or s.lower() in {"none", "nan", "nat"}:
-        return pd.NaT
-    s = s.replace(" IST", "").replace(" ist", "").replace("IST", "").strip()
-    ts = pd.to_datetime(s, errors="coerce")
-    if pd.isna(ts):
-        return pd.NaT
-    if ts.tzinfo is None:
-        try:
-            ts = ts.tz_localize("Asia/Kolkata")
-        except Exception:
-            return pd.NaT
-    return ts.tz_convert("UTC")
-
-
-def _norm_symbol(sym: Any) -> str:
-    s = str(sym or "").upper()
-    return "".join(ch for ch in s if ch.isalnum())
-
-
-def _resolve_manual_cmp(symbol: Any, latest_px_norm: Dict[str, float]) -> tuple[Optional[float], Optional[str]]:
-    """
-    Resolve manual symbol to CMP robustly.
-    Handles exact matches and base-symbol inputs like ETH -> ETHUSDT (if unambiguous).
-    """
-    n = _norm_symbol(symbol)
-    if not n:
-        return None, None
-    if n in latest_px_norm:
-        return latest_px_norm[n], n
-
-    def _base_of(symn: str) -> str:
-        for q in ("USDT", "USDC", "USD", "INR", "BTC", "ETH"):
-            if symn.endswith(q) and len(symn) > len(q):
-                return symn[: -len(q)]
-        return symn
-
-    # Base symbol fallback: ETH -> ETHUSDT/ETHINR/... choose only if unambiguous
-    cands = [k for k in latest_px_norm.keys() if k.startswith(n) or n.startswith(k)]
-    if not cands:
-        return None, None
-    if len(cands) == 1:
-        k = cands[0]
-        return latest_px_norm.get(k), k
-
-    # Prefer common quote suffixes if still ambiguous
-    for q in ("USDT", "USDC", "USD", "INR", "BTC", "ETH"):
-        filt = [k for k in cands if k.endswith(q)]
-        if len(filt) == 1:
-            k = filt[0]
-            return latest_px_norm.get(k), k
-
-    # base-asset fallback: ETHUSDC -> ETHUSDT if only one ETH pair is available
-    b = _base_of(n)
-    base_cands = [k for k in latest_px_norm.keys() if _base_of(k) == b]
-    if len(base_cands) == 1:
-        k = base_cands[0]
-        return latest_px_norm.get(k), k
-    for q in ("USDT", "USDC", "USD", "INR", "BTC", "ETH"):
-        filt = [k for k in base_cands if k.endswith(q)]
-        if len(filt) == 1:
-            k = filt[0]
-            return latest_px_norm.get(k), k
-    return None, None
-
-def _formula_pnl(df_trades: pd.DataFrame, today_date=None):
-    """
-    Formula PnL = sum(cum_quote_qty * pct / 100) over sell legs (non-rebalance).
-    Returns (today_pnl, alltime_pnl).  pct extracted from reason field (e.g. 'ltp>=ref+0.4%').
-    """
-    import re
-    if not isinstance(df_trades, pd.DataFrame) or df_trades.empty:
-        return None, None
-    sells = df_trades[
-        (df_trades["side"].astype(str).str.upper() == "SELL") &
-        (~df_trades["reason"].astype(str).str.startswith("rebalance_"))
-    ].copy()
-    if sells.empty:
-        return None, None
-    pct_series = sells["reason"].astype(str).str.extract(r"ref\+(\d+\.?\d*)%")[0]
-    sells["_pct"] = pd.to_numeric(pct_series, errors="coerce")
-    sells["_quote"] = pd.to_numeric(sells.get("cum_quote_qty", pd.Series(dtype=float)), errors="coerce").fillna(0)
-    sells = sells.dropna(subset=["_pct"])
-    if sells.empty:
-        return None, None
-    sells["_cycle_pnl"] = sells["_quote"] * sells["_pct"] / 100
-    alltime = round(float(sells["_cycle_pnl"].sum()), 2)
-    today = None
-    if today_date is not None and "ts" in sells.columns:
-        td = sells[sells["ts"].dt.date == today_date]
-        today = round(float(td["_cycle_pnl"].sum()), 2) if not td.empty else 0.0
-    return today, alltime
-
-
-def _sum_cycles(store: Dict[str, Any]) -> tuple[Optional[float], Optional[float]]:
-    per = store.get("per_symbol", {}) if isinstance(store, dict) else {}
-    total_cycles = 0.0
-    total_cycle_quote = 0.0
-    has_cycles = False
-    has_quote = False
-    for rec in (per or {}).values():
-        if not isinstance(rec, dict):
+    ps = store.get("per_symbol", {}) if isinstance(store, dict) else {}
+    total = 0
+    for v in ps.values():
+        if not isinstance(v, dict):
             continue
-        ce = _safe_float(rec.get("cycles_est"))
-        if ce is not None:
-            total_cycles += ce
-            has_cycles = True
-        cq = _safe_float(rec.get("cycle_quote"))
-        if cq is not None:
-            total_cycle_quote += cq
-            has_quote = True
-    return (total_cycles if has_cycles else None, total_cycle_quote if has_quote else None)
-
-
-def _compute_config_cycles(df: pd.DataFrame) -> pd.DataFrame:
-    """Break down trades by symbol + config (pct%, buy_quote) inferred from reason field.
-    Cycles = min(buy_count, sell_count) per group.
-    Expected PnL = cycles * buy_quote * upper_pct / 100.
-    Rebalance trades (reason starts with 'rebalance_') are excluded.
-    """
-    import re
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    rows = []
-    for _, row in df.iterrows():
-        reason = str(row.get("reason", "") or "")
-        if reason.startswith("rebalance_"):
+        est = _sf(v.get("cycles_est"))
+        if est is not None:
+            total += int(est)
             continue
-        m = re.search(r'ref[+-](\d+\.?\d*)%', reason)
-        if not m:
-            continue
-        pct = float(m.group(1))
-        quote = row.get("cum_quote_qty", 0)
-        try:
-            quote = float(quote) if quote is not None else 0.0
-        except (TypeError, ValueError):
-            continue
-        import math
-        if math.isnan(quote) or quote < 100:
-            continue
-        size = round(quote / 100) * 100
-        side = str(row.get("side", "")).upper()
-        if side not in ("BUY", "SELL"):
-            continue
-        symbol = str(row.get("symbol", "") or "")
-        ts = row.get("ts")
-        rows.append({"symbol": symbol, "pct": pct, "size": size, "side": side, "ts": ts})
-    if not rows:
-        return pd.DataFrame()
-    tmp = pd.DataFrame(rows)
-    tmp["ts"] = pd.to_datetime(tmp["ts"], utc=True, errors="coerce")
-    result = []
-    for (symbol, pct, size), grp in tmp.groupby(["symbol", "pct", "size"]):
-        buys = int((grp["side"] == "BUY").sum())
-        sells = int((grp["side"] == "SELL").sum())
-        cycles = min(buys, sells)
-        per_cycle = round(size * pct / 100, 2)
-        expected_pnl = round(cycles * per_cycle, 2)
-        ts_valid = grp["ts"].dropna()
-        if len(ts_valid) >= 2:
-            days = max((ts_valid.max() - ts_valid.min()).days, 1)
-        else:
-            days = 1
-        daily_avg = round(cycles / days, 1)
-        result.append({
-            "Symbol": symbol,
-            "Config": f"{pct}% / ${size:.0f}",
-            "Buys": buys,
-            "Sells": sells,
-            "Cycles (min)": cycles,
-            "Daily Avg Cycles": daily_avg,
-            "Per Cycle ($)": per_cycle,
-            "Expected PnL ($)": expected_pnl,
-        })
-    if not result:
-        return pd.DataFrame()
-    return pd.DataFrame(result).sort_values(["Symbol", "Config"], ascending=[True, False]).reset_index(drop=True)
+        # Fallback: cycle_quote / step_size
+        cq   = _sf(v.get("cycle_quote"))
+        unit = _sf(v.get("cycle_unit_quote")) or step
+        if cq and unit and unit > 0:
+            total += int(cq / unit)
+    return total
 
 
-# -------------------------
-# Manual-refresh state
-# -------------------------
+# ── Page setup ────────────────────────────────────────────────────────────────
 
-def _ensure_session_defaults() -> None:
-    ss = st.session_state
-    ss.setdefault("loaded", False)
-    ss.setdefault("data_snapshot", None)
-    ss.setdefault("data_summary", None)
-    ss.setdefault("data_trades_df", pd.DataFrame())
-    ss.setdefault("data_manual_df", pd.DataFrame())
-    ss.setdefault("data_pnl_df", pd.DataFrame())
-    ss.setdefault("data_price_df", pd.DataFrame())
-    ss.setdefault("data_pnl_daily_df", pd.DataFrame())
-    ss.setdefault("data_price_daily_df", pd.DataFrame())
-    ss.setdefault("data_manual_positions_df", pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"]))
-    ss.setdefault("data_manual_positions_path", None)
-    ss.setdefault("data_capital_flows_df", pd.DataFrame(columns=["ts", "delta", "note"]))
-    ss.setdefault("data_capital_flows_path", None)
-    ss.setdefault("data_cycle_units", {})
-    ss.setdefault("data_run_files", {})
-    ss.setdefault("last_loaded_at", None)
-    ss.setdefault("manual_positions_input_df", pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"]))
-    ss.setdefault("manual_positions_seeded", False)
+st.set_page_config(page_title="MEXC Bot Dashboard", layout="wide")
+st.title("MEXC ETH/USDC Bot Dashboard")
 
+# ── Sidebar controls ──────────────────────────────────────────────────────────
 
-def _load_all(repo_root: str, selected_runs: List[str], max_lines: int, max_curve_lines: int) -> None:
-    run_file_map: Dict[str, RunFiles] = {}
-    cycle_units: Dict[str, str] = {}
-    trades: List[dict] = []
-    manuals: List[dict] = []
-    pnl_frames: List[pd.DataFrame] = []
-    prices: List[dict] = []
-    pnl_daily_frames: List[pd.DataFrame] = []
-    price_daily_frames: List[pd.DataFrame] = []
-    manual_positions_paths: List[str] = []
-    capital_flows_paths: List[str] = []
-
-    for rd in selected_runs:
-        rf = _resolve_run_files(rd)
-        run_file_map[rd] = rf
-        cycle_units.update(_read_cycle_units_from_state_json(rd))
-        for trades_path in (rf.trades_paths or []):
-            recs = _tail_jsonl(trades_path, max_lines=max_lines)
-            for r in recs:
-                r["_run_dir"] = rd
-                r["_trades_file"] = trades_path
-            trades.extend(recs)
-        if rf.manual_path:
-            recs = _tail_jsonl(rf.manual_path, max_lines=max_lines)
-            for r in recs:
-                r["_run_dir"] = rd
-                r["_manual_file"] = rf.manual_path
-            manuals.extend(recs)
-        if rf.pnl_points_path:
-            try:
-                p = _tail_csv_df(rf.pnl_points_path, max_lines=max_curve_lines)
-                if not p.empty:
-                    p["_run_dir"] = rd
-                    p["_pnl_file"] = rf.pnl_points_path
-                    pnl_frames.append(p)
-            except Exception:
-                pass
-        if rf.price_points_path:
-            recs = _tail_jsonl(rf.price_points_path, max_lines=max_curve_lines)
-            for r in recs:
-                r["_run_dir"] = rd
-                r["_price_file"] = rf.price_points_path
-            prices.extend(recs)
-        if rf.pnl_daily_path:
-            try:
-                pday = pd.read_csv(rf.pnl_daily_path)
-                if not pday.empty:
-                    pday["_run_dir"] = rd
-                    pday["_pnl_daily_file"] = rf.pnl_daily_path
-                    pnl_daily_frames.append(pday)
-            except Exception:
-                pass
-        if rf.price_daily_path:
-            try:
-                prday = pd.read_csv(rf.price_daily_path)
-                if not prday.empty:
-                    prday["_run_dir"] = rd
-                    prday["_price_daily_file"] = rf.price_daily_path
-                    price_daily_frames.append(prday)
-            except Exception:
-                pass
-        if rf.manual_positions_path:
-            manual_positions_paths.append(rf.manual_positions_path)
-        if rf.capital_flows_path:
-            capital_flows_paths.append(rf.capital_flows_path)
-
-    df = pd.DataFrame(trades)
-    if not df.empty:
-        df = _coerce_ts(df)
-        df = _to_num(df, ["qty", "price", "cum_quote_qty", "realized_delta", "expected_price", "slippage_bps"])
-
-    # pick latest snapshot/summary among selected runs
-    latest_snapshot_path = _latest_by_mtime([run_file_map[r].snapshot_path for r in selected_runs if run_file_map[r].snapshot_path] or [])
-    latest_summary_path = _latest_by_mtime([run_file_map[r].summary_path for r in selected_runs if run_file_map[r].summary_path] or [])
-
-    snapshot = _safe_json_load(latest_snapshot_path or "")
-    summary = _safe_json_load(latest_summary_path or "")
-    manual_df = pd.DataFrame(manuals)
-    if not manual_df.empty:
-        manual_df = _coerce_ts(manual_df)
-    pnl_df = pd.concat(pnl_frames, ignore_index=True) if pnl_frames else pd.DataFrame()
-    if not pnl_df.empty:
-        pnl_df = _coerce_ts(pnl_df)
-        pnl_df = _to_num(pnl_df, ["portfolio_value", "portfolio_pnl", "portfolio_pnl_pct", "strategy_total"])
-    price_df = pd.DataFrame(prices)
-    if not price_df.empty:
-        price_df = _coerce_ts(price_df)
-    pnl_daily_df = pd.concat(pnl_daily_frames, ignore_index=True) if pnl_daily_frames else pd.DataFrame()
-    if not pnl_daily_df.empty:
-        pnl_daily_df = _coerce_ts(pnl_daily_df)
-        pnl_daily_df = _to_num(pnl_daily_df, ["portfolio_value", "portfolio_pnl", "portfolio_pnl_pct"])
-    price_daily_df = pd.concat(price_daily_frames, ignore_index=True) if price_daily_frames else pd.DataFrame()
-    if not price_daily_df.empty:
-        price_daily_df = _coerce_ts(price_daily_df)
-    manual_positions_path: Optional[str] = None
-    capital_flows_path: Optional[str] = None
-    # First selected run is authoritative for external/manual files.
-    for rd in selected_runs:
-        rf = run_file_map.get(rd)
-        if rf and not manual_positions_path and rf.manual_positions_path:
-            manual_positions_path = rf.manual_positions_path
-        if rf and not capital_flows_path and rf.capital_flows_path:
-            capital_flows_path = rf.capital_flows_path
-    if not manual_positions_path:
-        manual_positions_path = _latest_by_mtime(manual_positions_paths)
-    if not capital_flows_path:
-        capital_flows_path = _latest_by_mtime(capital_flows_paths)
-
-    manual_positions_df = _load_manual_positions_file(manual_positions_path or "")
-    capital_flows_df = _load_capital_flows_file(capital_flows_path or "")
-
-    st.session_state["loaded"] = True
-    st.session_state["data_snapshot"] = snapshot
-    st.session_state["data_summary"] = summary
-    st.session_state["data_trades_df"] = df
-    st.session_state["data_manual_df"] = manual_df
-    st.session_state["data_pnl_df"] = pnl_df
-    st.session_state["data_price_df"] = price_df
-    st.session_state["data_pnl_daily_df"] = pnl_daily_df
-    st.session_state["data_price_daily_df"] = price_daily_df
-    st.session_state["data_manual_positions_df"] = manual_positions_df
-    st.session_state["data_manual_positions_path"] = manual_positions_path
-    st.session_state["data_capital_flows_df"] = capital_flows_df
-    st.session_state["data_capital_flows_path"] = capital_flows_path
-    st.session_state["data_cycle_units"] = cycle_units
-    st.session_state["data_run_files"] = {k: run_file_map[k].__dict__ for k in run_file_map}
-    st.session_state["last_loaded_at"] = pd.Timestamp.utcnow().isoformat() + "Z"
-    st.session_state["manual_positions_seeded"] = False
-
-
-# -------------------------
-# UI
-# -------------------------
-
-st.set_page_config(page_title="Trading Bot Dashboard", layout="wide")
-_ensure_session_defaults()
-
-st.title("Trading Bot Dashboard (Manual Refresh Only)")
-
-repo_root_default = os.getenv("TRADING_BOT_ROOT", str(Path.cwd()))
-repo_root = st.sidebar.text_input("Repo root", value=repo_root_default)
-
-state_dirs = _discover_state_dirs(repo_root)
-if not state_dirs:
-    st.warning("No state directories found. Set 'Repo root' to your trading_bot folder.")
-    st.stop()
-
-# Default to pct_ladder/state if present, otherwise first
-_default_state_idx = next((i for i, d in enumerate(state_dirs) if "pct_ladder" in d and "managed" not in d), 0)
-state_dir = st.sidebar.selectbox("Strategy state directory", options=state_dirs, index=_default_state_idx)
-run_dirs = _discover_run_dirs(state_dir)
-
-def _label_run(p: str) -> str:
-    if os.path.abspath(p) == os.path.abspath(state_dir):
-        return f"(current) {p}"
-    return p
-
-selected_runs = st.sidebar.multiselect(
-    "Run folder(s)",
-    options=run_dirs,
-    default=[run_dirs[0]],
-    format_func=_label_run,
-)
-
-max_lines = int(st.sidebar.number_input("Max trades lines to load (tail)", min_value=1000, value=50000, step=5000))
-max_curve_lines = int(st.sidebar.number_input("Max curve points to load (tail)", min_value=500, value=5000, step=500))
-
-col_btn1, col_btn2 = st.sidebar.columns(2)
-with col_btn1:
-    if st.button("Refresh", type="primary"):
-        with st.spinner("Loading data..."):
-            _load_all(repo_root, selected_runs, max_lines=max_lines, max_curve_lines=max_curve_lines)
-with col_btn2:
-    if st.button("Clear"):
-        for k in [
-            "loaded", "data_snapshot", "data_summary", "data_trades_df", "data_manual_df",
-            "data_pnl_df", "data_price_df", "data_pnl_daily_df", "data_price_daily_df",
-            "data_manual_positions_df", "data_manual_positions_path",
-            "data_capital_flows_df", "data_capital_flows_path",
-            "data_cycle_units", "data_run_files", "last_loaded_at",
-            "manual_positions_input_df", "manual_positions_seeded",
-        ]:
-            if k in st.session_state:
-                del st.session_state[k]
+with st.sidebar:
+    if st.button("Refresh", type="primary", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
+    st.caption("Data is not refreshed automatically. Click Refresh to reload.")
+    st.divider()
+    max_trades = int(st.number_input("Max trades to load", min_value=100, value=10000, step=1000))
+    show_raw   = st.checkbox("Show raw JSON (debug)", value=False)
 
-if not st.session_state.get("loaded"):
-    st.info("Click **Refresh** to load data. No background refresh is performed.")
-    st.stop()
+# ── Load data ─────────────────────────────────────────────────────────────────
 
-snapshot = st.session_state.get("data_snapshot")
-summary = st.session_state.get("data_summary")
-df = st.session_state.get("data_trades_df")
-manual_df = st.session_state.get("data_manual_df")
-pnl_df = st.session_state.get("data_pnl_df")
-price_df = st.session_state.get("data_price_df")
-pnl_daily_df = st.session_state.get("data_pnl_daily_df")
-price_daily_df = st.session_state.get("data_price_daily_df")
-manual_positions_file_df = st.session_state.get("data_manual_positions_df")
-manual_positions_file_path = st.session_state.get("data_manual_positions_path")
-capital_flows_df = st.session_state.get("data_capital_flows_df")
-capital_flows_path = st.session_state.get("data_capital_flows_path")
-cycle_units = st.session_state.get("data_cycle_units") or {}
-last_loaded_at = st.session_state.get("last_loaded_at")
+summary = _jload(SUMMARY_FILE) or {}
 
-st.caption(f"Loaded at: {last_loaded_at}")
+state_path  = _newest(os.path.join(STATE_DIR, "mexc_state_*_v1.json"))
+state       = _jload(state_path) or {}
+extras      = state.get("extras") or {}
 
-# -------------------------
-# Filters (do NOT reload data)
-# -------------------------
+trades_path = _newest(os.path.join(STATE_DIR, "mexc_trades_*_v1.jsonl"))
+raw_trades  = _load_trades(trades_path, max_lines=max_trades)
 
-if isinstance(df, pd.DataFrame) and not df.empty:
-    symbol_list = sorted(df["symbol"].dropna().unique().tolist()) if "symbol" in df.columns else []
+snapshot_path = os.path.join(STATE_DIR, "positions_snapshot.json")
+snapshot    = _jload(snapshot_path) or {}
+
+# Build trades DataFrame
+df_all = pd.DataFrame(raw_trades) if raw_trades else pd.DataFrame()
+if not df_all.empty:
+    df_all = _coerce_ts(df_all)
+    df_all = _to_num(df_all, ["qty", "price", "cum_quote_qty", "realized_delta"])
+    df_all = df_all.sort_values("ts") if "ts" in df_all.columns else df_all
+
+# ── Extract key numbers ───────────────────────────────────────────────────────
+
+portfolio_value  = _sf(summary.get("portfolio_value")) or 0.0
+portfolio_pnl    = _sf(summary.get("portfolio_pnl")) or 0.0
+
+bot              = summary.get("bot") or {}
+realized_today   = _sf(bot.get("realized_today")) or 0.0
+realized_alltime = _sf(bot.get("realized_all_time")) or 0.0
+bot_unrealized   = _sf(bot.get("unrealized_now")) or 0.0
+
+holdings         = summary.get("holdings") or {}
+usdc_balance     = _sf(holdings.get("quote_total")) or 0.0
+eth_data         = (holdings.get("per_symbol") or {}).get("ETHUSDC") or {}
+eth_qty          = _sf(eth_data.get("base_total")) or 0.0
+eth_price        = _sf(eth_data.get("px")) or 0.0
+eth_value        = eth_qty * eth_price
+
+cycles_today_d   = summary.get("cycles_today") or {}
+cycles_alltime_d = summary.get("cycles_all_time") or {}
+
+# Compound / fresh-start info from state extras
+initial_equity   = _sf(extras.get("compound_initial_equity")) or 0.0
+initial_step     = _sf(extras.get("compound_initial_buy_quote")) or 0.0
+current_step     = _sf(extras.get("compound_buy_quote")) or initial_step
+lifo_pnl         = _sf(extras.get("compound_last_actual_pnl")) or 0.0
+compound_last_ts = extras.get("compound_last_ts", "—")
+
+pnl_since_start  = (portfolio_value - initial_equity) if initial_equity > 0 else None
+pct_since_start  = (pnl_since_start / initial_equity * 100) if initial_equity > 0 and pnl_since_start is not None else None
+step_pct         = (current_step / initial_equity * 100) if initial_equity > 0 and current_step > 0 else 0.0
+
+_step_for_cycles = current_step if current_step > 0 else initial_step
+ct_count         = _count_cycles(cycles_today_d,   step=_step_for_cycles)
+ca_count         = _count_cycles(cycles_alltime_d, step=_step_for_cycles)
+
+# ── Section: Portfolio ────────────────────────────────────────────────────────
+
+st.subheader("Portfolio")
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total Value",   _fmt(portfolio_value))
+c2.metric("USDC Balance",  _fmt(usdc_balance))
+c3.metric(f"ETH ({eth_qty:.4f})", _fmt(eth_value), delta=f"@ ${eth_price:,.2f}")
+if pnl_since_start is not None:
+    c4.metric(
+        "PnL Since Start",
+        _fmt(pnl_since_start),
+        delta=f"{pct_since_start:+.2f}%",
+        delta_color="normal",
+    )
 else:
-    symbol_list = []
+    c4.metric("PnL Since Start", "—")
 
-sel_symbols = st.sidebar.multiselect("Symbols (filter)", options=symbol_list, default=symbol_list)
-only_fills = st.sidebar.checkbox("Only FILL events", value=True)
+# ── Section: Bot Performance ──────────────────────────────────────────────────
 
-dff_base = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
-if not dff_base.empty:
-    if sel_symbols and "symbol" in dff_base.columns:
-        dff_base = dff_base[dff_base["symbol"].isin(sel_symbols)]
-    if only_fills and "event" in dff_base.columns:
-        dff_base = dff_base[dff_base["event"] == "FILL"]
+st.subheader("Bot Performance")
+st.caption("Realized PnL uses avg-cost basis (tracked by engine per fill). Cycles from snapshot.")
 
-dff = dff_base.copy()
-if not dff.empty:
+b1, b2, b3, b4 = st.columns(4)
+b1.metric("Realized Today",   _fmt(realized_today))
+b2.metric("Realized All-time", _fmt(realized_alltime))
+b3.metric("Cycles Today",     ct_count)
+b4.metric("Cycles All-time",  ca_count)
+
+# ── Section: Compounding ──────────────────────────────────────────────────────
+
+st.subheader("Compounding (LIFO Actual PnL)")
+st.caption("LIFO PnL = sum of (sell_price − buy_price) × qty for profitable buy→sell pairs only. Updated daily by compound cron.")
+
+d1, d2, d3, d4 = st.columns(4)
+d1.metric("Initial Equity",  _fmt(initial_equity))
+d2.metric("Initial Step",    _fmt(initial_step))
+d3.metric("Current Step",    f"${current_step:,.2f} ({step_pct:.2f}%)" if current_step > 0 else "—")
+d4.metric("LIFO Cycle PnL",  _fmt(lifo_pnl))
+st.caption(f"Last compound run: {compound_last_ts}")
+
+# ── Section: Open LIFO Lots ───────────────────────────────────────────────────
+
+st.subheader("Open Buy Lots (LIFO)")
+
+sym_states = state.get("symbol_states") or {}
+lots_rows  = []
+for sym, sd in sym_states.items():
+    if not isinstance(sd, dict):
+        continue
+    for lot in (sd.get("lots") or []):
+        if isinstance(lot, (list, tuple)) and len(lot) >= 2:
+            lots_rows.append({"symbol": sym, "qty": lot[0], "buy_price": lot[1],
+                              "value": float(lot[0] or 0) * float(lot[1] or 0)})
+        elif isinstance(lot, dict):
+            qty = _sf(lot.get("qty") or lot.get("quantity")) or 0
+            bp  = _sf(lot.get("buy_price") or lot.get("price")) or 0
+            lots_rows.append({"symbol": sym, "qty": qty, "buy_price": bp, "value": qty * bp})
+
+if lots_rows:
+    lots_df = pd.DataFrame(lots_rows)
+    for c in ["qty", "buy_price", "value"]:
+        if c in lots_df.columns:
+            lots_df[c] = lots_df[c].round(4 if c == "qty" else 2)
+    l1, l2 = st.columns([2, 1])
+    with l1:
+        st.dataframe(lots_df, use_container_width=True, hide_index=True)
+    with l2:
+        total_lots_qty  = lots_df["qty"].sum()
+        total_lots_val  = lots_df["value"].sum()
+        mark_val        = total_lots_qty * eth_price
+        unrealized      = mark_val - total_lots_val if eth_price > 0 else 0.0
+        st.metric("Open Lots",         len(lots_df))
+        st.metric("Total Lot Qty",     f"{total_lots_qty:.4f} ETH")
+        st.metric("Lot Cost Basis",    f"${total_lots_val:,.2f}")
+        st.metric("Mark Value",        f"${mark_val:,.2f}")
+        st.metric("Unrealized (lots)", f"${unrealized:+,.2f}")
+else:
+    st.info("No open lots in state (or no trades yet).")
+
+# ── Section: Trades ───────────────────────────────────────────────────────────
+
+st.subheader("Recent Trades")
+
+if df_all.empty:
+    st.info(f"No trades yet in {trades_path or 'no file found'}.")
+else:
+    # Sidebar symbol filter — default to first symbol only
+    if "symbol" in df_all.columns:
+        sym_options = sorted(df_all["symbol"].dropna().unique().tolist())
+        default_sym = sym_options[:1]   # default = first only
+        sel_syms = st.sidebar.multiselect("Symbol filter", options=sym_options, default=default_sym)
+        dff = df_all[df_all["symbol"].isin(sel_syms)] if sel_syms else df_all
+    else:
+        dff = df_all
+
+    # Date range filter
     if "ts" in dff.columns and dff["ts"].notna().any():
-        ts_min = dff["ts"].min()
-        ts_max = dff["ts"].max()
-        d0 = ts_min.date()
-        d1 = ts_max.date()
-        d_from, d_to = st.sidebar.date_input("Date range (UTC)", value=(d0, d1))
-        start = pd.Timestamp(d_from, tz="UTC")
-        end = pd.Timestamp(d_to, tz="UTC") + pd.Timedelta(days=1)
-        dff = dff[(dff["ts"] >= start) & (dff["ts"] < end)]
+        d0 = dff["ts"].min().date()
+        d1 = dff["ts"].max().date()
+        d_from, d_to = st.sidebar.date_input("Date range", value=(d0, d1))
+        dff = dff[(dff["ts"] >= pd.Timestamp(d_from, tz="UTC")) &
+                  (dff["ts"] < pd.Timestamp(d_to, tz="UTC") + pd.Timedelta(days=1))]
 
-    # PnL date filter (single day)
-    pnl_date = st.sidebar.date_input("PnL date (UTC)", value=d1 if "d1" in locals() else pd.Timestamp.utcnow().date())
-else:
-    pnl_date = pd.Timestamp.utcnow().date()
+    st.caption(f"File: {trades_path}  |  Total fills: {len(df_all)}  |  Showing: {len(dff)}")
 
-default_cycle_unit = float(st.sidebar.number_input("Default cycle unit quote", min_value=1.0, value=1500.0, step=100.0))
-manual_capital_adjustment = float(
-    st.sidebar.number_input("Manual Capital Adjustment", value=0.0, step=100.0)
-)
+    # Ladder vs rebalance split + running book
+    tab1, tab2, tab3 = st.tabs(["Ladder Trades", "Rebalance Trades", "Running Book"])
 
-auto_capital_flow = 0.0
-capital_flow_rows_used = 0
-if isinstance(capital_flows_df, pd.DataFrame) and not capital_flows_df.empty and "delta" in capital_flows_df.columns:
-    cf = capital_flows_df.copy()
-    cf["delta_num"] = pd.to_numeric(cf["delta"], errors="coerce")
-    cf = cf[cf["delta_num"].notna()]
-    capital_flow_rows_used = int(len(cf))
-    auto_capital_flow = float(cf["delta_num"].sum())
-capital_added_since_start = auto_capital_flow + manual_capital_adjustment
-use_capital_flows_as_effective_initial = capital_flow_rows_used > 0
+    base_cols = ["ts", "symbol", "side", "qty", "price", "avg_cost", "realized_delta", "reason"]
 
-def _unit_for(sym: str) -> float:
-    if sym in cycle_units:
-        try:
-            return float(cycle_units[sym])
-        except Exception:
-            pass
-    # try latest snapshot cycles_today
-    try:
-        if isinstance(snapshot, dict):
-            ct = snapshot.get("cycles_today", {})
-            ps = ct.get("per_symbol", {}) if isinstance(ct, dict) else {}
-            if sym in ps:
-                u = ps[sym].get("cycle_unit_quote")
-                if u:
-                    return float(u)
-    except Exception:
-        pass
-    return default_cycle_unit
+    def _prepare_display(src: pd.DataFrame) -> pd.DataFrame:
+        d = src.copy()
+        # avg_cost = the other-leg avg price used to compute realized_delta
+        # SELL: avg_buy_cost = sell_price - realized_delta / qty
+        # BUY:  avg_sell_price = buy_price + realized_delta / qty
+        if "realized_delta" in d.columns and "price" in d.columns and "qty" in d.columns:
+            rd  = pd.to_numeric(d["realized_delta"], errors="coerce").fillna(0)
+            qty = pd.to_numeric(d["qty"], errors="coerce").replace(0, float("nan"))
+            px  = pd.to_numeric(d["price"], errors="coerce")
+            sign = d["side"].astype(str).str.upper().map({"BUY": 1, "SELL": -1}).fillna(-1)
+            implied = (px + sign * rd / qty).round(2)
+            # Only show when realized_delta is non-zero
+            d["avg_cost"] = implied.where(rd != 0, other=float("nan"))
+        # IST timestamp
+        if "ts" in d.columns:
+            d = d.sort_values("ts", ascending=False)
+            d["ts"] = d["ts"].dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M:%S IST")
+        show = [c for c in base_cols if c in d.columns]
+        d = d[show]
+        if "qty" in d.columns:
+            d["qty"] = d["qty"].round(6)
+        for col in ["price", "avg_cost", "realized_delta"]:
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce").round(2)
+        return d.reset_index(drop=True)
 
+    with tab1:
+        ladder = dff[~dff["reason"].astype(str).str.startswith("rebalance_")] if "reason" in dff.columns else dff
+        st.dataframe(_prepare_display(ladder), use_container_width=True, hide_index=True)
 
-# -------------------------
-# Summary context
-# -------------------------
-
-st_real_all = None
-st_real_td = None
-if isinstance(summary, dict):
-    created = summary.get("created") if isinstance(summary.get("created"), dict) else {}
-    bot = summary.get("bot") if isinstance(summary.get("bot"), dict) else {}
-    st_real_all = bot.get("realized_all_time") if bot.get("realized_all_time") is not None else created.get("strategy_realized_all_time")
-    st_real_td = bot.get("realized_today") if bot.get("realized_today") is not None else created.get("strategy_realized_today")
-
-# -------------------------
-# Portfolio views (raw + adjusted)
-# -------------------------
-
-st.subheader("Portfolio Views")
-
-raw_current = _safe_float(summary.get("portfolio_value")) if isinstance(summary, dict) else None
-summary_pnl = _safe_float(summary.get("portfolio_pnl")) if isinstance(summary, dict) else None
-raw_initial_base = (raw_current - summary_pnl) if (raw_current is not None and summary_pnl is not None) else None
-
-if isinstance(pnl_daily_df, pd.DataFrame) and not pnl_daily_df.empty:
-    curve_daily_base = pnl_daily_df.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
-else:
-    curve_daily_base = pd.DataFrame()
-
-if isinstance(pnl_df, pd.DataFrame) and not pnl_df.empty:
-    curve_base = pnl_df.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
-else:
-    curve_base = pd.DataFrame()
-
-if curve_daily_base.empty and not curve_base.empty:
-    daily_tmp = curve_base[["ts", "portfolio_value"]].copy()
-    daily_tmp["date_utc"] = daily_tmp["ts"].dt.date.astype(str)
-    curve_daily_base = daily_tmp.sort_values("ts").groupby("date_utc", as_index=False).tail(1)
-
-if raw_current is None:
-    if not curve_daily_base.empty:
-        raw_current = _safe_float(curve_daily_base["portfolio_value"].iloc[-1])
-    elif not curve_base.empty:
-        raw_current = _safe_float(curve_base["portfolio_value"].iloc[-1])
-
-if raw_initial_base is None:
-    if not curve_daily_base.empty:
-        raw_initial_base = _safe_float(curve_daily_base["portfolio_value"].iloc[0])
-    elif not curve_base.empty:
-        raw_initial_base = _safe_float(curve_base["portfolio_value"].iloc[0])
-
-if use_capital_flows_as_effective_initial:
-    raw_initial = float(capital_added_since_start)
-else:
-    raw_initial = (raw_initial_base + float(capital_added_since_start)) if raw_initial_base is not None else None
-raw_pnl = (raw_current - raw_initial) if (raw_current is not None and raw_initial is not None) else None
-
-latest_px_by_symbol: Dict[str, float] = {}
-if isinstance(snapshot, dict):
-    snap_symbols = snapshot.get("symbols") if isinstance(snapshot.get("symbols"), dict) else {}
-    for sym, rec in snap_symbols.items():
-        if isinstance(rec, dict):
-            px = _safe_float(rec.get("px"))
-            if px is not None:
-                latest_px_by_symbol[str(sym)] = px
-
-if isinstance(df, pd.DataFrame) and not df.empty and "symbol" in df.columns and "price" in df.columns:
-    latest_trade_rows = df.dropna(subset=["symbol", "price"]).copy()
-    if not latest_trade_rows.empty and "ts" in latest_trade_rows.columns:
-        latest_trade_rows = latest_trade_rows.sort_values("ts")
-    latest_trade_rows = latest_trade_rows.groupby("symbol", dropna=True).tail(1)
-    for _, r in latest_trade_rows.iterrows():
-        sym = str(r.get("symbol"))
-        if sym and sym not in latest_px_by_symbol:
-            px = _safe_float(r.get("price"))
-            if px is not None:
-                latest_px_by_symbol[sym] = px
-
-if isinstance(price_df, pd.DataFrame) and not price_df.empty and "prices" in price_df.columns and "ts" in price_df.columns:
-    psrc = price_df.dropna(subset=["ts"]).copy().sort_values("ts")
-    for _, r in psrc.iterrows():
-        pmap = r.get("prices")
-        if isinstance(pmap, str):
-            try:
-                pmap = json.loads(pmap)
-            except Exception:
-                pmap = None
-        if not isinstance(pmap, dict):
-            continue
-        for sym, px in pmap.items():
-            pxf = _safe_float(px)
-            if pxf is not None:
-                latest_px_by_symbol[str(sym)] = pxf
-
-# symbol normalization map: helps match ETH/USDT, ethusdt, ETH-USDT, etc.
-latest_px_norm: Dict[str, float] = {}
-for k, v in latest_px_by_symbol.items():
-    nk = _norm_symbol(k)
-    if nk:
-        latest_px_norm[nk] = v
-
-if not st.session_state.get("manual_positions_seeded", False):
-    seed_rows: List[Dict[str, Any]] = []
-    if isinstance(manual_positions_file_df, pd.DataFrame) and not manual_positions_file_df.empty:
-        mdf = manual_positions_file_df.copy()
-        mdf = mdf[[c for c in ["ts", "symbol", "qty", "buy_price"] if c in mdf.columns]]
-        mdf = _to_num(mdf, ["qty", "buy_price"])
-        mdf = mdf.dropna(subset=["symbol", "qty", "buy_price"])
-        seed_rows = mdf.to_dict(orient="records")
-    else:
-        manual_map: Dict[str, Any] = {}
-        if isinstance(summary, dict) and isinstance(summary.get("manual_inventory_by_symbol"), dict):
-            manual_map = summary.get("manual_inventory_by_symbol") or {}
-        elif isinstance(snapshot, dict) and isinstance(snapshot.get("manual_inventory_by_symbol"), dict):
-            manual_map = snapshot.get("manual_inventory_by_symbol") or {}
-        for sym, qty_raw in manual_map.items():
-            qty = _safe_float(qty_raw)
-            if qty is None or qty == 0:
-                continue
-            seed_rows.append({
-                "ts": None,
-                "symbol": str(sym),
-                "qty": qty,
-                "buy_price": latest_px_by_symbol.get(str(sym)),
-            })
-    st.session_state["manual_positions_input_df"] = pd.DataFrame(seed_rows, columns=["ts", "symbol", "qty", "buy_price"])
-    st.session_state["manual_positions_seeded"] = True
-
-manual_input = st.session_state.get("manual_positions_editor")
-if not isinstance(manual_input, pd.DataFrame):
-    manual_input = st.session_state.get("manual_positions_input_df", pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"]))
-if not isinstance(manual_input, pd.DataFrame):
-    manual_input = pd.DataFrame(columns=["ts", "symbol", "qty", "buy_price"])
-
-manual_calc = pd.DataFrame()
-manual_eval = pd.DataFrame()
-manual_pnl_total = 0.0
-if isinstance(manual_input, pd.DataFrame) and not manual_input.empty:
-    manual_eval = manual_input.copy()
-    for c in ["ts", "symbol", "qty", "buy_price"]:
-        if c not in manual_eval.columns:
-            manual_eval[c] = None
-    manual_eval["symbol"] = manual_eval["symbol"].astype(str).str.strip()
-    manual_eval = _to_num(manual_eval, ["qty", "buy_price"])
-    manual_eval["ts_text"] = manual_eval["ts"].astype(str).str.strip()
-    manual_eval.loc[manual_eval["ts"].isna(), "ts_text"] = ""
-    manual_eval["ts_text"] = manual_eval["ts_text"].replace({"None": "", "none": "", "NaN": "", "nan": "", "NaT": "", "nat": ""})
-    manual_eval["ts_utc"] = manual_eval["ts"].apply(_parse_ts_user_ist_to_utc)
-    manual_eval["ts_provided"] = manual_eval["ts_text"] != ""
-    manual_eval["symbol_norm"] = manual_eval["symbol"].apply(_norm_symbol)
-    resolved = manual_eval["symbol"].apply(lambda s: _resolve_manual_cmp(s, latest_px_norm))
-    manual_eval["cmp"] = resolved.apply(lambda t: t[0] if isinstance(t, tuple) else None)
-    manual_eval["cmp_symbol"] = resolved.apply(lambda t: t[1] if isinstance(t, tuple) else None)
-    manual_eval["status"] = "ok"
-    manual_eval.loc[manual_eval["symbol_norm"] == "", "status"] = "missing_symbol"
-    manual_eval.loc[manual_eval["qty"].isna(), "status"] = "missing_qty"
-    manual_eval.loc[manual_eval["buy_price"].isna(), "status"] = "missing_buy_price"
-    manual_eval.loc[(manual_eval["status"] == "ok") & manual_eval["ts_provided"] & manual_eval["ts_utc"].isna(), "status"] = "bad_ts"
-    manual_eval.loc[(manual_eval["status"] == "ok") & (manual_eval["cmp"].isna()), "status"] = "cmp_not_found"
-    now_utc = pd.Timestamp.now(tz="UTC")
-    manual_eval["active_now"] = manual_eval["ts_utc"].isna() | (manual_eval["ts_utc"] <= now_utc)
-    manual_eval.loc[(manual_eval["status"] == "ok") & (~manual_eval["active_now"]), "status"] = "not_active_yet"
-
-    manual_calc = manual_eval[manual_eval["status"] == "ok"].copy()
-    if not manual_calc.empty:
-        manual_calc["manual_cost"] = manual_calc["qty"] * manual_calc["buy_price"]
-        manual_calc["manual_market"] = manual_calc["qty"] * manual_calc["cmp"]
-        manual_calc["manual_pnl"] = manual_calc["manual_market"] - manual_calc["manual_cost"]
-        manual_pnl_total = float(manual_calc["manual_pnl"].sum())
-
-adjusted_current = (raw_current - manual_pnl_total) if raw_current is not None else None
-adjusted_initial = raw_initial
-adjusted_pnl = (adjusted_current - adjusted_initial) if (adjusted_current is not None and adjusted_initial is not None) else None
-
-raw_pnl_pct = (raw_pnl / raw_initial) if (raw_pnl is not None and raw_initial is not None and raw_initial > 0) else None
-adjusted_pnl_pct = (adjusted_pnl / adjusted_initial) if (adjusted_pnl is not None and adjusted_initial is not None and adjusted_initial > 0) else None
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Portfolio Initial", _fmt_num(raw_initial))
-m2.metric("Portfolio Value", _fmt_num(raw_current))
-m3.metric("Portfolio PnL", _fmt_num(raw_pnl), delta=_pretty_pct(raw_pnl_pct) if raw_pnl_pct is not None else None)
-m4.metric("Legacy PnL Removed", _fmt_num(manual_pnl_total))
-m5.metric("Adjusted Current", _fmt_num(adjusted_current))
-m6.metric("Adjusted PnL", _fmt_num(adjusted_pnl), delta=_pretty_pct(adjusted_pnl_pct) if adjusted_pnl_pct is not None else None)
-
-# -------------------------
-# Bot summary panel
-# -------------------------
-
-st.subheader("Bot Summary")
-
-cycles_today = snapshot.get("cycles_today", {}) if isinstance(snapshot, dict) else {}
-cycles_all = snapshot.get("cycles_all_time", {}) if isinstance(snapshot, dict) else {}
-ct_est, ct_quote = _sum_cycles(cycles_today)
-ca_est, ca_quote = _sum_cycles(cycles_all)
-
-# Formula PnL from filtered trades: cycles × buy_quote × pct%
-_today_date = pd.Timestamp.now(tz="UTC").date()
-fp_today, fp_alltime = _formula_pnl(dff, today_date=_today_date)
-
-# Avg buy_quote and pct for caption
-_sells = dff[(dff["side"].astype(str).str.upper() == "SELL") &
-             (~dff["reason"].astype(str).str.startswith("rebalance_"))] if not dff.empty else pd.DataFrame()
-_avg_quote = pd.to_numeric(_sells.get("cum_quote_qty", pd.Series(dtype=float)), errors="coerce").mean() if not _sells.empty else None
-_avg_pct   = pd.to_numeric(_sells["reason"].astype(str).str.extract(r"ref\+(\d+\.?\d*)%")[0], errors="coerce").mean() if not _sells.empty else None
-
-s1, s2, s3, s4 = st.columns(4)
-s1.metric("Bot PnL Today (formula)", _fmt_num(fp_today) if fp_today is not None else "—")
-s2.metric("Bot PnL All-time (formula)", _fmt_num(fp_alltime) if fp_alltime is not None else "—")
-s3.metric("Cycles Today (est)", _fmt_num(ct_est) if ct_est is not None else "—")
-s4.metric("Cycles All-time (est)", _fmt_num(ca_est) if ca_est is not None else "—")
-_cap = "Formula PnL = cycles × buy_quote × pct%."
-if _avg_quote is not None and _avg_pct is not None:
-    _cap += f"  Avg buy_quote: ${_avg_quote:,.0f} | Avg pct: {_avg_pct:.2f}%"
-st.caption(_cap)
-
-# --- Cycles by Config breakdown ---
-st.markdown("**Cycles by Config (Actual Round Trips)**")
-config_cycles_df = _compute_config_cycles(dff)
-if not config_cycles_df.empty:
-    st.dataframe(config_cycles_df, use_container_width=True, hide_index=True)
-    total_cycles_actual = int(config_cycles_df["Cycles (min)"].sum())
-    total_expected_pnl = round(float(config_cycles_df["Expected PnL ($)"].sum()), 2)
-    cc1, cc2, cc3 = st.columns(3)
-    cc1.metric("Total Cycles (actual)", total_cycles_actual)
-    cc2.metric("Expected PnL (formula)", f"${total_expected_pnl:.2f}")
-    cc3.metric("Actual Realized PnL", _fmt_num(st_real_all) if st_real_all is not None else "—")
-    st.caption("Expected PnL = cycles × buy_quote × pct%. Actual realized may differ due to weighted avg cost basis.")
-else:
-    st.info("No config breakdown available — trades may lack pct in reason field.")
-
-# --- Rebalance Trades ---
-st.markdown("**Rebalance Trades**")
-if isinstance(df, pd.DataFrame) and not df.empty and "reason" in df.columns:
-    reb_df = dff[dff["reason"].astype(str).str.startswith("rebalance_")].copy()
-    if not reb_df.empty:
-        cols_show = [c for c in ["ts", "symbol", "side", "reason", "qty", "price", "cum_quote_qty"] if c in reb_df.columns]
-        reb_display = reb_df[cols_show].copy()
-        if "ts" in reb_display.columns:
-            reb_display["ts"] = pd.to_datetime(reb_display["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
-        for col in ["qty", "price", "cum_quote_qty"]:
-            if col in reb_display.columns:
-                reb_display[col] = pd.to_numeric(reb_display[col], errors="coerce").round(4 if col == "qty" else 2)
-        reb_display = reb_display.sort_values("ts", ascending=False).reset_index(drop=True)
-        st.dataframe(reb_display, use_container_width=True, hide_index=True)
-        r1, r2 = st.columns(2)
-        r1.metric("Total Rebalances", len(reb_df))
-        notional = pd.to_numeric(reb_df.get("cum_quote_qty", pd.Series(dtype=float)), errors="coerce").sum()
-        r2.metric("Total Notional", f"${notional:,.2f}")
-    else:
-        st.caption("No rebalance trades recorded.")
-else:
-    st.caption("No trades loaded.")
-
-manual_input_new = st.data_editor(
-    manual_input,
-    num_rows="dynamic",
-    hide_index=True,
-    use_container_width=True,
-    key="manual_positions_editor",
-)
-if isinstance(manual_input_new, pd.DataFrame):
-    st.session_state["manual_positions_input_df"] = manual_input_new.copy()
-
-if not manual_calc.empty:
-    show_cols = [c for c in ["ts", "symbol", "qty", "buy_price", "cmp_symbol", "cmp", "manual_cost", "manual_market", "manual_pnl"] if c in manual_calc.columns]
-    st.dataframe(manual_calc[show_cols], use_container_width=True)
-else:
-    st.warning("No valid manual positions could be used for adjusted PnL.")
-    if isinstance(manual_eval, pd.DataFrame) and not manual_eval.empty:
-        show_bad = [c for c in ["ts", "symbol", "qty", "buy_price", "cmp_symbol", "cmp", "status"] if c in manual_eval.columns]
-        st.dataframe(manual_eval[show_bad], use_container_width=True)
-
-st.subheader("Portfolio Value Curve")
-st.caption("Curve uses daily points (one point per UTC day).")
-curve = curve_daily_base[["ts", "portfolio_value"]].copy() if not curve_daily_base.empty else pd.DataFrame()
-if curve.empty:
-    s_ts = pd.to_datetime(summary.get("ts"), utc=True, errors="coerce") if isinstance(summary, dict) else pd.NaT
-    if pd.isna(s_ts):
-        s_ts = pd.Timestamp.utcnow()
-    s_val = _safe_float(summary.get("portfolio_value")) if isinstance(summary, dict) else None
-    if s_val is not None:
-        curve = pd.DataFrame([{"ts": s_ts, "portfolio_value": s_val}])
-if not curve.empty:
-    # include current day point so today's daily value is visible even before UTC rollover flush.
-    s_ts = pd.to_datetime(summary.get("ts"), utc=True, errors="coerce") if isinstance(summary, dict) else pd.NaT
-    if pd.isna(s_ts):
-        s_ts = pd.Timestamp.utcnow()
-    s_val = _safe_float(summary.get("portfolio_value")) if isinstance(summary, dict) else None
-    if s_val is not None:
-        dcur = str(s_ts.date())
-        curve["date_utc"] = curve["ts"].dt.date.astype(str)
-        if dcur in curve["date_utc"].tolist():
-            idx = curve.index[curve["date_utc"] == dcur][-1]
-            if s_ts >= curve.loc[idx, "ts"]:
-                curve.loc[idx, "ts"] = s_ts
-                curve.loc[idx, "portfolio_value"] = s_val
+    with tab2:
+        rebal = dff[dff["reason"].astype(str).str.startswith("rebalance_")] if "reason" in dff.columns else pd.DataFrame()
+        if rebal.empty:
+            st.info("No rebalance trades.")
         else:
-            curve = pd.concat([curve, pd.DataFrame([{"ts": s_ts, "portfolio_value": s_val, "date_utc": dcur}])], ignore_index=True)
-    curve = curve.dropna(subset=["ts", "portfolio_value"]).sort_values("ts")
-    if not curve.empty:
-        exact_adjusted_drawn = False
-        if (
-            not manual_calc.empty
-            and (
-                (isinstance(price_daily_df, pd.DataFrame) and not price_daily_df.empty and "prices" in price_daily_df.columns and "ts" in price_daily_df.columns)
-                or (isinstance(price_df, pd.DataFrame) and not price_df.empty and "prices" in price_df.columns and "ts" in price_df.columns)
-            )
-        ):
-            price_source = price_daily_df if isinstance(price_daily_df, pd.DataFrame) and not price_daily_df.empty else price_df
-            price_rows: List[Dict[str, Any]] = []
-            for _, r in price_source.dropna(subset=["ts"]).iterrows():
-                ts = r.get("ts")
-                pmap = r.get("prices")
-                if isinstance(pmap, str):
+            st.dataframe(_prepare_display(rebal), use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.caption("Inventory book: tracks total ETH, buy avg cost, sell avg price. "
+                   "**delta** = (sell_price − buy_avg) × qty (includes ETH appreciation). "
+                   "**spread** = LIFO-matched (sell_price − matched_buy_price) × qty — pure grid trading PnL. "
+                   "Sells with no matching buy (initial inventory) have spread = 0. "
+                   "**status** on BUY rows: matched / partial / pending.")
+        if dff.empty:
+            st.info("No trades.")
+        else:
+            book = dff.copy().sort_values("ts", ascending=True)
+            book = _to_num(book, ["qty", "price", "realized_delta"])
+
+            # Initial ETH from manual inventory, cost at first trade price
+            manual_inv = summary.get("manual_inventory_by_symbol") or {}
+            init_qty   = _sf(manual_inv.get("ETHUSDC")) or 0.0
+            first_price = float(book.iloc[0]["price"]) if len(book) > 0 else 0.0
+            mark_px    = eth_price if eth_price > 0 else first_price
+
+            # ── Pass 1: run LIFO to get final stack state (which buys are pending) ──
+            # Each buy gets an index; stack tracks (buy_index, price, qty_remaining, ts, type)
+            p1_stack: list[tuple[int, float, float, str, str]] = []
+            p1_buy_idx = 0
+            p1_buy_indices: list[int] = []   # parallel to book rows, -1 for SELLs
+
+            for _, r in book.iterrows():
+                side = str(r.get("side", "")).upper()
+                qty  = float(r.get("qty", 0) or 0)
+                if side == "BUY" and qty > 0:
+                    reason_raw = str(r.get("reason", ""))
+                    rtype = "rebalance" if "rebalance" in reason_raw.lower() else "ladder"
+                    p1_stack.append((p1_buy_idx, float(r.get("price", 0)), qty, str(r.get("ts", "")), rtype))
+                    p1_buy_indices.append(p1_buy_idx)
+                    p1_buy_idx += 1
+                elif side == "SELL" and qty > 0:
+                    remaining = qty
+                    while remaining > 1e-9 and p1_stack:
+                        bi, bpx, bqty, bts, btype = p1_stack[-1]
+                        matched = min(remaining, bqty)
+                        remaining -= matched
+                        bqty -= matched
+                        if bqty < 1e-9:
+                            p1_stack.pop()
+                        else:
+                            p1_stack[-1] = (bi, bpx, bqty, bts, btype)
+                    p1_buy_indices.append(-1)
+                else:
+                    p1_buy_indices.append(-1)
+
+            # Build lookup: buy_index → qty_remaining in final stack
+            pending_map: dict[int, float] = {bi: bqty for bi, _, bqty, _, _ in p1_stack}
+
+            # ── Pass 2: build display rows with LIFO spread + status column ──
+            total_qty    = init_qty
+            buy_avg      = first_price
+            cum_sell_qty = 0.0
+            cum_sell_quote = 0.0
+            buy_stack: list[tuple[float, float]] = []  # (price, qty)
+            buy_idx_stack: list[int] = []              # parallel index stack
+
+            rows = []
+            cur_buy_idx = 0
+            p1_ptr = 0
+
+            for _, r in book.iterrows():
+                side       = str(r.get("side", "")).upper()
+                qty        = float(r.get("qty", 0) or 0)
+                px         = float(r.get("price", 0) or 0)
+                reason_raw = str(r.get("reason", ""))
+                reason_label = "rebalance" if "rebalance" in reason_raw.lower() else "ladder"
+
+                delta  = 0.0
+                spread = 0.0
+                status = None
+
+                if side == "SELL" and qty > 0:
+                    delta = (px - buy_avg) * qty
+                    remaining_sell = qty
+                    matched_cost   = 0.0
+                    matched_total  = 0.0
+                    while remaining_sell > 1e-9 and buy_stack:
+                        buy_px, buy_qty = buy_stack[-1]
+                        matched = min(remaining_sell, buy_qty)
+                        spread        += (px - buy_px) * matched
+                        matched_cost  += buy_px * matched
+                        matched_total += matched
+                        remaining_sell -= matched
+                        buy_qty -= matched
+                        if buy_qty < 1e-9:
+                            buy_stack.pop()
+                            buy_idx_stack.pop()
+                        else:
+                            buy_stack[-1] = (buy_px, buy_qty)
+                    if matched_total > 1e-9:
+                        avg_matched_buy = matched_cost / matched_total
+                        from_inv = remaining_sell  # qty unmatched = sold from initial inventory
+                        if from_inv > 1e-9:
+                            status = f"partial @ {avg_matched_buy:.2f} ({from_inv:.5f} from inventory)"
+                        else:
+                            status = f"matched @ {avg_matched_buy:.2f}"
+                    else:
+                        status = "from inventory"
+                    total_qty     -= qty
+                    cum_sell_qty  += qty
+                    cum_sell_quote += qty * px
+
+                elif side == "BUY" and qty > 0:
+                    if total_qty + qty > 0:
+                        buy_avg = (buy_avg * total_qty + px * qty) / (total_qty + qty)
+                    total_qty += qty
+                    buy_stack.append((px, qty))
+                    buy_idx_stack.append(cur_buy_idx)
+
+                    # Determine status from pass-1 result
+                    qty_remaining = pending_map.get(cur_buy_idx, 0.0)
+                    if qty_remaining < 1e-9:
+                        status = "matched"
+                    elif abs(qty_remaining - qty) < 1e-9:
+                        status = "pending"
+                    else:
+                        status = f"partial ({round(qty_remaining, 5)} left)"
+
+                    cur_buy_idx += 1
+
+                sell_avg = (cum_sell_quote / cum_sell_qty) if cum_sell_qty > 0 else None
+
+                rows.append({
+                    "ts":        r.get("ts"),
+                    "side":      side,
+                    "type":      reason_label,
+                    "qty":       round(qty, 6),
+                    "price":     round(px, 2),
+                    "buy_avg":   round(buy_avg, 2),
+                    "sell_avg":  round(sell_avg, 2) if sell_avg is not None else None,
+                    "total_qty": round(total_qty, 4),
+                    "delta":     round(delta, 2),
+                    "spread":    round(spread, 2),
+                    "status":    status,
+                })
+
+            book_df = pd.DataFrame(rows)
+            book_df["cum_delta"]  = book_df["delta"].cumsum().round(2)
+            book_df["cum_spread"] = book_df["spread"].cumsum().round(2)
+            if "ts" in book_df.columns:
+                book_df = book_df.sort_values("ts", ascending=False)
+                book_df["ts"] = pd.to_datetime(book_df["ts"], utc=True, errors="coerce")
+                book_df["ts"] = book_df["ts"].dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M:%S IST")
+
+            # ── Summary metrics (Option 3 — top) ──────────────────────────────
+            if p1_stack:
+                stranded_qty  = sum(bqty for _, _, bqty, _, _ in p1_stack)
+                stranded_cost = sum(bpx * bqty for _, bpx, bqty, _, _ in p1_stack)
+                stranded_avg  = stranded_cost / stranded_qty if stranded_qty > 0 else 0.0
+                unrealized_spread_loss = (mark_px - stranded_avg) * stranded_qty
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Stranded Buys (lots)", len(p1_stack))
+                c2.metric("Stranded ETH qty", f"{stranded_qty:.4f}")
+                c3.metric("Avg stranded buy px", f"{stranded_avg:.2f}")
+                c4.metric("Unrealized spread loss", f"{unrealized_spread_loss:.2f} USDC")
+
+            # ── Main running book table (Option 4 — status column) ────────────
+            st.subheader("Trade Book")
+            st.dataframe(book_df, use_container_width=True, hide_index=True)
+
+            # ── Stranded buys table (Option 3 — bottom) ───────────────────────
+            if p1_stack:
+                st.subheader("Stranded (Pending) Buys")
+                stranded_rows = []
+                for _, bpx, bqty, bts, btype in sorted(p1_stack, key=lambda x: -x[1]):  # highest px first
+                    loss = (mark_px - bpx) * bqty
+                    # Format ts to IST
                     try:
-                        pmap = json.loads(pmap)
+                        bts_fmt = pd.to_datetime(bts, utc=True).tz_convert("Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S IST")
                     except Exception:
-                        pmap = None
-                if not isinstance(pmap, dict):
-                    continue
-                for sym, px in pmap.items():
-                    pxf = _safe_float(px)
-                    if pxf is None:
-                        continue
-                    price_rows.append({"ts": ts, "symbol": str(sym), "px": pxf})
+                        bts_fmt = bts
+                    stranded_rows.append({
+                        "ts":          bts_fmt,
+                        "type":        btype,
+                        "buy_price":   round(bpx, 2),
+                        "qty":         round(bqty, 5),
+                        "mark_price":  round(mark_px, 2),
+                        "loss_per_eth": round(mark_px - bpx, 2),
+                        "total_loss":  round(loss, 2),
+                    })
+                st.dataframe(pd.DataFrame(stranded_rows), use_container_width=True, hide_index=True)
 
-            price_long = pd.DataFrame(price_rows)
-            if not price_long.empty:
-                price_long["ts"] = pd.to_datetime(price_long["ts"], utc=True, errors="coerce")
-                price_long = price_long.dropna(subset=["ts", "symbol", "px"]).sort_values("ts")
+# ── Section: Daily Summary ────────────────────────────────────────────────────
 
-                curve_for_adj = curve[["ts", "portfolio_value"]].copy().sort_values("ts")
-                curve_for_adj["manual_pnl_exact"] = 0.0
-                exact_ok = True
+st.subheader("Daily Summary")
 
-                for _, mr in manual_calc.iterrows():
-                    sym = str(mr.get("cmp_symbol") or mr.get("symbol"))
-                    qty = _safe_float(mr.get("qty"))
-                    buy_price = _safe_float(mr.get("buy_price"))
-                    lot_ts = mr.get("ts_utc")
-                    lot_ts = pd.to_datetime(lot_ts, utc=True, errors="coerce")
-                    if not sym or qty is None or buy_price is None:
-                        continue
-                    sp = price_long[price_long["symbol"] == sym][["ts", "px"]].sort_values("ts")
-                    if sp.empty:
-                        exact_ok = False
-                        break
-                    merged = pd.merge_asof(
-                        curve_for_adj[["ts"]].sort_values("ts"),
-                        sp,
-                        on="ts",
-                        direction="backward",
-                    )
-                    if merged["px"].isna().all():
-                        exact_ok = False
-                        break
-                    merged["px"] = merged["px"].ffill()
-                    if merged["px"].isna().any():
-                        exact_ok = False
-                        break
-                    contrib = qty * (merged["px"] - buy_price)
-                    if not pd.isna(lot_ts):
-                        contrib = contrib.where(curve_for_adj["ts"] >= lot_ts, 0.0)
-                    curve_for_adj["manual_pnl_exact"] += contrib
-
-                if exact_ok:
-                    curve_for_adj["portfolio_value_adj_exact"] = curve_for_adj["portfolio_value"] - curve_for_adj["manual_pnl_exact"]
-                    st.line_chart(curve_for_adj.set_index("ts")[["portfolio_value", "portfolio_value_adj_exact"]], use_container_width=True)
-                    src_nm = "price_daily.csv" if price_source is price_daily_df else "price_points.jsonl"
-                    st.caption(f"Adjusted curve is exact using timestamped prices from {src_nm}.")
-                    exact_adjusted_drawn = True
-
-        if exact_adjusted_drawn:
-            pass
-        elif manual_calc.empty:
-            st.line_chart(curve.set_index("ts")[["portfolio_value"]], use_container_width=True)
-        else:
-            curve["portfolio_value_adj_est"] = curve["portfolio_value"] - manual_pnl_total
-            st.line_chart(curve.set_index("ts")[["portfolio_value", "portfolio_value_adj_est"]], use_container_width=True)
-            st.caption("Exact adjusted curve not available from loaded data. Showing estimate using constant offset from current legacy PnL.")
+if df_all.empty or "ts" not in df_all.columns:
+    st.info("No trades for daily summary.")
+else:
+    fills = df_all.copy()
+    if "reason" in fills.columns:
+        ladder_mask = ~fills["reason"].astype(str).str.startswith("rebalance_")
     else:
-        st.info("No portfolio curve points available.")
-else:
-    st.info("No daily portfolio curve data available yet.")
+        ladder_mask = pd.Series([True] * len(fills))
 
-# -------------------------
-# PnL for selected date
-# -------------------------
+    buy_mask  = fills["side"].astype(str).str.upper() == "BUY" if "side" in fills.columns else pd.Series(False, index=fills.index)
+    sell_mask = fills["side"].astype(str).str.upper() == "SELL" if "side" in fills.columns else pd.Series(False, index=fills.index)
 
-st.subheader("PnL For Selected Date (UTC)")
-
-if not isinstance(dff_base, pd.DataFrame) or dff_base.empty or "ts" not in dff_base.columns:
-    st.info("No trades available for date-based PnL.")
-else:
-    day_start = pd.Timestamp(pnl_date, tz="UTC")
-    day_end = day_start + pd.Timedelta(days=1)
-    day_df = dff_base[(dff_base["ts"] >= day_start) & (dff_base["ts"] < day_end)]
-    if day_df.empty:
-        st.info("No trades on selected date.")
+    # Ladder only cycles
+    lf = fills[ladder_mask]
+    if "date_utc" in lf.columns and "cum_quote_qty" in lf.columns:
+        grp = lf.groupby("date_utc")
+        def _day_summary(g):
+            b = g[g["side"].astype(str).str.upper() == "BUY"]["cum_quote_qty"].sum()
+            s = g[g["side"].astype(str).str.upper() == "SELL"]["cum_quote_qty"].sum()
+            buys  = int((g["side"].astype(str).str.upper() == "BUY").sum())
+            sells = int((g["side"].astype(str).str.upper() == "SELL").sum())
+            return pd.Series({
+                "buys":       buys,
+                "sells":      sells,
+                "cycles":     min(buys, sells),
+                "buy_usdc":   round(float(b), 2),
+                "sell_usdc":  round(float(s), 2),
+                "net_usdc":   round(float(s - b), 2),
+            })
+        daily_df = grp.apply(_day_summary).reset_index().sort_values("date_utc", ascending=False)
+        st.caption("Ladder trades only. Cycles = min(buys, sells). Net USDC = sell USDC − buy USDC (positive = profit in USDC).")
+        st.dataframe(daily_df, use_container_width=True, hide_index=True)
     else:
-        fills_day = day_df
-        if "event" in fills_day.columns:
-            fills_day = fills_day[fills_day["event"] == "FILL"] if "FILL" in fills_day["event"].unique().tolist() else fills_day
-        realized_day = fills_day["realized_delta"].sum() if "realized_delta" in fills_day.columns else None
-        buys = fills_day["side"].astype(str).str.upper().eq("BUY") if "side" in fills_day.columns else False
-        sells = fills_day["side"].astype(str).str.upper().eq("SELL") if "side" in fills_day.columns else False
-        buy_q = sells_q = None
-        cycles_est_day = None
-        if "cum_quote_qty" in fills_day.columns and "symbol" in fills_day.columns:
-            buy_q = fills_day[buys]["cum_quote_qty"].sum()
-            sells_q = fills_day[sells]["cum_quote_qty"].sum()
-            cycles_sum = 0.0
-            has_cycles = False
-            for sym, g in fills_day.groupby("symbol"):
-                bq = g[g["side"].astype(str).str.upper().eq("BUY")]["cum_quote_qty"].sum()
-                sq = g[g["side"].astype(str).str.upper().eq("SELL")]["cum_quote_qty"].sum()
-                cycle_q = min(bq, sq)
-                unit = _unit_for(str(sym))
-                if unit and unit > 0:
-                    cycles_sum += float(cycle_q) / float(unit)
-                    has_cycles = True
-            cycles_est_day = cycles_sum if has_cycles else None
-        elif "qty" in fills_day.columns and "price" in fills_day.columns:
-            # fallback when cum_quote_qty is not logged
-            buy_q = (fills_day[buys]["qty"] * fills_day[buys]["price"]).sum()
-            sells_q = (fills_day[sells]["qty"] * fills_day[sells]["price"]).sum()
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Realized PnL (day)", _fmt_num(realized_day) if realized_day is not None else "—")
-        c2.metric("Fills (day)", str(len(fills_day)))
-        c3.metric("Buy Quote (day)", _fmt_num(buy_q) if buy_q is not None else "—")
-        c4.metric("Sell Quote (day)", _fmt_num(sells_q) if sells_q is not None else "—")
-        c5.metric("Cycles Est (day)", _fmt_num(cycles_est_day) if cycles_est_day is not None else "—")
+        st.info("Not enough data for daily summary.")
 
+# ── Section: Debug ────────────────────────────────────────────────────────────
 
-# -------------------------
-# Snapshot view
-# -------------------------
-
-st.subheader("Current Snapshot (latest loaded)")
-
-if isinstance(snapshot, dict):
-    c1, c2 = st.columns([1.2, 1.0])
-
-    with c1:
-        sym_map = snapshot.get("symbols") if isinstance(snapshot.get("symbols"), dict) else {}
-        rows = []
-        for sym, d in (sym_map or {}).items():
-            if not isinstance(d, dict):
-                continue
-            r = {"symbol": sym}
-            r.update(d)
-            rows.append(r)
-        if rows:
-            st.dataframe(pd.DataFrame(rows))
-        else:
-            st.info("No symbols in snapshot.")
-
-    with c2:
-        st.markdown("**Bot**")
-        st.json(snapshot.get("bot", {}))
-        st.markdown("**Manual Inventory**")
-        st.json(snapshot.get("manual_inventory_by_symbol", {}))
-        st.markdown("**Created**")
-        st.json(snapshot.get("created", {}))
-        st.markdown("**Deployed**")
-        st.json(snapshot.get("deployed", {}))
-        st.markdown("**Cycles (Today UTC)**")
-        st.json(snapshot.get("cycles_today", {}))
-        st.markdown("**Cycles (All-time)**")
-        st.json(snapshot.get("cycles_all_time", {}))
-        st.markdown("**Holdings**")
-        st.json(snapshot.get("holdings", {}))
-        st.markdown("**LIFO Lots (state, by symbol)**")
-        state_dir_info = st.session_state.get("data_run_files", {})
-        lots_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
-        try:
-            if isinstance(state_dir_info, dict):
-                # use the latest state.json from selected runs
-                state_paths = []
-                for v in state_dir_info.values():
-                    if isinstance(v, dict):
-                        sp = v.get("snapshot_path")
-                        rp = v.get("run_dir")
-                        if rp:
-                            p = _find_file(rp, preferred_names=["state.json"], patterns=["*state*.json"])
-                            if p:
-                                state_paths.append(p)
-                latest_state_path = _latest_by_mtime(state_paths)
-                raw_state = _safe_json_load(latest_state_path or "")
-                if isinstance(raw_state, dict):
-                    ss = raw_state.get("symbol_states") or {}
-                    for sym, sd in ss.items():
-                        if not isinstance(sd, dict):
-                            continue
-                        lots = sd.get("lots") or []
-                        if isinstance(lots, list):
-                            lots_by_symbol[str(sym)] = lots
-        except Exception:
-            lots_by_symbol = {}
-        if lots_by_symbol:
-            st.json(lots_by_symbol)
-        else:
-            st.info("No lots found in state.json (or lots not saved yet).")
-
-    with st.expander("Raw positions_snapshot.json (loaded)"):
-        st.code(json.dumps(snapshot, indent=2), language="json")
-else:
-    st.info("No snapshot loaded.")
-
-
-# -------------------------
-# Trades view + daily summary
-# -------------------------
-
-st.subheader("Trades (filtered)")
-
-if dff.empty:
-    st.info("No trades match current filters.")
-else:
-    st.caption(f"Trades loaded: {len(df)} | After filters: {len(dff)}")
-
-    # Slippage stats
-    if "slippage_bps" in dff.columns:
-        slp = dff.dropna(subset=["slippage_bps"])
-        if not slp.empty:
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Avg slippage (bps)", f"{slp['slippage_bps'].mean():.2f}")
-            m2.metric("Median slippage (bps)", f"{slp['slippage_bps'].median():.2f}")
-            m3.metric("Worst slippage (bps)", f"{slp['slippage_bps'].max():.2f}")
-
-    cols = ["ts", "symbol", "side", "qty", "expected_price", "price", "slippage_bps",
-            "cum_quote_qty", "realized_delta", "reason", "order_id", "_run_dir"]
-    cols = [c for c in cols if c in dff.columns]
-    st.dataframe(dff.sort_values("ts")[cols], use_container_width=True)
-
-    st.subheader("Daily Summary (UTC, filtered)")
-
-    fills = dff.copy()
-    if "event" in fills.columns:
-        fills = fills[fills["event"] == "FILL"] if "FILL" in fills["event"].unique().tolist() else fills
-
-    if not fills.empty and "date_utc" in fills.columns and "symbol" in fills.columns:
-        buy_mask = fills["side"].astype(str).str.upper().eq("BUY") if "side" in fills.columns else False
-        sell_mask = fills["side"].astype(str).str.upper().eq("SELL") if "side" in fills.columns else False
-
-        g = fills.groupby(["date_utc", "symbol"], dropna=True)
-
-        daily = g.agg(
-            fills=("order_id", "count") if "order_id" in fills.columns else ("symbol", "count"),
-            realized=("realized_delta", "sum") if "realized_delta" in fills.columns else ("symbol", "count"),
-            avg_slip_bps=("slippage_bps", "mean") if "slippage_bps" in fills.columns else ("symbol", "count"),
-        ).reset_index()
-
-        if "cum_quote_qty" in fills.columns:
-            bq = fills[buy_mask].groupby(["date_utc", "symbol"])["cum_quote_qty"].sum().rename("buy_quote")
-            sq = fills[sell_mask].groupby(["date_utc", "symbol"])["cum_quote_qty"].sum().rename("sell_quote")
-            daily = daily.merge(bq.reset_index(), on=["date_utc", "symbol"], how="left")
-            daily = daily.merge(sq.reset_index(), on=["date_utc", "symbol"], how="left")
-            daily["buy_quote"] = daily["buy_quote"].fillna(0.0)
-            daily["sell_quote"] = daily["sell_quote"].fillna(0.0)
-            daily["cycle_quote"] = daily[["buy_quote", "sell_quote"]].min(axis=1)
-            daily["cycle_unit_quote"] = daily["symbol"].apply(_unit_for)
-            daily["cycles_est"] = daily["cycle_quote"] / daily["cycle_unit_quote"]
-
-        st.dataframe(daily.sort_values(["date_utc", "symbol"]), use_container_width=True)
-    else:
-        st.info("Not enough fields to compute daily summary.")
-
-# -------------------------
-# Manual adjustments (balance reconcile)
-# -------------------------
-
-st.subheader("Manual Adjustments (balance reconcile)")
-
-if not isinstance(manual_df, pd.DataFrame) or manual_df.empty:
-    st.info("No manual adjustments loaded.")
-else:
-    cols = ["ts", "symbol", "manual_delta", "manual_qty", "base_total", "bot_net_qty", "px", "reason", "_run_dir"]
-    cols = [c for c in cols if c in manual_df.columns]
-    st.dataframe(manual_df.sort_values("ts")[cols], use_container_width=True)
-
-with st.expander("Raw pnl_summary.json (loaded)"):
-    if isinstance(summary, dict):
-        st.code(json.dumps(summary, indent=2), language="json")
-    else:
-        st.info("No summary loaded.")
+if show_raw:
+    with st.expander("pnl_summary.json"):
+        st.code(json.dumps(summary, indent=2, default=str), language="json")
+    with st.expander("State extras"):
+        st.code(json.dumps(extras, indent=2, default=str), language="json")
+    with st.expander("positions_snapshot.json"):
+        st.code(json.dumps(snapshot, indent=2, default=str), language="json")
+    with st.expander("Files loaded"):
+        st.write({
+            "state_path":   state_path,
+            "trades_path":  trades_path,
+            "summary_path": SUMMARY_FILE,
+            "snapshot_path": snapshot_path,
+        })

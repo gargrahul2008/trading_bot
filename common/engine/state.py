@@ -112,18 +112,31 @@ class GlobalState:
             extras=dict(raw.get("extras") or {}),
         )
 
+    # Keys preserved from file if not yet in memory (one-time adoption)
+    _PRESERVE_EXTRAS = ["realized_pnl_carry"]
+    # Keys always updated from file (external cron is authoritative)
+    _SYNC_EXTRAS = [
+        "compound_buy_quote",
+        "compound_sell_quote",
+        "compound_initial_equity",
+        "compound_initial_buy_quote",
+    ]
+
     def dump(self, path: str) -> None:
-        # Preserve realized_pnl_carry from the existing file when not already in memory.
-        # This ensures a carry value written externally survives subsequent bot dumps.
-        if "realized_pnl_carry" not in self.extras:
-            try:
-                with open(path, "r", encoding="utf-8") as _f:
-                    _existing = json.load(_f)
-                _carry = (_existing.get("extras") or {}).get("realized_pnl_carry")
-                if _carry is not None:
-                    self.extras["realized_pnl_carry"] = _carry
-            except Exception:
-                pass
+        # Merge externally-written extras from the existing file.
+        try:
+            with open(path, "r", encoding="utf-8") as _f:
+                _existing_extras = json.load(_f).get("extras") or {}
+        except Exception:
+            _existing_extras = {}
+        # One-time adopt: only if not already in memory
+        for key in self._PRESERVE_EXTRAS:
+            if key not in self.extras and key in _existing_extras:
+                self.extras[key] = _existing_extras[key]
+        # Always sync: file wins (cron writes these between dumps)
+        for key in self._SYNC_EXTRAS:
+            if key in _existing_extras:
+                self.extras[key] = _existing_extras[key]
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(dataclasses.asdict(self), f, indent=2, default=str)

@@ -19,6 +19,20 @@ from common.engine.pnl import (
     compute_strategy_pnl, update_drawdown, ensure_portfolio_start,
     ensure_today_buckets, update_trade_counters, realized_today,
 )
+from common.engine.overlay_pnl import OverlayPnL
+
+def _try_start_price_feed(broker, symbols):
+    """Start a MexcPriceFeed if the broker is MexcSpotClient, else return None."""
+    try:
+        from common.broker.mexc_spot_client import MexcPriceFeed
+        if type(broker).__name__ == "MexcSpotClient":
+            base_url = getattr(broker, "base_url", "https://api.mexc.com")
+            feed = MexcPriceFeed(symbols, base_url=base_url, poll_ms=200)
+            feed.start()
+            return feed
+    except Exception as e:
+        LOG.warning("Could not start MexcPriceFeed: %s", e)
+    return None
 
 LOG = setup_logger("runner")
 
@@ -60,6 +74,13 @@ class GenericRunner:
         self.price_points_path = os.path.join(base_dir, "price_points.jsonl")
         self.pnl_daily_path = os.path.join(base_dir, "pnl_daily.csv")
         self.price_daily_path = os.path.join(base_dir, "price_daily.csv")
+        _ledger_path = os.path.join(base_dir, "mexc_ledger.csv")
+        self._overlay = OverlayPnL(
+            trades_path=trades_path,
+            csv_path=os.path.join(base_dir, "pnl_new.csv"),
+            state=state,
+            ledger_path=_ledger_path if os.path.exists(_ledger_path) else None,
+        )
         self._last_price_point: Dict[str, str] = {}
         os.makedirs(os.path.dirname(self.price_points_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(self.pnl_daily_path) or ".", exist_ok=True)
@@ -478,7 +499,11 @@ class GenericRunner:
                     self._add_lot(ss, remaining, price)
 
             if not skip_ref_update and not (reason or "").startswith("rebalance_"):
-                ss.reference_price = price
+                # Use trigger price (ltp at order placement) not execution price.
+                # This prevents slippage from shifting the grid — any favourable
+                # slippage becomes pure bonus without pushing the next level further away.
+                trigger_px = _dec(ss.pending_expected_price) if ss.pending_expected_price is not None else D0
+                ss.reference_price = trigger_px if trigger_px > 0 else price
             ss.pending_order_id = None
             ss.pending_reason = None
             ss.pending_since = None
@@ -532,6 +557,22 @@ class GenericRunner:
                 )
         except Exception:
             pass
+        # --- Overlay PnL attribution (post-cutoff tracking) ---
+        if qty > 0:
+            try:
+                mark = self.state.last_prices.get(symbol) or price
+                self._overlay.on_fill(
+                    ts=rec["ts"],
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    cum_quote=cum_quote if cum_quote > 0 else (price * qty),
+                    fill_price=price,
+                    mark_price=_dec(mark),
+                    reason=reason,
+                )
+            except Exception as _oe:
+                LOG.warning("Overlay PnL update failed: %s", _oe)
         ss.pending_expected_price = None
         ss.pending_expected_source = None
 
@@ -795,6 +836,32 @@ class GenericRunner:
             ss.pending_since = utcnow().isoformat()
             LOG.info("Placed %s %s qty=%s oid=%s reason=%s", intent.symbol, intent.side, str(qty), oid, intent.reason)
 
+    def _overlay_summary(self, prices: Dict[str, Decimal]) -> dict:
+        """Return overlay PnL snapshot for embedding in pnl_summary.json."""
+        try:
+            # Use the first symbol's price as mark (MEXC runs one symbol at a time)
+            mark = D0
+            for sym in self.symbols:
+                p = prices.get(sym)
+                if p is not None:
+                    mark = _dec(p)
+                    break
+            o_pnl = self._overlay.current_overlay_pnl(mark)
+            b_val = self._overlay.baseline_value(mark)
+            return {
+                "cutoff_ts": self.state.extras.get("overlay_cutoff_ts", ""),
+                "baseline_qty": self.state.extras.get("overlay_baseline_qty", "0"),
+                "baseline_cash": self.state.extras.get("overlay_baseline_cash", "0"),
+                "baseline_value": str(b_val),
+                "overlay_qty": self.state.extras.get("overlay_qty", "0"),
+                "overlay_cash": self.state.extras.get("overlay_cash", "0"),
+                "overlay_pnl": str(o_pnl),
+                "mark_price": str(mark),
+            }
+        except Exception as e:
+            LOG.warning("Overlay summary failed: %s", e)
+            return {}
+
     def run_reactive(self, strategy: ReactiveStrategy, *, state_path: str) -> None:
         self.state.ensure_symbols(self.symbols)
 
@@ -804,7 +871,12 @@ class GenericRunner:
             except Exception as e:
                 LOG.warning("Sync-on-start failed: %s", e)
 
-        LOG.info("LIVE started symbols=%s", ",".join(self.symbols))
+        # Start real-time WebSocket price feed (MEXC only; None for other brokers)
+        price_feed = _try_start_price_feed(self.broker, self.symbols)
+        if price_feed:
+            LOG.info("LIVE started symbols=%s [WebSocket price feed active]", ",".join(self.symbols))
+        else:
+            LOG.info("LIVE started symbols=%s [REST polling mode]", ",".join(self.symbols))
 
         while True:
             now = now_local(self.market_tz)
@@ -833,20 +905,51 @@ class GenericRunner:
             allow_new = (now >= open_dt) and (now < eod_cancel_dt)
 
             try:
-                prices = self.broker.get_ltps(self.symbols)
+                # Use WebSocket cached price if available; fall back to REST
+                ws_prices = price_feed.get_prices() if price_feed else None
+                if ws_prices:
+                    prices = ws_prices
+                else:
+                    prices = self.broker.get_ltps(self.symbols)
+
                 for sym, px in prices.items():
                     self.state.last_prices[sym] = _dec(px)
                     self.state.symbol_states[sym].last_mark_price = _dec(px)
 
                 self._update_extras_crypto(prices)
 
-                # poll pending
+                # poll pending — capture state before to detect fills
+                had_pending = {s: bool(self.state.symbol_states[s].pending_order_id) for s in self.symbols}
                 for sym in self.symbols:
                     self._poll_pending(sym, current_price=_dec(prices[sym]))
 
                 # init refs
                 for sym in self.symbols:
                     self._init_reference(sym, _dec(prices[sym]))
+
+                # ── Catch-up: if a fill just cleared, immediately re-check with
+                # the freshest cached price for one extra order opportunity.
+                # Safe: only fires if latest ltp still satisfies the trigger —
+                # if price reversed during order placement, no order is placed.
+                filled_any = any(
+                    had_pending[s] and not self.state.symbol_states[s].pending_order_id
+                    for s in self.symbols
+                )
+                if filled_any and allow_new and price_feed and price_feed.connected:
+                    fresh = price_feed.get_prices()
+                    if fresh:
+                        for sym, px in fresh.items():
+                            if sym in self.state.last_prices:
+                                self.state.last_prices[sym] = _dec(px)
+                                self.state.symbol_states[sym].last_mark_price = _dec(px)
+                        catchup_intents = [
+                            it for it in strategy.on_prices(fresh, self.state, utcnow().isoformat())
+                            if not (it.reason or "").startswith("rebalance_")
+                        ]
+                        if catchup_intents:
+                            LOG.info("Catch-up: %d ladder intent(s) after fill", len(catchup_intents))
+                        for it in catchup_intents:
+                            self._place_intent(it, ltp=_dec(fresh[it.symbol]))
 
                 intents = strategy.on_prices(prices, self.state, utcnow().isoformat())
 
@@ -1037,6 +1140,7 @@ class GenericRunner:
                         "cycles_today": cycles_today_out,
                         "cycles_all_time": cycles_all_out,
                         "holdings": holdings_out,
+                        "overlay": self._overlay_summary(prices),
                     }
                     self._pnl_writer.write_summary(summary_out)
                 LOG.info("cash=%s eq=%s%s | %s", str(self.state.cash), str(self.state.strategy_equity()), pv_str, " | ".join(parts))
@@ -1051,7 +1155,11 @@ class GenericRunner:
             self.state.dump(state_path)
 
             sleep_s = self.poll_seconds if (now >= open_dt and now < close_dt) else self.closed_poll_seconds
-            time.sleep(max(int(sleep_s), 1))
+            if price_feed and price_feed.connected:
+                # Wake up the instant a new price tick arrives (or after poll_seconds max)
+                price_feed.wait_for_tick(timeout=float(sleep_s))
+            else:
+                time.sleep(max(int(sleep_s), 1))
 
     # ================================================================
     # Proactive runner helpers

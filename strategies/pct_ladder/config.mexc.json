@@ -12,13 +12,14 @@
     "symbols": ["ETHUSDC"],
     "upper_pct": 0.4,
     "lower_pct": 0.4,
-    "sizing_mode": "fixed_quote",
-    "buy_quote": 3180,
-    "sell_quote": 3180,
+    "sizing_mode": "banded_qty",
+    "band_width": 100,
+    "buy_quote": 2662,
+    "sell_quote": 2662,
     "qty_step": 1e-06,
     "min_qty": 1e-06,
-    "rebalance_threshold_steps": 2,
-    "rebalance_target_steps": 3
+    "rebalance_threshold_steps": 1,
+    "rebalance_target_steps": 1
   },
   "execution": {
     "poll_seconds": 2,
@@ -33,11 +34,11 @@
     "bot_only_pnl": true
   },
   "paths": {
-    "state_path": "state/mexc_state_2026_03_05_v1.json",
-    "trades_path": "state/mexc_trades_2026_03_05_v1.jsonl",
-    "rejects_path": "state/mexc_rejects_2026_03_05_v1.jsonl",
-    "manual_adjustments_path": "state/manual_adjustments_2026_03_05_v1.jsonl",
-    "capital_flows_file": "capital_flows_2026_03_05_v1.json",
-    "manual_positions_file": "state/manual_positions_2026_03_05_v1.json"
+    "state_path": "state/mexc_state_2026_04_13_v1.json",
+    "trades_path": "state/mexc_trades_2026_04_13_v1.jsonl",
+    "rejects_path": "state/mexc_rejects_2026_04_13_v1.jsonl",
+    "manual_adjustments_path": "state/manual_adjustments_2026_04_13_v1.jsonl",
+    "capital_flows_file": "capital_flows_2026_04_13_v1.json",
+    "manual_positions_file": "state/manual_positions_2026_04_13_v1.json"
   }
 }
