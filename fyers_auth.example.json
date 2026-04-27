@@ -1,0 +1,32 @@
+{
+  "users": {
+    "user1": {
+      "label": "User 1",
+      "client_id": "YOUR_APP_ID",
+      "secret_key": "YOUR_SECRET_KEY",
+      "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
+      "access_token": ""
+    },
+    "user2": {
+      "label": "User 2",
+      "client_id": "YOUR_APP_ID",
+      "secret_key": "YOUR_SECRET_KEY",
+      "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
+      "access_token": ""
+    },
+    "user3": {
+      "label": "User 3",
+      "client_id": "YOUR_APP_ID",
+      "secret_key": "YOUR_SECRET_KEY",
+      "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
+      "access_token": ""
+    },
+    "user4": {
+      "label": "User 4",
+      "client_id": "YOUR_APP_ID",
+      "secret_key": "YOUR_SECRET_KEY",
+      "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
+      "access_token": ""
+    }
+  }
+}

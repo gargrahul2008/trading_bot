@@ -1,0 +1,20 @@
+{
+  "session_ttl_seconds": 600,
+  "passwords": [
+    {
+      "label": "dashboard-only",
+      "password": "dashboard123",
+      "pages": ["dashboard"]
+    },
+    {
+      "label": "fyers-only",
+      "password": "fyers123",
+      "pages": ["fyers-auth"]
+    },
+    {
+      "label": "full-access",
+      "password": "admin123",
+      "pages": ["dashboard", "fyers-auth"]
+    }
+  ]
+}

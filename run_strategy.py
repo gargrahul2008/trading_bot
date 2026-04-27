@@ -9,6 +9,7 @@ from typing import Any, Dict, Tuple
 from decimal import Decimal
 
 from common.broker.auth_db import get_fyers_creds_from_db
+from common.broker.auth_json import get_fyers_creds_from_json
 from common.broker.fyers_client import FyersClient
 from common.broker.mexc_spot_client import MexcSpotClient
 from common.engine.state import GlobalState
@@ -56,9 +57,15 @@ def build_broker(cfg: Dict[str, Any], base_dir: str):
                 db_name=db_name,
                 table_name=db_table,
             )
+        elif auth_mode == "json":
+            auth_file = _abs(str(b.get("auth_file") or "fyers_auth.json"), base_dir)
+            user_key = str(b.get("user_key") or "").strip()
+            if not user_key:
+                raise SystemExit("broker.auth_mode=json requires broker.user_key")
+            client_id, access_token = get_fyers_creds_from_json(auth_file, user_key=user_key)
 
         if not client_id or not access_token:
-            raise SystemExit("Missing FYERS auth. Use broker.auth_mode=db or set FYERS_CLIENT_ID/FYERS_ACCESS_TOKEN.")
+            raise SystemExit("Missing FYERS auth. Use broker.auth_mode=db, broker.auth_mode=json, or set FYERS_CLIENT_ID/FYERS_ACCESS_TOKEN.")
 
         log_path = str(b.get("log_path") or "")
         return FyersClient(client_id=client_id, access_token=access_token, log_path=log_path)

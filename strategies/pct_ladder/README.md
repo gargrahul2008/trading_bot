@@ -48,6 +48,35 @@ After every **fill**, the reference is reset to the fill price.
    python run_strategy.py --config strategies/pct_ladder/config.example.json
    ```
 
+## Backtesting (CSV candles)
+Use the backtester script at repo root:
+
+```bash
+python backtest_pct_ladder.py \
+  --config strategies/pct_ladder/config.mexc.example.json \
+  --candles-csv /path/to/candles.csv \
+  --initial-cash 40000 \
+  --fee-bps 8 \
+  --slippage-bps 5
+```
+
+Required CSV columns:
+- `ts` (or `timestamp`/`datetime`/`date`)
+- `close` (or `c`/`ltp`/`price`)
+- `symbol` (optional only when config has exactly one symbol)
+
+Example:
+```csv
+ts,symbol,close
+2026-03-01T00:00:00Z,ETHUSDT,1984.12
+2026-03-01T00:01:00Z,ETHUSDT,1985.02
+```
+
+Output files are written under `backtests/pct_ladder_<timestamp>/`:
+- `summary.json`
+- `trades.csv`
+- `equity_curve.csv`
+
 
 ## Crypto sizing modes
 - fixed_quote: set buy_quote_usdt and sell_quote_usdt

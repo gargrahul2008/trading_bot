@@ -21,6 +21,8 @@ secrets/
 .env
 .env.*
 *.env
+fyers_auth.json
+dashboard_access.json
 
 # Django
 *.log
@@ -36,4 +38,3 @@ staticfiles/
 # OS
 .DS_Store
 Thumbs.db
-

@@ -4,6 +4,7 @@
 - `common/` shared layer:
   - FYERS client wrapper (quotes/orders/orderbook/positions/holdings/funds/history)
   - DB auth helper (reads `tr_db`)
+  - JSON auth helper (for small multi-user local setups without DB)
   - Sellable quantity computation with **T1/BTST auto**:
     - Treat T1 as sellable automatically for `NSE:* -EQ` and `BSE:* -A` (BTST eligible)
   - Reject parser + adaptive SELL qty retry on "insufficient qty/holdings" type rejects
@@ -25,12 +26,76 @@ pip install -r requirements.txt
 1) Copy/modify config:
 `strategies/pct_ladder/config.example.json`
 
-2) Ensure `tr_db` file is present (for DB auth) or switch broker.auth_mode to env.
+2) Ensure `tr_db` file is present (for DB auth), or switch broker.auth_mode to `env`/`json`.
 
 3) Run:
 ```bash
 python run_strategy.py --config strategies/pct_ladder/config.example.json
 ```
+
+## FYERS JSON auth
+- Use this if you have a small fixed set of FYERS users and do not want any database.
+- Create `fyers_auth.json` from `fyers_auth.example.json`.
+- Add your 4 users with `client_id`, `secret_key`, and the registered `redirect_uri`.
+- Create `dashboard_access.json` from `dashboard_access.example.json`.
+- Start the multipage dashboard:
+```bash
+streamlit run dashboard/streamlit_app.py
+```
+- By default the app opens on `FYERS Auth`.
+- The other page is named `Dashboard`.
+- Access is controlled by `dashboard_access.json` with a 10-minute session by default.
+- You can define different passwords for different pages:
+  - a password with `["dashboard"]` opens only the MEXC dashboard
+  - a password with `["fyers-auth"]` opens only the FYERS auth page
+  - a password with `["dashboard", "fyers-auth"]` opens both pages
+- Only pages allowed by the entered password are shown in the sidebar.
+- For minimum interaction, set each FYERS `redirect_uri` to the exact FYERS auth page URL.
+  Example: if Streamlit is running at `http://127.0.0.1:8501`, register `http://127.0.0.1:8501/fyers-auth`.
+- Then the flow is:
+  - click `Generate`
+  - if the saved token is still valid, nothing else is needed
+  - if login is required, the page redirects to FYERS
+  - after you finish FYERS login, the browser returns to the auth page and the token is saved automatically
+- Use a strategy config with:
+```json
+"broker": {
+  "type": "fyers",
+  "auth_mode": "json",
+  "auth_file": "../../fyers_auth.json",
+  "user_key": "user1"
+}
+```
+- Example config: `strategies/pct_ladder/config.fyers.json_auth.example.json`
+- The auth page stores the latest `access_token` back into `fyers_auth.json`, and `run_strategy.py` reads from that file directly.
+
+### Dashboard access file
+Example `dashboard_access.json`:
+```json
+{
+  "session_ttl_seconds": 600,
+  "passwords": [
+    {
+      "label": "dashboard-only",
+      "password": "dashboard123",
+      "pages": ["dashboard"]
+    },
+    {
+      "label": "fyers-only",
+      "password": "fyers123",
+      "pages": ["fyers-auth"]
+    },
+    {
+      "label": "full-access",
+      "password": "admin123",
+      "pages": ["dashboard", "fyers-auth"]
+    }
+  ]
+}
+```
+- `session_ttl_seconds` controls how long one login stays active in the browser session.
+- The real `dashboard_access.json` is ignored by git, so you can keep actual passwords locally.
+- Optional fallback: if `dashboard_access.json` is missing, the app still accepts `STREAMLIT_APP_PASSWORD` as a full-access password for both pages.
 
 ## Proactive strategies
 For strategies that pre-place orders and react to fills:
