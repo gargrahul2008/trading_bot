@@ -270,9 +270,9 @@ class MexcSpotClient(Broker):
         oid = str(oid)
         self._order_symbol[oid] = sym
         return oid
-    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+    def cancel_order(self, order_id: str, symbol: str = None) -> Dict[str, Any]:
         oid = str(order_id)
-        sym = self._order_symbol.get(oid)
+        sym = self._order_symbol.get(oid) or symbol
         if not sym:
             # Fallback: search open orders to find symbol
             try:
@@ -285,6 +285,7 @@ class MexcSpotClient(Broker):
                 sym = None
         if not sym:
             raise BrokerError(f"MEXC cancel needs symbol for order_id={oid}.")
+        self._order_symbol[oid] = sym  # register for future lookups
         data = self._private_request("DELETE", "/api/v3/order", params={"symbol": sym, "orderId": oid})
         return data
 
@@ -308,11 +309,12 @@ class MexcSpotClient(Broker):
             )
         return None
 
-    def get_order_snapshot(self, order_id: str) -> Optional[Dict[str, Any]]:
+    def get_order_snapshot(self, order_id: str, symbol: str = None) -> Optional[Dict[str, Any]]:
         oid = str(order_id)
-        sym = self._order_symbol.get(oid)
+        sym = self._order_symbol.get(oid) or symbol
         if not sym:
             return None
+        self._order_symbol[oid] = sym  # register for future lookups
         data = self._private_request("GET", "/api/v3/order", params={"symbol": sym, "orderId": oid})
         status_raw = str(data.get("status") or "").upper()
         side = str(data.get("side") or "").upper()

@@ -129,6 +129,7 @@ def main() -> None:
         quote_reserve=to_decimal(ex.get("quote_reserve_usdt") or ex.get("quote_reserve") or 0),
         use_inventory_buffer=bool(ex.get("use_inventory_buffer", False)),
         price_tick=to_decimal(ex.get("price_tick") or 0),
+        pro_levels=int(ex.get("pro_levels") or 1),
     )
 
     state = GlobalState.load(state_path)

@@ -1,6 +1,6 @@
 {
   "strategy_name": "pct_ladder",
-  "runner_type": "reactive",
+  "runner_type": "proactive",
   "broker": {
     "type": "mexc_spot",
     "base_url": "https://api.mexc.com",
@@ -10,19 +10,19 @@
   },
   "strategy": {
     "symbols": ["ETHUSDC"],
-    "upper_pct": 0.4,
-    "lower_pct": 0.4,
+    "upper_pct": 0.2,
+    "lower_pct": 0.2,
     "sizing_mode": "banded_qty",
     "band_width": 100,
-    "buy_quote": 2662,
-    "sell_quote": 2662,
+    "buy_quote": 2512,
+    "sell_quote": 2512,
     "qty_step": 1e-06,
     "min_qty": 1e-06,
     "rebalance_threshold_steps": 1,
     "rebalance_target_steps": 1
   },
   "execution": {
-    "poll_seconds": 2,
+    "poll_seconds": 1,
     "order_mode": "marketable_limit",
     "slippage_bps": 10,
     "limit_ttl_seconds": 15,
@@ -31,7 +31,8 @@
     "adopt_broker_inventory": true,
     "use_inventory_buffer": true,
     "reconcile_crypto_balances": true,
-    "bot_only_pnl": true
+    "bot_only_pnl": true,
+    "pro_levels": 2
   },
   "paths": {
     "state_path": "state/mexc_state_2026_04_13_v1.json",

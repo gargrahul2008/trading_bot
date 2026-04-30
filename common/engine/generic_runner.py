@@ -1165,41 +1165,59 @@ class GenericRunner:
     # Proactive runner helpers
     # ================================================================
 
+    # ------------------------------------------------------------------
+    # Multi-level proactive OID management
+    # OIDs stored as JSON lists: pro_buy_oids_{sym}, pro_sell_oids_{sym}
+    # ------------------------------------------------------------------
+
+    def _get_pro_oid_list(self, sym: str, side: str) -> list:
+        """Return list of active OIDs for this side (newest last)."""
+        key = f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"
+        val = self.state.extras.get(key)
+        if isinstance(val, list):
+            return [o for o in val if o]
+        # backward compat: single OID stored under old key
+        old_key = f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}"
+        old = self.state.extras.get(old_key)
+        return [old] if old else []
+
+    def _add_pro_oid(self, sym: str, side: str, oid: str) -> None:
+        key = f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"
+        lst = self._get_pro_oid_list(sym, side)
+        if oid not in lst:
+            lst.append(oid)
+        self.state.extras[key] = lst
+
+    def _clear_pro_oids(self, sym: str, side: str) -> None:
+        self.state.extras[f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"] = []
+        self.state.extras.pop(f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}", None)
+
+    def _remove_pro_oid(self, sym: str, side: str, oid: str) -> None:
+        """Remove a single OID from the list (used after a fill is confirmed)."""
+        key = f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"
+        lst = self._get_pro_oid_list(sym, side)
+        if oid in lst:
+            lst.remove(oid)
+        self.state.extras[key] = lst
+
+    # Legacy single-oid shims used by status logging and snapshot
     def _get_pro_oids(self, sym: str):
-        """Returns (buy_oid, sell_oid) — None if not placed."""
-        buy_oid = self.state.extras.get(f"pro_buy_oid_{sym}") or None
-        sell_oid = self.state.extras.get(f"pro_sell_oid_{sym}") or None
-        return buy_oid, sell_oid
+        """Returns (first_buy_oid_or_None, first_sell_oid_or_None) for display."""
+        bl = self._get_pro_oid_list(sym, "BUY")
+        sl = self._get_pro_oid_list(sym, "SELL")
+        return (bl[0] if bl else None), (sl[0] if sl else None)
 
-    def _set_pro_oid(self, sym: str, side: str, oid: str) -> None:
-        key = f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}"
-        self.state.extras[key] = oid
-
-    def _clear_pro_oid(self, sym: str, side: str) -> None:
-        key = f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}"
-        self.state.extras.pop(key, None)
-
-    def _cancel_pro_order(self, sym: str, side: str, partial_reason: str = "") -> None:
-        """
-        Cancel the stored proactive order for this side, then clear it.
-        After cancel, checks for any partial fill and applies it to state.
-        Works for both MEXC (instant snapshot) and Fyers (polls until terminal).
-        skip_ref_update=True so the reference_price set by the triggering fill is preserved.
-        partial_reason: trade reason string to use for the recovered partial fill.
-        """
-        buy_oid, sell_oid = self._get_pro_oids(sym)
-        oid = buy_oid if side == "BUY" else sell_oid
-        if oid:
+    def _cancel_pro_orders(self, sym: str, side: str, partial_reason: str = "") -> None:
+        """Cancel ALL resting orders on this side and recover any partial fills."""
+        for oid in list(self._get_pro_oid_list(sym, side)):
             try:
-                self.broker.cancel_order(oid)
+                self.broker.cancel_order(oid, sym)
                 LOG.info("PRO cancelled %s %s oid=%s", sym, side, oid)
             except Exception as e:
                 LOG.warning("PRO cancel failed %s %s oid=%s: %s", sym, side, oid, e)
-            # Recover any partial fill on the cancelled order
             try:
                 if hasattr(self.broker, "get_order_snapshot"):
-                    # MEXC: snapshot is immediately available after cancel
-                    snap = getattr(self.broker, "get_order_snapshot")(oid)
+                    snap = getattr(self.broker, "get_order_snapshot")(oid, sym)
                     if snap:
                         executed = _dec(snap.get("executed_qty") or 0)
                         avg_px   = _dec(snap.get("avg_price") or 0)
@@ -1212,10 +1230,7 @@ class GenericRunner:
                             LOG.info("PRO %s %s partial fill recovered: qty=%s @ %s",
                                      sym, side, executed, avg_px)
                 else:
-                    # Fyers: poll until order reaches terminal state (CANCELLED/FILLED)
-                    # Use short timeout — cancel confirmation on NSE is usually <5s
-                    filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(
-                        sym, oid, timeout_s=10)
+                    filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=10)
                     if terminal and filled_qty > D0:
                         reason = partial_reason or f"pro_{side.lower()}_partial_cancel"
                         self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
@@ -1225,11 +1240,15 @@ class GenericRunner:
                                  sym, side, filled_qty, avg_px)
             except Exception as e:
                 LOG.warning("PRO partial fill check after cancel failed %s %s: %s", sym, side, e)
-        self._clear_pro_oid(sym, side)
+        self._clear_pro_oids(sym, side)
+
+    # Keep old single-cancel name as alias for backward compat with non-proactive callers
+    def _cancel_pro_order(self, sym: str, side: str, partial_reason: str = "") -> None:
+        self._cancel_pro_orders(sym, side, partial_reason)
 
     def _cancel_all_pro_orders(self, sym: str) -> None:
-        self._cancel_pro_order(sym, "BUY")
-        self._cancel_pro_order(sym, "SELL")
+        self._cancel_pro_orders(sym, "BUY")
+        self._cancel_pro_orders(sym, "SELL")
 
     def _check_pro_fill(self, sym: str, oid: str):
         """
@@ -1237,7 +1256,7 @@ class GenericRunner:
         Returns (filled_qty, avg_price, cum_quote, is_terminal) or None if still open.
         """
         if hasattr(self.broker, "get_order_snapshot"):
-            snap = getattr(self.broker, "get_order_snapshot")(oid)
+            snap = getattr(self.broker, "get_order_snapshot")(oid, sym)
             if snap is None:
                 return None
             status = snap["status"]
@@ -1369,123 +1388,172 @@ class GenericRunner:
     def _place_proactive_orders(self, sym: str, strategy, price: Decimal) -> None:
         """
         Place resting GTC LIMIT BUY and SELL orders if not already in the book.
-        Pre-validates funds; triggers synchronous rebalance (Option B) if needed.
+        Supports N levels (pro_levels): level k is at ref ± k*pct/100.
+        Pre-validates funds for all N orders before placing; rebalances if needed.
         Works for both fixed_quote (crypto) and fixed_qty (India equity) modes.
         """
         ss = self.state.symbol_states[sym]
         cfg = strategy.cfg
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
         quote_reserve = _dec(self.exec_cfg.quote_reserve)
+        n_levels = int(getattr(self.exec_cfg, "pro_levels", 1))
 
-        buy_level  = self._round_price_to_tick(ref * (Decimal("1") - cfg.lower_pct / Decimal("100")))
-        sell_level = self._round_price_to_tick(ref * (Decimal("1") + cfg.upper_pct / Decimal("100")))
-
-        # ---- BUY side ----
-        buy_oid, _ = self._get_pro_oids(sym)
-        if not buy_oid and buy_level > D0:
-            if cfg.sizing_mode == "fixed_qty":
-                buy_qty = _dec(cfg.fixed_qty_buy)
-            else:
-                buy_qty = self._round_qty_pro(_dec(cfg.buy_quote) / buy_level, strategy)
-
-            buy_cost = buy_qty * buy_level
-            available_cash = max(self.state.cash - quote_reserve, D0)
-            if buy_qty > D0 and buy_cost > available_cash:
-                if cfg.rebalance_threshold_steps > 0:
-                    LOG.info("PRO %s BUY: insufficient cash (need=%s have=%s), rebalancing", sym, buy_cost, available_cash)
-                    self._rebalance_sync(sym, strategy, "buy", ref)
-                    # Refresh balances after market rebalance order
-                    self._update_extras_crypto({sym: price})
-                    available_cash = max(self.state.cash - quote_reserve, D0)
-                if buy_cost > available_cash:
-                    LOG.warning("PRO %s BUY: insufficient cash after rebalance, skipping", sym)
-                    buy_qty = D0
-
-            if buy_qty > D0:
-                req = PlaceOrderRequest(
-                    symbol=sym, side="BUY", qty=buy_qty,
-                    product_type=self.exec_cfg.product_type,
-                    order_type="LIMIT", limit_price=buy_level, time_in_force="GTC",
+        # ---- BUY side: place levels 1..N if no OIDs exist ----
+        if not self._get_pro_oid_list(sym, "BUY"):
+            buy_levels: list = []
+            total_buy_cost = D0
+            for k in range(1, n_levels + 1):
+                lvl_price = self._round_price_to_tick(
+                    ref * (Decimal("1") - k * cfg.lower_pct / Decimal("100"))
                 )
-                oid = self.exec.place_with_adaptive_qty(req, reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
-                if oid:
-                    self._set_pro_oid(sym, "BUY", oid)
-                    LOG.info("PRO %s BUY placed oid=%s qty=%s @ %s", sym, oid, buy_qty, buy_level)
+                if lvl_price <= D0:
+                    continue
+                if cfg.sizing_mode == "fixed_qty":
+                    qty = _dec(cfg.fixed_qty_buy)
+                elif cfg.sizing_mode == "banded_qty":
+                    band_mid = (lvl_price // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
+                    qty = self._round_qty_pro(_dec(cfg.buy_quote) / band_mid, strategy)
+                else:
+                    qty = self._round_qty_pro(_dec(cfg.buy_quote) / lvl_price, strategy)
+                buy_levels.append((k, lvl_price, qty))
+                total_buy_cost += qty * lvl_price
 
-        # ---- SELL side ----
-        _, sell_oid = self._get_pro_oids(sym)
-        if not sell_oid and sell_level > D0:
-            if cfg.sizing_mode == "fixed_qty":
-                sell_qty = _dec(cfg.fixed_qty_sell)
-            else:
-                sell_qty = self._round_qty_pro(_dec(cfg.sell_quote) / sell_level, strategy)
+            available_cash = max(self.state.cash - quote_reserve, D0)
+            if total_buy_cost > available_cash and cfg.rebalance_threshold_steps > 0:
+                LOG.info("PRO %s BUY: insufficient cash (need=%s have=%s), rebalancing",
+                         sym, total_buy_cost, available_cash)
+                self._rebalance_sync(sym, strategy, "buy", ref)
+                self._update_extras_crypto({sym: price})
+                available_cash = max(self.state.cash - quote_reserve, D0)
+
+            placed_cash = D0
+            for k, lvl_price, qty in buy_levels:
+                if qty <= D0:
+                    continue
+                order_cost = qty * lvl_price
+                if placed_cash + order_cost > available_cash:
+                    LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining levels",
+                                sym, k, lvl_price)
+                    break
+                req = PlaceOrderRequest(
+                    symbol=sym, side="BUY", qty=qty,
+                    product_type=self.exec_cfg.product_type,
+                    order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
+                )
+                oid = self.exec.place_with_adaptive_qty(
+                    req, reason=f"pro_buy_L{k}|ref-{k}x{float(cfg.lower_pct)}%"
+                )
+                if oid:
+                    self._add_pro_oid(sym, "BUY", oid)
+                    placed_cash += order_cost
+                    LOG.info("PRO %s BUY L%d placed oid=%s qty=%s @ %s", sym, k, oid, qty, lvl_price)
+
+        # ---- SELL side: place levels 1..N if no OIDs exist ----
+        if not self._get_pro_oid_list(sym, "SELL"):
+            sell_levels: list = []
+            total_sell_qty = D0
+            for k in range(1, n_levels + 1):
+                lvl_price = self._round_price_to_tick(
+                    ref * (Decimal("1") + k * cfg.upper_pct / Decimal("100"))
+                )
+                if lvl_price <= D0:
+                    continue
+                if cfg.sizing_mode == "fixed_qty":
+                    qty = _dec(cfg.fixed_qty_sell)
+                elif cfg.sizing_mode == "banded_qty":
+                    band_mid = (lvl_price // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
+                    qty = self._round_qty_pro(_dec(cfg.sell_quote) / band_mid, strategy)
+                else:
+                    qty = self._round_qty_pro(_dec(cfg.sell_quote) / lvl_price, strategy)
+                sell_levels.append((k, lvl_price, qty))
+                total_sell_qty += qty
 
             base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
-            if sell_qty > D0 and base_qty < sell_qty:
-                if cfg.rebalance_threshold_steps > 0:
-                    LOG.info("PRO %s SELL: insufficient ETH (need=%s have=%s), rebalancing", sym, sell_qty, base_qty)
-                    self._rebalance_sync(sym, strategy, "sell", ref)
-                    self._update_extras_crypto({sym: price})
-                    base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
-                if base_qty < sell_qty:
-                    LOG.warning("PRO %s SELL: insufficient inventory after rebalance, skipping", sym)
-                    sell_qty = D0
+            if total_sell_qty > base_qty and cfg.rebalance_threshold_steps > 0:
+                LOG.info("PRO %s SELL: insufficient ETH (need=%s have=%s), rebalancing",
+                         sym, total_sell_qty, base_qty)
+                self._rebalance_sync(sym, strategy, "sell", ref)
+                self._update_extras_crypto({sym: price})
+                base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
 
-            if sell_qty > D0:
+            placed_qty = D0
+            for k, lvl_price, qty in sell_levels:
+                if qty <= D0:
+                    continue
+                if placed_qty + qty > base_qty:
+                    LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
+                                sym, k, lvl_price)
+                    break
                 req = PlaceOrderRequest(
-                    symbol=sym, side="SELL", qty=sell_qty,
+                    symbol=sym, side="SELL", qty=qty,
                     product_type=self.exec_cfg.product_type,
-                    order_type="LIMIT", limit_price=sell_level, time_in_force="GTC",
+                    order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
                 )
-                oid = self.exec.place_with_adaptive_qty(req, reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+                oid = self.exec.place_with_adaptive_qty(
+                    req, reason=f"pro_sell_L{k}|ref+{k}x{float(cfg.upper_pct)}%"
+                )
                 if oid:
-                    self._set_pro_oid(sym, "SELL", oid)
-                    LOG.info("PRO %s SELL placed oid=%s qty=%s @ %s", sym, oid, sell_qty, sell_level)
+                    self._add_pro_oid(sym, "SELL", oid)
+                    placed_qty += qty
+                    LOG.info("PRO %s SELL L%d placed oid=%s qty=%s @ %s", sym, k, oid, qty, lvl_price)
 
     def _poll_proactive_symbol(self, sym: str, strategy, price: Decimal, allow_new: bool = True) -> None:
         """
-        Check BUY and SELL proactive orders for fills.
-        On fill: record trade, cancel other side, guard re-center, place fresh orders immediately.
-        Also handles drift: if price drifts > 2*pct from ref, cancel stale orders and re-center.
+        Check ALL BUY and SELL proactive orders for fills (supports N levels).
+        Fetches open orders ONCE per tick; only calls get_order_snapshot for OIDs
+        that have disappeared (terminal). Normal tick = 1 API call instead of N.
+        On any fill: cancel ALL remaining orders on both sides, guard re-center, place fresh N+N.
+        Also handles drift: if price drifts > lower_pct+upper_pct from ref, re-center.
         """
         ss = self.state.symbol_states[sym]
         cfg = strategy.cfg
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
 
-        buy_oid, sell_oid = self._get_pro_oids(sym)
+        # --- Single orderbook fetch for this tick ---
+        open_oids: set = set()
+        try:
+            ob = self.broker.orderbook()
+            for o in (ob.get("orderBook") or []):
+                oid = str(o.get("id") or "")
+                if oid:
+                    open_oids.add(oid)
+        except Exception as e:
+            LOG.warning("PRO %s: orderbook fetch failed: %s — skipping tick", sym, e)
+            return
 
-        # Check BUY fill
+        def _check_terminal(side: str, oid: str) -> bool:
+            """Returns True if a fill was recorded, removes OID from tracking."""
+            nonlocal filled_buy, filled_sell
+            if oid in open_oids:
+                return False  # still open — no API call needed
+            # Not in open orders → terminal: fetch details
+            result = self._check_pro_fill(sym, oid)
+            self._remove_pro_oid(sym, side, oid)
+            if result is None:
+                # snapshot unavailable (e.g. very old OID) — treat as cancelled, no fill
+                LOG.warning("PRO %s %s oid=%s disappeared but snapshot unavailable, dropping", sym, side, oid)
+                return False
+            filled_qty, avg_px, cum_q, _ = result
+            if filled_qty > D0:
+                fill_px = avg_px if avg_px > D0 else price
+                reason = f"pro_buy|ref-{float(cfg.lower_pct)}%" if side == "BUY" else f"pro_sell|ref+{float(cfg.upper_pct)}%"
+                self._apply_fill(sym, side, filled_qty, fill_px, cum_q,
+                                 reason=reason, order_id=oid, status="FILLED")
+                return True
+            else:
+                LOG.info("PRO %s %s terminal (no fill) oid=%s", sym, side, oid)
+                return False
+
         filled_buy = False
-        if buy_oid:
-            result = self._check_pro_fill(sym, buy_oid)
-            if result is not None:
-                filled_qty, avg_px, cum_q, _ = result
-                self._clear_pro_oid(sym, "BUY")
-                if filled_qty > 0:
-                    fill_px = avg_px if avg_px > D0 else price
-                    self._apply_fill(sym, "BUY", filled_qty, fill_px, cum_q,
-                                     reason=f"pro_buy|ref-{float(cfg.lower_pct)}%",
-                                     order_id=buy_oid, status="FILLED")
-                    filled_buy = True
-                else:
-                    LOG.info("PRO %s BUY terminal (no fill) oid=%s", sym, buy_oid)
-
-        # Check SELL fill (re-read sell_oid in case BUY clear above changed extras)
         filled_sell = False
-        _, sell_oid = self._get_pro_oids(sym)
-        if sell_oid:
-            result = self._check_pro_fill(sym, sell_oid)
-            if result is not None:
-                filled_qty, avg_px, cum_q, _ = result
-                self._clear_pro_oid(sym, "SELL")
-                if filled_qty > 0:
-                    fill_px = avg_px if avg_px > D0 else price
-                    self._apply_fill(sym, "SELL", filled_qty, fill_px, cum_q,
-                                     reason=f"pro_sell|ref+{float(cfg.upper_pct)}%",
-                                     order_id=sell_oid, status="FILLED")
-                    filled_sell = True
-                else:
-                    LOG.info("PRO %s SELL terminal (no fill) oid=%s", sym, sell_oid)
+
+        for oid in list(self._get_pro_oid_list(sym, "BUY")):
+            if _check_terminal("BUY", oid):
+                filled_buy = True
+
+        for oid in list(self._get_pro_oid_list(sym, "SELL")):
+            if _check_terminal("SELL", oid):
+                filled_sell = True
 
         # Drift check — only if no fills this iteration (fills take priority)
         if not filled_buy and not filled_sell and ref > D0:
@@ -1498,10 +1566,12 @@ class GenericRunner:
                 ss.reference_price = price
                 return
 
-        # Post-fill: cancel opposite side + guard re-center + immediately place fresh orders
+        # Post-fill: cancel ALL remaining orders on both sides → guard re-center → place fresh N+N
         if filled_buy and not filled_sell:
-            self._cancel_pro_order(sym, "SELL",
-                                   partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+            self._cancel_pro_orders(sym, "BUY",
+                                    partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+            self._cancel_pro_orders(sym, "SELL",
+                                    partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
             new_ref = _dec(ss.reference_price)
             new_sell_level = new_ref * (Decimal("1") + cfg.upper_pct / Decimal("100"))
             if price >= new_sell_level:
@@ -1511,8 +1581,10 @@ class GenericRunner:
                 self._place_proactive_orders(sym, strategy, price)
 
         elif filled_sell and not filled_buy:
-            self._cancel_pro_order(sym, "BUY",
-                                   partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+            self._cancel_pro_orders(sym, "SELL",
+                                    partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+            self._cancel_pro_orders(sym, "BUY",
+                                    partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
             new_ref = _dec(ss.reference_price)
             new_buy_level = new_ref * (Decimal("1") - cfg.lower_pct / Decimal("100"))
             if price <= new_buy_level:
@@ -1522,8 +1594,12 @@ class GenericRunner:
                 self._place_proactive_orders(sym, strategy, price)
 
         elif filled_buy and filled_sell:
-            # Both filled in same poll (big move) — re-center on current price
+            # Both sides filled in same poll (big move) — cancel all remaining, re-center on current price
             LOG.info("PRO %s both BUY+SELL filled, re-centering ref on price=%s", sym, price)
+            self._cancel_pro_orders(sym, "BUY",
+                                    partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+            self._cancel_pro_orders(sym, "SELL",
+                                    partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
             ss.reference_price = price
             if allow_new:
                 self._place_proactive_orders(sym, strategy, price)

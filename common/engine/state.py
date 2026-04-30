@@ -120,6 +120,7 @@ class GlobalState:
         "compound_sell_quote",
         "compound_initial_equity",
         "compound_initial_buy_quote",
+        "portfolio_start_value",
     ]
 
     def dump(self, path: str) -> None:

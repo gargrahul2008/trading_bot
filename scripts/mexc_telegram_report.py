@@ -370,6 +370,27 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
             if broker_eth <= D0:
                 ss         = (state.get("symbol_states") or {}).get(symbol) or {}
                 broker_eth = _dec(ss.get("traded_qty") or "0")
+
+            # Prefer pnl_summary.json for cash — it includes locked USDC (frozen in open orders)
+            # state.cash only reflects free balance, understating PV by ~N×buy_quote
+            try:
+                summary_path = os.path.join(os.path.dirname(state_path), "pnl_summary.json")
+                with open(summary_path, encoding="utf-8") as f:
+                    summary = json.load(f)
+                holdings = summary.get("holdings") or {}
+                quote_total = _dec(holdings.get("quote_total") or "0")
+                sym_data = (holdings.get("per_symbol") or {}).get(symbol) or {}
+                base_total = _dec(sym_data.get("base_total") or "0")
+                px = _dec(sym_data.get("px") or "0")
+                if quote_total > D0:
+                    cash = quote_total
+                if base_total > D0:
+                    broker_eth = base_total
+                if px > D0:
+                    price = px
+            except Exception:
+                pass  # fall back to state values
+
             pv     = cash + broker_eth * price
             pv_str = f", PV{int(pv)}"
 

@@ -27,8 +27,8 @@ fi
 python3 scripts/mexc_compound.py \
     --config strategies/pct_ladder/config.mexc.json \
     --trades strategies/pct_ladder/state/mexc_trades_2026_04_13_v1.jsonl \
-    --initial-equity 53233 \
-    --initial-buy-quote 2662
+    --initial-equity 100491.12 \
+    --initial-buy-quote 2512
 
 # 4. Restart bot in mexc screen
 sleep 2

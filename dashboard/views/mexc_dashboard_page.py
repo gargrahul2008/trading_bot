@@ -128,6 +128,7 @@ def render_page() -> None:
     state_path = _newest(os.path.join(STATE_DIR, "mexc_state_*_v1.json"))
     state = _jload(state_path) or {}
     extras = state.get("extras") or {}
+    config = _jload(os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.json")) or {}
     trades_path = _newest(os.path.join(STATE_DIR, "mexc_trades_*_v1.jsonl"))
     raw_trades = _load_trades(trades_path, max_lines=max_trades)
     snapshot_path = os.path.join(STATE_DIR, "positions_snapshot.json")
@@ -163,11 +164,26 @@ def render_page() -> None:
     ct_count = _count_cycles(cycles_today_d, step=step_for_cycles)
     ca_count = _count_cycles(cycles_alltime_d, step=step_for_cycles)
 
+    # Runway calculations
+    strategy_cfg = config.get("strategy") or {}
+    exec_cfg = config.get("execution") or {}
+    grid_pct = _sf(strategy_cfg.get("lower_pct")) or 0.0   # downside grid step %
+    upper_grid_pct = _sf(strategy_cfg.get("upper_pct")) or grid_pct
+    quote_reserve = _sf(exec_cfg.get("quote_reserve_usdt")) or 0.0
+    buy_step = current_step if current_step > 0 else (_sf(strategy_cfg.get("buy_quote")) or 1.0)
+    sell_step = (_sf(extras.get("compound_sell_quote")) or buy_step)
+    effective_usdc = max(usdc_balance - quote_reserve, 0.0)
+    # grid_pct is already in % units (e.g. 0.2 means 0.2%), so result is directly in %
+    usdc_runway_pct = (effective_usdc / buy_step * grid_pct) if buy_step > 0 and grid_pct > 0 else None
+    eth_runway_pct = (eth_value / sell_step * upper_grid_pct) if sell_step > 0 and upper_grid_pct > 0 and eth_value > 0 else None
+
     st.subheader("Portfolio")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Value", _fmt(portfolio_value))
-    c2.metric("USDC Balance", _fmt(usdc_balance))
-    c3.metric(f"ETH ({eth_qty:.4f})", _fmt(eth_value), delta=f"@ ${eth_price:,.2f}")
+    usdc_runway_str = f"↓ {usdc_runway_pct:.1f}% runway" if usdc_runway_pct is not None else ""
+    c2.metric("USDC Balance", _fmt(usdc_balance), delta=usdc_runway_str or None, delta_color="off")
+    eth_runway_str = f"↑ {eth_runway_pct:.1f}% runway" if eth_runway_pct is not None else ""
+    c3.metric(f"ETH ({eth_qty:.4f})", _fmt(eth_value), delta=f"@ ${eth_price:,.2f}  ·  {eth_runway_str}", delta_color="off")
     if pnl_since_start is not None:
         c4.metric("PnL Since Start", _fmt(pnl_since_start), delta=f"{pct_since_start:+.2f}%", delta_color="normal")
     else:
@@ -277,7 +293,129 @@ def render_page() -> None:
             if rebal.empty:
                 st.info("No rebalance trades.")
             else:
-                st.dataframe(_prepare_display(rebal), use_container_width=True, hide_index=True)
+                rb = rebal.copy().sort_values("ts", ascending=True).reset_index(drop=True)
+                rb = _to_num(rb, ["qty", "price"])
+
+                # --- Pass 1: FIFO matching (two-pass so buys know their future sell match) ---
+                # Each entry: [row_idx, qty_remaining, price, ts_str]
+                open_buys: list[list]  = []
+                open_sells: list[list] = []
+                realized_pnl = 0.0
+                # match_info[row_idx] = {"matched_qty": float, "matched_avg_px": float, "pnl": float}
+                match_info: dict[int, dict] = {i: {"matched_qty": 0.0, "matched_cost": 0.0, "pnl": 0.0} for i in range(len(rb))}
+
+                for i, row in rb.iterrows():
+                    side = str(row.get("side", "")).upper()
+                    qty  = float(row.get("qty", 0) or 0)
+                    px   = float(row.get("price", 0) or 0)
+
+                    if side == "BUY":
+                        remaining = qty
+                        while remaining > 1e-9 and open_sells:
+                            si, sq, spx, _ = open_sells[0]
+                            take = min(remaining, sq)
+                            pnl_piece = take * (spx - px)
+                            realized_pnl += pnl_piece
+                            # record on both sides
+                            match_info[i]["matched_qty"]  += take
+                            match_info[i]["matched_cost"] += spx * take
+                            match_info[i]["pnl"]          += pnl_piece
+                            match_info[si]["matched_qty"]  += take
+                            match_info[si]["matched_cost"] += px * take
+                            match_info[si]["pnl"]          += pnl_piece
+                            remaining -= take
+                            open_sells[0][1] -= take
+                            if open_sells[0][1] < 1e-9:
+                                open_sells.pop(0)
+                        if remaining > 1e-9:
+                            open_buys.append([i, remaining, px, str(row.get("ts", ""))])
+
+                    elif side == "SELL":
+                        remaining = qty
+                        while remaining > 1e-9 and open_buys:
+                            bi, bq, bpx, _ = open_buys[0]
+                            take = min(remaining, bq)
+                            pnl_piece = take * (px - bpx)
+                            realized_pnl += pnl_piece
+                            match_info[i]["matched_qty"]  += take
+                            match_info[i]["matched_cost"] += bpx * take
+                            match_info[i]["pnl"]          += pnl_piece
+                            match_info[bi]["matched_qty"]  += take
+                            match_info[bi]["matched_cost"] += px * take
+                            match_info[bi]["pnl"]          += pnl_piece
+                            remaining -= take
+                            open_buys[0][1] -= take
+                            if open_buys[0][1] < 1e-9:
+                                open_buys.pop(0)
+                        if remaining > 1e-9:
+                            open_sells.append([i, remaining, px, str(row.get("ts", ""))])
+
+                # --- Pass 2: build display columns ---
+                open_idx_set = {entry[0] for entry in open_buys} | {entry[0] for entry in open_sells}
+                open_qty_map = {entry[0]: entry[1] for entry in open_buys + open_sells}
+
+                row_matched: list[str] = []
+                row_pnl: list = []
+                row_status: list[str] = []
+
+                for i, row in rb.iterrows():
+                    qty = float(row.get("qty", 0) or 0)
+                    side = str(row.get("side", "")).upper()
+                    info = match_info[i]
+                    mq = info["matched_qty"]
+                    mc = info["matched_cost"]
+                    mp = info["pnl"]
+
+                    if mq > 1e-9:
+                        avg_px = mc / mq
+                        label = "sell" if side == "BUY" else "buy"
+                        row_matched.append(f"{label} @ {avg_px:.2f}")
+                        row_pnl.append(round(mp, 2))
+                        open_q = open_qty_map.get(i, 0.0)
+                        if open_q > 1e-9:
+                            row_status.append(f"partial ({open_q:.4f} open)")
+                        else:
+                            row_status.append("matched")
+                    else:
+                        row_matched.append("")
+                        row_pnl.append(None)
+                        row_status.append("open")
+
+                # Unrealized PnL on open positions
+                open_buy_qty  = sum(e[1] for e in open_buys)
+                open_buy_cost = sum(e[1] * e[2] for e in open_buys)
+                open_sell_qty  = sum(e[1] for e in open_sells)
+                open_sell_cost = sum(e[1] * e[2] for e in open_sells)
+                unrealized_pnl = 0.0
+                if open_buy_qty > 1e-9 and eth_price > 0:
+                    unrealized_pnl += open_buy_qty * eth_price - open_buy_cost
+                if open_sell_qty > 1e-9 and eth_price > 0:
+                    unrealized_pnl += open_sell_cost - open_sell_qty * eth_price
+
+                # Summary metrics
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Realized PnL", f"${realized_pnl:+.2f}")
+                m2.metric("Unrealized PnL", f"${unrealized_pnl:+.2f}",
+                          delta=f"{open_buy_qty:.4f} ETH open" if open_buy_qty > 1e-9 else None,
+                          delta_color="off")
+                m3.metric("Total PnL", f"${realized_pnl + unrealized_pnl:+.2f}")
+                m4.metric("Open positions", f"{open_buy_qty + open_sell_qty:.4f} ETH")
+
+                st.caption("FIFO matching across rebalance trades. **matched** = counterpart avg price. "
+                           "Unrealized on open positions at current mark price.")
+
+                # Build display table
+                rb["matched"] = row_matched
+                rb["pnl"]     = row_pnl
+                rb["status"]  = row_status
+                rb_disp = rb.copy().sort_values("ts", ascending=False)
+                rb_disp["ts"] = rb_disp["ts"].dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M:%S IST")
+                show_cols = ["ts", "side", "qty", "price", "matched", "pnl", "status", "reason"]
+                show_cols = [c for c in show_cols if c in rb_disp.columns]
+                rb_disp["qty"] = pd.to_numeric(rb_disp["qty"], errors="coerce").round(5)
+                rb_disp["price"] = pd.to_numeric(rb_disp["price"], errors="coerce").round(2)
+                rb_disp["pnl"] = pd.to_numeric(rb_disp["pnl"], errors="coerce").round(2)
+                st.dataframe(rb_disp[show_cols].reset_index(drop=True), use_container_width=True, hide_index=True)
 
         with tab3:
             st.caption(
