@@ -309,10 +309,24 @@ class GenericRunner:
             return
 
         # ---- Equities fallback ----
-        try:
-            self.state.cash = _dec(self.broker.funds_cash())
-        except Exception:
-            pass
+        if getattr(self.exec_cfg, "isolated_cash", False):
+            # isolated_cash: do NOT sync from broker — cash is tracked from fills only.
+            # Used for sell-first strategies where the strategy must not touch account cash.
+            LOG.info("isolated_cash: skipping funds_cash() sync, state cash=%.2f", float(self.state.cash))
+        else:
+            try:
+                raw_cash = _dec(self.broker.funds_cash())
+                # For MTF strategies, state.cash tracks effective buying power = actual_cash × leverage.
+                # Default leverage=0/1 means no scaling (non-MTF and MEXC).
+                lev = _dec(getattr(self.exec_cfg, "mtf_leverage", "0"))
+                if lev > _dec("1"):
+                    self.state.cash = raw_cash * lev
+                    LOG.info("MTF cash sync: actual=%.2f leverage=%.1fx buying_power=%.2f",
+                             float(raw_cash), float(lev), float(self.state.cash))
+                else:
+                    self.state.cash = raw_cash
+            except Exception:
+                pass
 
         if not self.adopt_broker_inventory:
             return
@@ -358,11 +372,18 @@ class GenericRunner:
             sym = str(o.get("symbol") or o.get("tradingSymbol") or "")
             if (not cancel_all) and sym and (sym not in symset):
                 continue
-            status = str(o.get("status") or o.get("orderStatus") or o.get("order_status") or "").upper()
+            raw_status = o.get("status") or o.get("orderStatus") or o.get("order_status")
             qty = _dec(o.get("qty") or o.get("quantity") or 0)
             filled_qty = _dec(o.get("filledQty") or o.get("tradedQty") or o.get("filled_qty") or 0)
-            if status in {"TRADED", "FILLED", "COMPLETE", "REJECTED", "CANCELLED", "CANCELED"}:
-                continue
+            # Fyers returns integer status codes: 1=Cancelled, 2=Traded/Filled, 5=Rejected, 6=Pending
+            # MEXC/other brokers return string statuses.
+            if isinstance(raw_status, int):
+                if raw_status in (1, 2, 5):  # Fyers terminal
+                    continue
+            else:
+                status = str(raw_status or "").upper()
+                if status in {"TRADED", "FILLED", "COMPLETE", "REJECTED", "CANCELLED", "CANCELED"}:
+                    continue
             if qty > 0 and filled_qty >= qty:
                 continue
             open_ids.append(oid)
@@ -1247,6 +1268,41 @@ class GenericRunner:
         self._cancel_pro_orders(sym, side, partial_reason)
 
     def _cancel_all_pro_orders(self, sym: str) -> None:
+        """
+        Cancel all resting proactive orders on both sides.
+        Uses broker batch cancel (single API call) when available, falling back
+        to individual cancels.  Partial fills are recovered from the batch response.
+        """
+        if hasattr(self.broker, "cancel_all_open_orders"):
+            try:
+                snaps = self.broker.cancel_all_open_orders(sym)
+                # Recover any partial fills from the batch response
+                all_oids = (self._get_pro_oid_list(sym, "BUY") +
+                            self._get_pro_oid_list(sym, "SELL"))
+                oid_side = {o: "BUY" for o in self._get_pro_oid_list(sym, "BUY")}
+                oid_side.update({o: "SELL" for o in self._get_pro_oid_list(sym, "SELL")})
+                for snap in snaps:
+                    oid      = snap.get("order_id", "")
+                    executed = _dec(snap.get("executed_qty") or 0)
+                    avg_px   = _dec(snap.get("avg_price") or 0)
+                    cum_q    = _dec(snap.get("cum_quote_qty") or 0)
+                    side     = oid_side.get(oid) or snap.get("side", "")
+                    if executed > D0 and side:
+                        reason = (f"pro_buy|ref-{float(self.state.symbol_states[sym].reference_price or 0):.4f}"
+                                  if side == "BUY" else
+                                  f"pro_sell_partial_cancel")
+                        self._apply_fill(sym, side, executed, avg_px, cum_q,
+                                         reason=reason, order_id=oid,
+                                         status="CANCELLED", skip_ref_update=True)
+                        LOG.info("PRO %s %s batch-cancel partial fill recovered: qty=%s @ %s",
+                                 sym, side, executed, avg_px)
+                self._clear_pro_oids(sym, "BUY")
+                self._clear_pro_oids(sym, "SELL")
+                LOG.info("PRO %s batch cancel done (%d orders)", sym, len(snaps))
+                return
+            except Exception as e:
+                LOG.warning("PRO %s batch cancel failed (%s), falling back to individual cancels", sym, e)
+        # Fallback: cancel side-by-side individually
         self._cancel_pro_orders(sym, "BUY")
         self._cancel_pro_orders(sym, "SELL")
 
@@ -1385,6 +1441,51 @@ class GenericRunner:
                                  reason="rebalance_restore", order_id=oid, status="FILLED")
             return terminal
 
+    def _place_orders_parallel(self, sym: str, orders: list) -> None:
+        """
+        Place multiple orders concurrently using a thread pool.
+        Each entry in `orders` is (side, level_k, limit_price, qty, reason).
+        Results are collected and OIDs registered after all threads complete.
+        Falls back to sequential placement if threading fails.
+        """
+        import concurrent.futures
+
+        def _place_one(entry):
+            side, k, lvl_price, qty, reason = entry
+            req = PlaceOrderRequest(
+                symbol=sym, side=side, qty=qty,
+                product_type=self.exec_cfg.product_type,
+                order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
+            )
+            oid = self.exec.place_with_adaptive_qty(req, reason=reason)
+            return side, k, lvl_price, qty, oid
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(orders)) as pool:
+                futures = [pool.submit(_place_one, entry) for entry in orders]
+                for fut in concurrent.futures.as_completed(futures):
+                    try:
+                        side, k, lvl_price, qty, oid = fut.result()
+                        if oid:
+                            self._add_pro_oid(sym, side, oid)
+                            LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s",
+                                     sym, side, k, oid, qty, lvl_price)
+                    except Exception as e:
+                        LOG.warning("PRO %s parallel place error: %s", sym, e)
+        except Exception as e:
+            LOG.warning("PRO %s parallel placement failed (%s), placing sequentially", sym, e)
+            for side, k, lvl_price, qty, reason in orders:
+                req = PlaceOrderRequest(
+                    symbol=sym, side=side, qty=qty,
+                    product_type=self.exec_cfg.product_type,
+                    order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
+                )
+                oid = self.exec.place_with_adaptive_qty(req, reason=reason)
+                if oid:
+                    self._add_pro_oid(sym, side, oid)
+                    LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s",
+                             sym, side, k, oid, qty, lvl_price)
+
     def _place_proactive_orders(self, sym: str, strategy, price: Decimal) -> None:
         """
         Place resting GTC LIMIT BUY and SELL orders if not already in the book.
@@ -1397,9 +1498,18 @@ class GenericRunner:
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
         quote_reserve = _dec(self.exec_cfg.quote_reserve)
         n_levels = int(getattr(self.exec_cfg, "pro_levels", 1))
+        orders_to_place: list = []   # collected by both BUY and SELL blocks, placed in parallel
 
-        # ---- BUY side: place levels 1..N if no OIDs exist ----
-        if not self._get_pro_oid_list(sym, "BUY"):
+        # ---- BUY side: place levels 1..N if fewer than n_levels are tracked ----
+        # Condition is < n_levels (not just "empty") so a dropped Level-1 OID doesn't
+        # leave the bot stuck with only a Level-2 order and miss the tighter level.
+        # When the list is partial we cancel the stale remainder and rebuild all levels
+        # from scratch around the current ref to avoid mismatched price levels.
+        if len(self._get_pro_oid_list(sym, "BUY")) < n_levels:
+            if self._get_pro_oid_list(sym, "BUY"):  # partial — cancel stale before rebuild
+                LOG.info("PRO %s BUY: only %d/%d levels tracked — cancelling stale and rebuilding",
+                         sym, len(self._get_pro_oid_list(sym, "BUY")), n_levels)
+                self._cancel_pro_orders(sym, "BUY")
             buy_levels: list = []
             total_buy_cost = D0
             for k in range(1, n_levels + 1):
@@ -1427,6 +1537,7 @@ class GenericRunner:
                 available_cash = max(self.state.cash - quote_reserve, D0)
 
             placed_cash = D0
+            orders_to_place: list = []
             for k, lvl_price, qty in buy_levels:
                 if qty <= D0:
                     continue
@@ -1435,21 +1546,18 @@ class GenericRunner:
                     LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining levels",
                                 sym, k, lvl_price)
                     break
-                req = PlaceOrderRequest(
-                    symbol=sym, side="BUY", qty=qty,
-                    product_type=self.exec_cfg.product_type,
-                    order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
-                )
-                oid = self.exec.place_with_adaptive_qty(
-                    req, reason=f"pro_buy_L{k}|ref-{k}x{float(cfg.lower_pct)}%"
-                )
-                if oid:
-                    self._add_pro_oid(sym, "BUY", oid)
-                    placed_cash += order_cost
-                    LOG.info("PRO %s BUY L%d placed oid=%s qty=%s @ %s", sym, k, oid, qty, lvl_price)
+                orders_to_place.append((
+                    "BUY", k, lvl_price, qty,
+                    f"pro_buy_L{k}|ref-{k}x{float(cfg.lower_pct)}%",
+                ))
+                placed_cash += order_cost
 
-        # ---- SELL side: place levels 1..N if no OIDs exist ----
-        if not self._get_pro_oid_list(sym, "SELL"):
+        # ---- SELL side: place levels 1..N if fewer than n_levels are tracked ----
+        if len(self._get_pro_oid_list(sym, "SELL")) < n_levels:
+            if self._get_pro_oid_list(sym, "SELL"):  # partial — cancel stale before rebuild
+                LOG.info("PRO %s SELL: only %d/%d levels tracked — cancelling stale and rebuilding",
+                         sym, len(self._get_pro_oid_list(sym, "SELL")), n_levels)
+                self._cancel_pro_orders(sym, "SELL")
             sell_levels: list = []
             total_sell_qty = D0
             for k in range(1, n_levels + 1):
@@ -1484,18 +1592,15 @@ class GenericRunner:
                     LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
                                 sym, k, lvl_price)
                     break
-                req = PlaceOrderRequest(
-                    symbol=sym, side="SELL", qty=qty,
-                    product_type=self.exec_cfg.product_type,
-                    order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
-                )
-                oid = self.exec.place_with_adaptive_qty(
-                    req, reason=f"pro_sell_L{k}|ref+{k}x{float(cfg.upper_pct)}%"
-                )
-                if oid:
-                    self._add_pro_oid(sym, "SELL", oid)
-                    placed_qty += qty
-                    LOG.info("PRO %s SELL L%d placed oid=%s qty=%s @ %s", sym, k, oid, qty, lvl_price)
+                orders_to_place.append((
+                    "SELL", k, lvl_price, qty,
+                    f"pro_sell_L{k}|ref+{k}x{float(cfg.upper_pct)}%",
+                ))
+                placed_qty += qty
+
+        # ---- Place all collected orders in parallel ----
+        if orders_to_place:
+            self._place_orders_parallel(sym, orders_to_place)
 
     def _poll_proactive_symbol(self, sym: str, strategy, price: Decimal, allow_new: bool = True) -> None:
         """
@@ -1515,7 +1620,13 @@ class GenericRunner:
             ob = self.broker.orderbook()
             for o in (ob.get("orderBook") or []):
                 oid = str(o.get("id") or "")
-                if oid:
+                status = o.get("status")
+                # Fyers returns all orders (open + filled + cancelled) in orderbook.
+                # Only treat as "open" if not in a numeric terminal state.
+                # Fyers status codes: 1=Cancelled, 2=Traded/Filled, 5=Rejected, 6=Pending
+                # MEXC returns only open orders (status is string), so this filter is harmless.
+                is_fyers_terminal = isinstance(status, int) and status in (1, 2, 5)
+                if oid and not is_fyers_terminal:
                     open_oids.add(oid)
         except Exception as e:
             LOG.warning("PRO %s: orderbook fetch failed: %s — skipping tick", sym, e)
@@ -1530,9 +1641,19 @@ class GenericRunner:
             result = self._check_pro_fill(sym, oid)
             self._remove_pro_oid(sym, side, oid)
             if result is None:
-                # snapshot unavailable (e.g. very old OID) — treat as cancelled, no fill
-                LOG.warning("PRO %s %s oid=%s disappeared but snapshot unavailable, dropping", sym, side, oid)
-                return False
+                # Snapshot unavailable for a disappeared OID — could be a fill that raced us
+                # or an exchange-side cancel we didn't initiate.  Either way, the safe action
+                # is to cancel ALL remaining orders and let _place_proactive_orders rebuild,
+                # rather than silently leaving a partial (e.g. only Level-2) order set which
+                # causes long dead windows where Level-1 is missing.
+                LOG.warning(
+                    "PRO %s %s oid=%s disappeared but snapshot unavailable — "
+                    "cancelling all + re-centering to restore full order set",
+                    sym, side, oid,
+                )
+                self._cancel_all_pro_orders(sym)
+                ss.reference_price = price
+                return False  # no confirmed fill; _place_proactive_orders restores orders
             filled_qty, avg_px, cum_q, _ = result
             if filled_qty > D0:
                 fill_px = avg_px if avg_px > D0 else price

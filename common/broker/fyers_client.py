@@ -96,7 +96,7 @@ class FyersClient(Broker):
             return resp
         return with_retries(_call, max_retries=3, base_sleep=0.5, max_sleep=4.0, logger=LOG)
 
-    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+    def cancel_order(self, order_id: str, symbol: str = None) -> Dict[str, Any]:
         def _call():
             payload = {"id": str(order_id)}
             try:
@@ -129,7 +129,7 @@ class FyersClient(Broker):
         if not found:
             return None
 
-        status_raw = str(found.get("status") or found.get("orderStatus") or found.get("order_status") or "").upper()
+        status_int = found.get("status") or found.get("orderStatus") or found.get("order_status")
         qty = int(found.get("qty") or found.get("quantity") or 0)
         filled = int(found.get("filledQty") or found.get("tradedQty") or found.get("filled_qty") or 0)
         avg_price = to_decimal(found.get("avgPrice") or found.get("averagePrice") or found.get("avg_price") or found.get("tradedPrice") or 0)
@@ -143,25 +143,41 @@ class FyersClient(Broker):
         else:
             side = "BUY"
 
-        terminal = {"TRADED", "FILLED", "COMPLETE", "REJECTED", "CANCELLED", "CANCELED"}
-        is_filled = (status_raw in {"TRADED", "FILLED", "COMPLETE"}) or (qty > 0 and filled >= qty)
-
-        if status_raw in {"REJECTED", "CANCELLED", "CANCELED"}:
-            return OrderTerminal(
-                order_id=str(order_id),
-                symbol=sym,
-                side=side,  # type: ignore
-                status="REJECTED" if status_raw == "REJECTED" else "CANCELLED",
-                filled_qty=to_decimal(0),
-                avg_price=to_decimal(0),
-                cum_quote_qty=to_decimal(0),
-                message=str(found.get("message") or found.get("msg") or ""),
-                ts=dt.datetime.now(dt.timezone.utc),
-                raw=found,
-            )
-
-        if not is_filled:
-            return None
+        # Fyers uses integer status codes: 1=Cancelled, 2=Traded/Filled, 5=Rejected, 6=Pending
+        # Other brokers use string statuses.
+        if isinstance(status_int, int):
+            if status_int == 1:
+                return OrderTerminal(
+                    order_id=str(order_id), symbol=sym, side=side,  # type: ignore
+                    status="CANCELLED", filled_qty=to_decimal(0), avg_price=to_decimal(0),
+                    cum_quote_qty=to_decimal(0),
+                    message=str(found.get("message") or found.get("msg") or ""),
+                    ts=dt.datetime.now(dt.timezone.utc), raw=found,
+                )
+            if status_int == 5:
+                return OrderTerminal(
+                    order_id=str(order_id), symbol=sym, side=side,  # type: ignore
+                    status="REJECTED", filled_qty=to_decimal(0), avg_price=to_decimal(0),
+                    cum_quote_qty=to_decimal(0),
+                    message=str(found.get("message") or found.get("msg") or ""),
+                    ts=dt.datetime.now(dt.timezone.utc), raw=found,
+                )
+            is_filled = (status_int == 2) or (qty > 0 and filled >= qty)
+            if not is_filled:
+                return None  # still pending (status=6) or unknown
+        else:
+            status_raw = str(status_int or "").upper()
+            if status_raw in {"REJECTED", "CANCELLED", "CANCELED"}:
+                return OrderTerminal(
+                    order_id=str(order_id), symbol=sym, side=side,  # type: ignore
+                    status="REJECTED" if status_raw == "REJECTED" else "CANCELLED",
+                    filled_qty=to_decimal(0), avg_price=to_decimal(0), cum_quote_qty=to_decimal(0),
+                    message=str(found.get("message") or found.get("msg") or ""),
+                    ts=dt.datetime.now(dt.timezone.utc), raw=found,
+                )
+            is_filled = (status_raw in {"TRADED", "FILLED", "COMPLETE"}) or (qty > 0 and filled >= qty)
+            if not is_filled:
+                return None
 
         if filled <= 0:
             filled = qty

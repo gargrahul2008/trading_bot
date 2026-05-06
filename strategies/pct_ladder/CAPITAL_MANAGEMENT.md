@@ -47,6 +47,19 @@ print('compound_initial_equity:', extras['compound_initial_equity'])
 "
 ```
 
+### Step 3b — Update the compound cron script ⚠️ CRITICAL — easy to miss
+File: `scripts/mexc_compound_cron.sh`
+
+The cron has a **hardcoded `--initial-equity` value** that runs every morning at 00:00 UTC. If you update the state file but forget this, the morning cron will reset `compound_initial_equity` back to the old value, making the dashboard show the deposit as profit again.
+
+Update the value to match the new `compound_initial_equity`:
+```bash
+# In mexc_compound_cron.sh, find and update:
+--initial-equity 104491.12   # ← change this to new value after every deposit/withdrawal
+```
+
+The current value should always equal the sum of all capital injections (initial + all deposits - all withdrawals) since the Apr 13 fresh start.
+
 ### Step 4 — Recalculate step size
 The step size (buy_quote) should always be ~5% of total initial equity to maintain consistent runway:
 
@@ -115,26 +128,32 @@ Re-enable the watchdog cron if you commented it out.
 | 2026-03-07 | +10571 | added | — |
 | 2026-03-18 | +15790 | added | 53233.00 |
 | 2026-04-27 | +31251.12 | added | 84484.12 |
+| 2026-04-28 | +16007.00 | added | 100491.12 |
+| 2026-05-04 | +4000.00  | added | 104491.12 |
 
 ---
 
-## Current config snapshot (2026-04-27)
+## Current config snapshot (2026-05-05)
 
 | Parameter | Value |
 |---|---|
-| grid pct | 0.2% |
+| grid pct | 0.4% |
 | buy_quote (config) | 2662 |
-| compound_initial_buy_quote | 2113 |
-| compound_buy_quote | 2113 |
-| compound_initial_equity | 84484.12 |
-| Step as % of equity | ~2.5% (= 5% at 0.4% grid equivalent) |
+| compound_initial_buy_quote | 2512 |
+| compound_buy_quote | (updated daily by cron) |
+| compound_initial_equity | 104491.12 |
+| `--initial-equity` in cron | 104491.12 |
+| Step as % of equity | ~2.4% |
 
 ---
 
 ## Key rules
 
 - **Always stop the bot before editing state** — bot dumps state every tick and will overwrite changes.
-- **Both `portfolio_start_value` and `compound_initial_equity` must be updated** on every capital change.
+- **Three places must be updated on every capital change** (missing any one causes dashboard to show deposit as profit):
+  1. `state/mexc_state_*.json` → `portfolio_start_value` + `compound_initial_equity`
+  2. `scripts/mexc_compound_cron.sh` → `--initial-equity` hardcoded value
+  3. `state/capital_flows_*.json` → append flow entry
 - **Step size ratio**: maintain ~5% of equity per step at 0.4% grid. Halve step if halving grid pct.
 - **Runway**: `(cash / buy_quote) × pct` = price % the bot can absorb in one direction. Keep ~4%.
 - After updating state, run compound dry-run to confirm new step looks correct before restarting.

@@ -201,22 +201,15 @@ def render_page() -> None:
         )
 
         if st.button("Generate", type="primary", use_container_width=True):
+            # Always redirect for a fresh login — do NOT pre-validate.
+            # get_profile can return "ok" for stale tokens that quotes/orders APIs reject,
+            # causing the bot to fail even though dashboard shows "token is valid".
+            state = f"fyers-auth:{selected_user}"
             try:
-                profile = validate_access_token(auth_file, user_key=selected_user)
-                if isinstance(profile, dict) and profile.get("s") == "ok":
-                    st.success("Saved token is already valid.")
-                    st.json(profile)
-                else:
-                    state = f"fyers-auth:{selected_user}"
-                    url = generate_login_url(auth_file, user_key=selected_user, state=state)
-                    _redirect(url)
-            except Exception:
-                state = f"fyers-auth:{selected_user}"
-                try:
-                    url = generate_login_url(auth_file, user_key=selected_user, state=state)
-                    _redirect(url)
-                except Exception as inner_exc:
-                    st.error(str(inner_exc))
+                url = generate_login_url(auth_file, user_key=selected_user, state=state)
+                _redirect(url)
+            except Exception as exc:
+                st.error(str(exc))
 
         if st.button("Validate Saved Token", use_container_width=True):
             try:

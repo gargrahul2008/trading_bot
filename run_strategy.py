@@ -64,6 +64,28 @@ def build_broker(cfg: Dict[str, Any], base_dir: str):
                 raise SystemExit("broker.auth_mode=json requires broker.user_key")
             client_id, access_token = get_fyers_creds_from_json(auth_file, user_key=user_key)
 
+        elif auth_mode == "http":
+            import requests as _requests
+            token_url    = str(b.get("token_url") or "").strip()
+            token_secret = str(b.get("token_secret") or "").strip()
+            user_key     = str(b.get("user_key") or "").strip()
+            if not token_url or not user_key:
+                raise SystemExit("broker.auth_mode=http requires token_url and user_key")
+            try:
+                resp = _requests.get(
+                    token_url,
+                    params={"user": user_key},
+                    headers={"X-Token-Secret": token_secret},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                client_id    = str(data.get("client_id") or "").strip()
+                access_token = str(data.get("access_token") or "").strip()
+                LOG.info("auth_mode=http: fetched token for user=%s from %s", user_key, token_url)
+            except Exception as e:
+                raise SystemExit(f"broker.auth_mode=http: failed to fetch token from {token_url}: {e}")
+
         if not client_id or not access_token:
             raise SystemExit("Missing FYERS auth. Use broker.auth_mode=db, broker.auth_mode=json, or set FYERS_CLIENT_ID/FYERS_ACCESS_TOKEN.")
 
@@ -130,6 +152,8 @@ def main() -> None:
         use_inventory_buffer=bool(ex.get("use_inventory_buffer", False)),
         price_tick=to_decimal(ex.get("price_tick") or 0),
         pro_levels=int(ex.get("pro_levels") or 1),
+        mtf_leverage=to_decimal(ex.get("mtf_leverage") or 0),
+        isolated_cash=bool(ex.get("isolated_cash", False)),
     )
 
     state = GlobalState.load(state_path)

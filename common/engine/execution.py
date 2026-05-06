@@ -28,6 +28,8 @@ class ExecutionConfig:
     use_inventory_buffer: bool = False
     price_tick: Decimal = D0            # round limit prices to this tick (e.g. 0.05 for NSE); 0 = no rounding
     pro_levels: int = 1                 # number of resting limit orders per side in proactive mode
+    mtf_leverage: Decimal = D0          # MTF leverage multiplier (e.g. 3 for 3X); 0/1 = no leverage (default)
+    isolated_cash: bool = False         # if True: skip funds_cash() sync on startup; cash tracked from fills only
 
 class OrderExecutor:
     def __init__(self, broker: Broker, state, cfg: ExecutionConfig, *, rejects_path: str):
@@ -63,9 +65,14 @@ class OrderExecutor:
             sym = str(o.get("symbol") or o.get("tradingSymbol") or "")
             if sym != symbol:
                 continue
-            status = str(o.get("status") or o.get("orderStatus") or o.get("order_status") or "").upper()
-            if status in {"TRADED", "FILLED", "COMPLETE", "REJECTED", "CANCELLED", "CANCELED"}:
-                continue
+            raw_status = o.get("status") or o.get("orderStatus") or o.get("order_status")
+            # Fyers uses integer status codes: 1=Cancelled, 2=Traded/Filled, 5=Rejected, 6=Pending
+            if isinstance(raw_status, int):
+                if raw_status in (1, 2, 5):  # terminal — not a pending sell
+                    continue
+            else:
+                if str(raw_status or "").upper() in {"TRADED", "FILLED", "COMPLETE", "REJECTED", "CANCELLED", "CANCELED"}:
+                    continue
             side = o.get("side")
             if side not in (-1, "-1", "SELL", "S"):
                 continue

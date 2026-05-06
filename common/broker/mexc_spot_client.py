@@ -289,6 +289,36 @@ class MexcSpotClient(Broker):
         data = self._private_request("DELETE", "/api/v3/order", params={"symbol": sym, "orderId": oid})
         return data
 
+    def cancel_all_open_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Cancel ALL open orders for `symbol` in a single API call.
+        Returns list of pre-cancel order snapshots (includes executedQty for partial fill recovery).
+        ~5x faster than cancelling one-by-one when there are multiple orders.
+        """
+        data = self._private_request("DELETE", "/api/v3/openOrders", params={"symbol": symbol})
+        if not isinstance(data, list):
+            return []
+        result = []
+        for o in data:
+            oid       = str(o.get("orderId") or o.get("order_id") or "")
+            side      = str(o.get("side") or "").upper()
+            executed  = to_decimal(o.get("executedQty") or o.get("executedQuantity") or "0")
+            cum_quote = to_decimal(o.get("cummulativeQuoteQty") or o.get("cumulativeQuoteQty") or "0")
+            orig      = to_decimal(o.get("origQty") or o.get("origQuantity") or "0")
+            price     = to_decimal(o.get("price") or "0")
+            avg_price = (cum_quote / executed) if executed > 0 else price
+            result.append({
+                "order_id":     oid,
+                "symbol":       symbol,
+                "side":         "BUY" if side == "BUY" else "SELL",
+                "status":       "CANCELLED",
+                "orig_qty":     orig,
+                "executed_qty": executed,
+                "cum_quote_qty": cum_quote,
+                "avg_price":    avg_price,
+            })
+        return result
+
     def get_order_terminal(self, order_id: str) -> Optional[OrderTerminal]:
         # For MEXC, we prefer get_order_snapshot() for partial/TTL handling.
         snap = self.get_order_snapshot(order_id)

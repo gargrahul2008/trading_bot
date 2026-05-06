@@ -1,6 +1,6 @@
 #!/bin/bash
-CONFIG="strategies/pct_ladder/config.reliance.mtf.json"
-LOG="logs/india_strategy.log"
+CONFIG="strategies/pct_ladder/config.shishind.json"
+LOG="logs/shishind_strategy.log"
 cd /root/trading_bot
 mkdir -p logs
 

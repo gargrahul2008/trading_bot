@@ -1,0 +1,57 @@
+{
+  "_comment": "SHISHIND sell-first grid — 30,000 shares from existing holdings, zero new capital",
+  "_capital_notes": {
+    "symbol": "NSE:SHISHIND-EQ",
+    "reference_price": 12.78,
+    "shares_per_level": 5000,
+    "levels": 6,
+    "total_shares_committed": 30000,
+    "total_value_approx_inr": 383400,
+    "grid_pct": "0.7%",
+    "product_type": "CNC",
+    "new_capital": "NONE — uses existing holdings only",
+    "cash_model": "isolated — starts at 0, grows only from sell fills"
+  },
+  "strategy_name": "pct_ladder",
+  "runner_type": "proactive",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "http",
+    "token_url": "http://MAIN_VPS_IP:8502/token",
+    "token_secret": "REPLACE_WITH_SECRET_FROM_scripts/token_server_secret.txt",
+    "user_key": "user2",
+    "log_path": ""
+  },
+  "strategy": {
+    "symbols": ["NSE:SHISHIND-EQ"],
+    "upper_pct": 0.7,
+    "lower_pct": 0.7,
+    "sizing_mode": "fixed_qty",
+    "fixed_qty_buy": 5000,
+    "fixed_qty_sell": 5000,
+    "qty_step": 1,
+    "min_qty": 1,
+    "rebalance_threshold_steps": 0
+  },
+  "execution": {
+    "product_type": "CNC",
+    "isolated_cash": true,
+    "pro_levels": 6,
+    "allow_btst_auto": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true,
+    "poll_seconds": 5,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": true,
+    "price_tick": 0.01
+  },
+  "paths": {
+    "state_path": "state/shishind_state.json",
+    "trades_path": "state/shishind_trades.jsonl",
+    "rejects_path": "state/shishind_rejects.jsonl"
+  }
+}

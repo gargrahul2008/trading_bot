@@ -23,9 +23,12 @@ INTERVAL_MS = {
     "1d":   86_400_000,
 }
 
-KLINE_COLS = ["ts", "open", "high", "low", "close", "volume",
-              "close_time", "quote_volume", "trades",
-              "taker_buy_base", "taker_buy_quote", "ignore"]
+BINANCE_KLINE_COLS = ["ts", "open", "high", "low", "close", "volume",
+                      "close_time", "quote_volume", "trades",
+                      "taker_buy_base", "taker_buy_quote", "ignore"]
+# MEXC returns 8 columns (no taker_buy fields)
+MEXC_KLINE_COLS = ["ts", "open", "high", "low", "close", "volume",
+                   "close_time", "quote_volume"]
 
 
 def fetch_klines(
@@ -98,7 +101,8 @@ def fetch_klines(
     if not rows:
         raise RuntimeError(f"No data returned for {symbol} {interval} in the requested range.")
 
-    df = pd.DataFrame(rows, columns=KLINE_COLS)
+    cols = MEXC_KLINE_COLS if source == "mexc" else BINANCE_KLINE_COLS
+    df = pd.DataFrame(rows, columns=cols)
     df = df[["ts", "open", "high", "low", "close"]].copy()
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     for col in ["open", "high", "low", "close"]:
