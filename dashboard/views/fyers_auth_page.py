@@ -112,6 +112,29 @@ def _rerun() -> None:
         st.experimental_rerun()
 
 
+def _token_freshness_banner(users: dict) -> None:
+    """Show a red/green banner for each user's token freshness."""
+    today = dt.date.today().isoformat()
+    lines = []
+    for uid, rec in users.items():
+        if not rec.get("client_id") or rec.get("client_id", "").startswith("YOUR_"):
+            continue
+        updated = str(rec.get("token_updated_at") or "")
+        label = rec.get("label") or uid
+        if updated.startswith(today):
+            lines.append(f"✅ **{label}** ({uid}) — token fresh today")
+        elif updated:
+            lines.append(f"🔴 **{label}** ({uid}) — token from **{updated[:10]}** — needs refresh!")
+        else:
+            lines.append(f"🔴 **{label}** ({uid}) — no token saved yet")
+    if lines:
+        msg = "  \n".join(lines)
+        if any("🔴" in l for l in lines):
+            st.warning(msg)
+        else:
+            st.success(msg)
+
+
 def render_page() -> None:
     st.title("FYERS Auth")
     st.caption("JSON-backed FYERS login for a small fixed set of users.")
@@ -146,6 +169,8 @@ def render_page() -> None:
         )
         st.stop()
 
+    _token_freshness_banner(users)
+
     params = _query_params()
     callback_auth_code = params.get("auth_code", "")
     callback_state = params.get("state", "")
@@ -164,25 +189,22 @@ def render_page() -> None:
     )
     rec = users[selected_user]
 
-    status_message = st.session_state.pop("auth_status_message", "")
-    status_kind = st.session_state.pop("auth_status_kind", "info")
-    if status_message:
-        getattr(st, status_kind, st.info)(status_message)
-
     if callback_auth_code and callback_user_key in user_keys:
         last_code = str(st.session_state.get("last_auto_auth_code") or "")
         if callback_auth_code != last_code:
             try:
                 exchange_auth_code_for_token(auth_file, user_key=callback_user_key, auth_code=callback_auth_code)
                 st.session_state["last_auto_auth_code"] = callback_auth_code
-                st.session_state["auth_status_kind"] = "success"
-                st.session_state["auth_status_message"] = (
-                    f"Access token saved automatically for user '{callback_user_key}'."
+                st.success(
+                    f"✅ Token saved for **{callback_user_key}**. "
+                    "Restart the bot to use the new token."
                 )
                 _clear_query_params()
-                _rerun()
             except Exception as exc:
-                st.error(f"Automatic token exchange failed: {exc}")
+                st.error(
+                    f"Auto token exchange failed for '{callback_user_key}': {exc}  \n"
+                    "Paste the callback URL manually in the text area below and click **Exchange And Save Token**."
+                )
 
     left, right = st.columns([1.3, 1.7])
 
@@ -258,11 +280,13 @@ def render_page() -> None:
                 if not auth_code:
                     raise ValueError("Could not find auth_code in the provided value.")
                 resp = exchange_auth_code_for_token(auth_file, user_key=chosen_target, auth_code=auth_code)
-                st.success(f"Access token saved for user '{chosen_target}'.")
+                st.success(
+                    f"✅ Token saved for **{chosen_target}**. "
+                    "Restart the bot to use the new token."
+                )
                 st.json(resp)
                 if callback_auth_code:
                     _clear_query_params()
-                _rerun()
             except Exception as exc:
                 st.error(str(exc))
 

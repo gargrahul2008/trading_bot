@@ -71,11 +71,23 @@ def load_trades(paths: list[str]) -> list[dict]:
     return events
 
 
+_CYCLE_SELL_RE = re.compile(
+    r'ltp[<>]=ref[+\-]'   # old runner format: ltp>=ref+0.4%
+    r'|pro_sell\|ref[+\-]' # new proactive runner format: pro_sell|ref+0.2%
+)
+_CYCLE_BUY_RE = re.compile(
+    r'ltp[<>]=ref[+\-]'   # old runner format: ltp<=ref-0.4%
+    r'|pro_buy\|ref[+\-]'  # new proactive runner format: pro_buy|ref-0.2%
+)
+
+
 def compute_actual_cycle_pnl(fills: list[dict]) -> Decimal:
     """
     LIFO-matched actual cycle PnL.
-    Matches each non-rebalance sell (ltp>=ref pattern) against the most
-    recent non-rebalance buy whose price is lower than the sell price.
+    Matches each non-rebalance cycle sell against the most recent non-rebalance
+    cycle buy whose price is lower than the sell price.
+    Supports both old reason format (ltp>=ref+0.4%) and new proactive runner
+    format (pro_sell|ref+0.2%).
     Only profitable buy→sell pairs are counted.
     """
     open_buys: list[list] = []  # [remaining_qty, buy_price]
@@ -88,10 +100,10 @@ def compute_actual_cycle_pnl(fills: list[dict]) -> Decimal:
         is_reb = bool(re.search(r'rebalance|rebal', reason, re.IGNORECASE))
         if qty <= D0 or price <= D0:
             continue
-        if side == "BUY" and not is_reb:
+        if side == "BUY" and not is_reb and _CYCLE_BUY_RE.search(reason):
             open_buys.append([qty, price])
         elif side == "SELL" and not is_reb:
-            if not re.search(r'ltp[<>]=ref[+\-]', reason):
+            if not _CYCLE_SELL_RE.search(reason):
                 continue
             remaining = qty
             for i in range(len(open_buys) - 1, -1, -1):
@@ -164,8 +176,24 @@ def main() -> None:
     new_step = (compound_equity * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if new_step < config_buy_quote:
         new_step = config_buy_quote  # never shrink below original
+    # Hard upper bound: step must not exceed 4x the original config value.
+    # If LIFO PnL is miscalculated or data is corrupted, this prevents runaway sizing.
+    max_step = (config_buy_quote * Decimal("4")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if new_step > max_step:
+        print(f"  WARNING: computed step ${new_step} exceeds 4x config (${max_step}) — capping.")
+        new_step = max_step
 
-    old_step = _dec(extras.get("compound_buy_quote", str(config_buy_quote)))
+    # If weekend mode is active, new_step is the weekday step.
+    # Keep compound_buy_quote at half (weekend step) and update weekday_compound_buy_quote
+    # so that weekend_end.sh restores the correct new value on Monday.
+    is_weekend = bool(extras.get("weekend_upper_pct"))
+    if is_weekend:
+        weekend_step = (new_step / Decimal("2")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        old_step = _dec(extras.get("weekday_compound_buy_quote", str(config_buy_quote)))
+    else:
+        weekend_step = None
+        old_step = _dec(extras.get("compound_buy_quote", str(config_buy_quote)))
+
     now = datetime.datetime.now(tz=UTC)
 
     print(f"═══ Daily Compound ({now.astimezone(IST).strftime('%Y-%m-%d %H:%M IST')}) ═══")
@@ -174,17 +202,24 @@ def main() -> None:
     print(f"  Ratio                : {float(ratio):.6f}")
     print(f"  Actual LIFO cycle PnL: ${actual_cycle_pnl:.2f}")
     print(f"  Compound equity      : ${compound_equity:.2f}")
-    print(f"  Old step             : ${old_step}")
-    print(f"  New step             : ${new_step}")
+    print(f"  Old step (weekday)   : ${old_step}")
+    print(f"  New step (weekday)   : ${new_step}")
     print(f"  Change               : ${new_step - old_step:+.2f}")
+    if is_weekend:
+        print(f"  Weekend mode active  : trading step kept at ${weekend_step} (half)")
 
     if args.dry_run:
         print("\n[dry-run] State not updated.")
         return
 
     # Write to state extras
-    extras["compound_buy_quote"]         = str(new_step)
-    extras["compound_sell_quote"]        = str(new_step)
+    if is_weekend:
+        extras["weekday_compound_buy_quote"] = str(new_step)   # restored by weekend_end.sh Monday
+        extras["compound_buy_quote"]         = str(weekend_step)
+        extras["compound_sell_quote"]        = str(weekend_step)
+    else:
+        extras["compound_buy_quote"]         = str(new_step)
+        extras["compound_sell_quote"]        = str(new_step)
     extras["compound_initial_equity"]    = str(initial_equity)
     extras["compound_initial_buy_quote"] = str(initial_buy_quote)
     extras["compound_last_ts"]           = now.isoformat()

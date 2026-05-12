@@ -24,8 +24,14 @@ secrets/
 fyers_auth.json
 dashboard_access.json
 
-# Django
+# Logs
 *.log
+
+# Jupyter notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Django
 local_settings.py
 db.sqlite3
 media/
@@ -38,3 +44,12 @@ staticfiles/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime state & trade data (live bot — changes constantly, may contain sensitive data)
+strategies/*/state/
+strategies/*/st/
+strategies/*/st
+
+# Backtest data cache (large binary files, re-downloadable)
+backtest/cache/
+backtest/ticks/

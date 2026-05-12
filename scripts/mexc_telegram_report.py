@@ -207,8 +207,14 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
     # This is the "real" PnL — what the sell actually earned vs what was paid for that ETH.
     avg_cost_qty  = D0   # running ETH qty (from all buys, used to maintain avg cost)
     avg_cost_cost = D0   # running total cost paid for all bought ETH
-    period_rebal_avg_pnl  = D0   # realized PnL (avg-cost) for rebalance sells in period
-    period_ladder_avg_pnl = D0   # realized PnL (avg-cost) for ladder sells in period
+    period_rebal_avg_pnl   = D0  # realized PnL (avg-cost) for rebalance sells in period
+    period_ladder_avg_pnl  = D0  # realized PnL (avg-cost) for ladder sells in period
+    all_time_rebal_avg_pnl = D0  # realized PnL (avg-cost) for ALL rebalance sells since start
+    # Rebalance pool: tracks open ETH that came from rebalance buys.
+    # On rebal BUY: add to pool. On ANY sell: drain proportionally (sold ETH is from mixed pool).
+    # Used to compute unrealized rebalance PnL = pool_qty × (current_price − pool_avg_cost).
+    rebal_pool_qty  = D0
+    rebal_pool_cost = D0
 
     def process_trade(side, qty, price, is_rebal, in_period):
         nonlocal all_time_pnl, all_time_rebal_pnl, all_time_cycles, all_time_rebal_cyc
@@ -279,6 +285,10 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
             if side == "BUY":
                 avg_cost_qty  += qty
                 avg_cost_cost += notional
+                if is_reb:
+                    # Track rebalance pool separately for unrealized calc
+                    rebal_pool_qty  += qty
+                    rebal_pool_cost += notional
             elif side == "SELL" and avg_cost_qty > D0:
                 avg_cost  = avg_cost_cost / avg_cost_qty
                 avg_pnl   = qty * (price - avg_cost)
@@ -286,10 +296,19 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
                 sell_qty  = min(qty, avg_cost_qty)
                 avg_cost_cost -= sell_qty * avg_cost
                 avg_cost_qty  -= sell_qty
-                if in_period:
-                    if is_reb:
-                        period_rebal_avg_pnl  += avg_pnl
-                    else:
+                # Drain rebalance pool proportionally — sold ETH comes from mixed holdings
+                if rebal_pool_qty > D0 and avg_cost_qty + sell_qty > D0:
+                    rebal_fraction = rebal_pool_qty / (avg_cost_qty + sell_qty)
+                    rebal_drained  = min(sell_qty * rebal_fraction, rebal_pool_qty)
+                    pool_avg       = rebal_pool_cost / rebal_pool_qty
+                    rebal_pool_qty  -= rebal_drained
+                    rebal_pool_cost -= rebal_drained * pool_avg
+                if is_reb:
+                    all_time_rebal_avg_pnl += avg_pnl
+                    if in_period:
+                        period_rebal_avg_pnl += avg_pnl
+                else:
+                    if in_period:
                         period_ladder_avg_pnl += avg_pnl
 
             process_trade(side, qty, price, is_reb, in_period)
@@ -316,6 +335,9 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
         "total_bot_pnl":        all_time_pnl,
         "period_pnl":           period_pnl,
         "total_rebal_pnl":      all_time_rebal_pnl,
+        "total_rebal_avg_pnl":  all_time_rebal_avg_pnl,
+        "rebal_pool_qty":       rebal_pool_qty,
+        "rebal_pool_cost":      rebal_pool_cost,
         "period_fills_seq":     period_fills_seq,
     }
 
@@ -345,9 +367,14 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
     pp = float(m['period_pnl'])
     pp_str = _sgn(pp, 0)
 
-    # Rebalance realized PnL: (sell_price − avg_buy_cost) × qty for rebal sells in period
-    rc = float(m['rebal_avg_pnl'])
+    # Rebalance all-time realized PnL (avg-cost) since Apr 13
+    rc = float(m['total_rebal_avg_pnl'])
     rc_str = _sgn(rc, 0)
+
+    # Rebalance unrealized PnL computed after price is known (see below)
+    rebal_pool_qty  = float(m['rebal_pool_qty'])
+    rebal_pool_cost = float(m['rebal_pool_cost'])
+    rebal_unrealized_str = ""  # filled in after price is resolved from state
 
     # Ladder realized PnL: (sell_price − avg_buy_cost) × qty for ladder sells in period
     # Positive = sold above average cost (true profit)
@@ -400,6 +427,10 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
             if cbq > D0:
                 cbq_f = float(cbq)
                 compound_s_str = f"{int(cbq_f)}" if cbq_f == int(cbq_f) else f"{cbq_f:.2f}"
+            # Weekend mode: override pct display if active
+            wpct = state.get("extras", {}).get("weekend_upper_pct")
+            if wpct:
+                pct_str = f"{float(wpct):g}"
         except Exception:
             pass
 
@@ -418,12 +449,18 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
         except Exception:
             pass
 
+    # Rebalance unrealized PnL: open rebal pool marked to current price
+    if rebal_pool_qty > 1e-6 and price > D0:
+        pool_avg_cost = rebal_pool_cost / rebal_pool_qty
+        rebal_unreal  = rebal_pool_qty * (float(price) - pool_avg_cost)
+        rebal_unrealized_str = f",U{_sgn(rebal_unreal, 0)}"
+
     line1 = f"{_fmt_short(since)} -> {_fmt_short(now)}"
     line2 = (
         f"C{m['cycles_completed']}({pp_str}), "
         f"A{int(float(m['avg_ladder_size']))}, "
         f"S{effective_s_str}({pct_str}%), "
-        f"R{m['rebal_cycles']}({rc_str}), "
+        f"R{m['rebal_cycles']}({rc_str}{rebal_unrealized_str}), "
         f"P{float(m['total_bot_pnl']):.2f}"
         f"{pv_str}"
     )

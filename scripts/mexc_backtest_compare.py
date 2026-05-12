@@ -218,27 +218,79 @@ def analyse_missed_cycles(fills: list, df, pct: float) -> dict:
     return {"missed_cycles": missed_total, "gaps": gap_details}
 
 
+def detect_effective_params(period_fills: list, strat: dict, ex: dict) -> dict:
+    """
+    Detect the grid parameters actually used during the period by inspecting
+    fill reasons (e.g. 'pro_buy|ref-0.1%'). Falls back to config values.
+    Returns dict with eff_pct, eff_buy_quote, eff_pro_levels.
+    """
+    # Extract pct from reason strings: 'pro_buy|ref-0.1%' or 'pro_sell|ref+0.2%'
+    pct_vals = set()
+    for f in period_fills:
+        m = re.search(r'ref[+\-]([\d.]+)%', f.get("reason", ""))
+        if m:
+            pct_vals.add(float(m.group(1)))
+
+    cfg_pct = float(strat["lower_pct"])
+    eff_pct = min(pct_vals) if pct_vals else cfg_pct
+
+    # If pct differs from config → weekend mode; pro_levels is 4
+    if abs(eff_pct - cfg_pct) > 0.001:
+        eff_pro_levels = 4
+    else:
+        eff_pro_levels = int(ex.get("pro_levels", 2))
+
+    # Estimate buy_quote from actual fill sizes (banded_qty: qty ≈ buy_quote / band_mid(price))
+    band_width = float(strat.get("band_width", 100))
+    grid_buys = [f for f in period_fills
+                 if f["side"] == "BUY" and not re.search(r"rebalance", f.get("reason",""), re.I)]
+    if grid_buys:
+        sample = grid_buys[:20]
+        vals = []
+        for f in sample:
+            p = float(f["price"])
+            bm = (p // band_width) * band_width + band_width / 2
+            vals.append(float(f["qty"]) * bm)
+        eff_buy_quote = round(sum(vals) / len(vals), 2)
+    else:
+        eff_buy_quote = float(strat["buy_quote"])
+
+    return {"eff_pct": eff_pct, "eff_buy_quote": eff_buy_quote, "eff_pro_levels": eff_pro_levels}
+
+
 def run_backtest(strat: dict, ex: dict, init_cash: float, init_eth: float,
-                 init_eth_cost: float, df, mode: str = "realistic", seed: int = 42) -> dict:
+                 init_eth_cost: float, df, mode: str = "realistic", seed: int = 42,
+                 eff_params: dict | None = None, init_ref_price: float | None = None) -> dict:
+    p = eff_params or {}
+    eff_pct       = p.get("eff_pct",       float(strat["lower_pct"]))
+    eff_buy_quote = p.get("eff_buy_quote",  float(strat["buy_quote"]))
+    eff_pro_levels= p.get("eff_pro_levels", int(ex.get("pro_levels", 2)))
+
+    from decimal import Decimal
     engine = ProactiveBacktestEngine(
         symbol            = strat["symbols"][0],
         initial_cash      = init_cash,
         initial_eth       = init_eth,
         initial_eth_cost  = init_eth_cost,
-        lower_pct         = float(strat["lower_pct"]),
-        upper_pct         = float(strat["upper_pct"]),
-        buy_quote         = float(strat["buy_quote"]),
-        sell_quote        = float(strat["sell_quote"]),
+        lower_pct         = eff_pct,
+        upper_pct         = eff_pct,
+        buy_quote         = eff_buy_quote,
+        sell_quote        = eff_buy_quote,
         band_width        = float(strat.get("band_width", 100)),
         qty_step          = float(strat.get("qty_step", 1e-6)),
         min_qty           = float(strat.get("min_qty",  1e-6)),
-        pro_levels        = int(ex.get("pro_levels", 2)),
+        pro_levels        = eff_pro_levels,
         quote_reserve     = float(ex.get("quote_reserve_usdt", 500)),
         rebalance_threshold_steps = int(strat.get("rebalance_threshold_steps", 1)),
         price_path_mode   = mode,
         seed              = seed,
     )
-    return engine.run(df)
+    # Seed the reference price from the last live fill before the window,
+    # so BT grid levels start aligned with the live bot — not at candle open.
+    if init_ref_price is not None:
+        engine.reference_price = Decimal(str(init_ref_price))
+    summary = engine.run(df)
+    return summary, engine.trades
 
 
 def eff(live_val: float, bt_val: float) -> str:
@@ -306,6 +358,98 @@ def send_telegram(text: str, secrets_path: str) -> None:
         print(f"Failed to send Telegram: {e}")
 
 
+def print_trade_comparison(period_fills: list, bt_trades: list) -> None:
+    """
+    Print a side-by-side timeline of live vs BT grid fills.
+
+    Matching logic: a live fill and BT fill are paired if they are on the
+    same side (BUY/SELL) and within the same 1-minute candle window.
+    Unmatched fills show as LIVE-ONLY or BT-ONLY rows.
+    """
+    is_rebal = lambda r: bool(re.search(r"rebalance", r, re.I))
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+
+    def to_ist(ts_str: str) -> str:
+        """Convert any ISO/datetime string to IST minute-precision string."""
+        ts = ts_str[:16].replace("T", " ")          # "2026-05-09 05:46"
+        try:
+            dt = datetime.strptime(ts, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            dt_ist = dt + IST_OFFSET
+            return dt_ist.strftime("%m-%d %H:%M")   # "05-09 11:16"
+        except Exception:
+            return ts[:11]
+
+    # Strip to minute precision for grouping (keep UTC for key matching)
+    def minute_bucket(ts_str: str) -> str:
+        return ts_str[:16].replace("T", " ")
+
+    # Collect live grid fills keyed by (minute_bucket, side)
+    live_by_min: dict = {}
+    for f in period_fills:
+        if is_rebal(f.get("reason", "")):
+            continue
+        key = (minute_bucket(f["ts"]), f["side"])
+        live_by_min.setdefault(key, []).append(f)
+
+    # Collect BT grid fills keyed by (minute_bucket, side)
+    bt_by_min: dict = {}
+    for t in bt_trades:
+        if is_rebal(t.get("reason", "")):
+            continue
+        key = (minute_bucket(t["ts"]), t["side"])
+        bt_by_min.setdefault(key, []).append(t)
+
+    all_keys = sorted(set(live_by_min) | set(bt_by_min))
+
+    HDR  = f"{'Time (IST)':<14} {'LIVE':^30} {'BT':^30}  Status"
+    SEP  = "─" * len(HDR)
+    print()
+    print("Trade-by-Trade Comparison (grid fills only, rebalances excluded)")
+    print(SEP)
+    print(HDR)
+    print(SEP)
+
+    live_only = bt_only = matched = 0
+
+    for key in all_keys:
+        minute, side = key
+        live_fills = live_by_min.get(key, [])
+        bt_fills   = bt_by_min.get(key, [])
+
+        # Pair up fills in order; excess go to unmatched
+        pairs = max(len(live_fills), len(bt_fills))
+        for i in range(pairs):
+            lf = live_fills[i] if i < len(live_fills) else None
+            bf = bt_fills[i]   if i < len(bt_fills)   else None
+
+            if lf:
+                l_str = f"{lf['side']:4} {float(lf['qty']):.4f} @ {float(lf['price']):,.2f}"
+            else:
+                l_str = "—"
+
+            if bf:
+                b_str = f"{bf['side']:4} {float(bf['qty']):.4f} @ {float(bf['price']):,.2f}"
+            else:
+                b_str = "—"
+
+            if lf and bf:
+                status = "✅ match"
+                matched += 1
+            elif lf:
+                status = "🔵 live only"
+                live_only += 1
+            else:
+                status = "⬜ BT only"
+                bt_only += 1
+
+            ts_label = to_ist(minute) if i == 0 else ""
+            print(f"{ts_label:<14} {l_str:<30} {b_str:<30}  {status}")
+
+    print(SEP)
+    print(f"Matched: {matched}  |  Live-only: {live_only}  |  BT-only: {bt_only}")
+    print()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -315,6 +459,7 @@ def main():
     parser.add_argument("--config",   required=True,  help="Path to config.mexc.json")
     parser.add_argument("--telegram", action="store_true", help="Send report to Telegram")
     parser.add_argument("--secrets",  default="secrets/telegram.json", help="Telegram secrets file")
+    parser.add_argument("--trades",   action="store_true", help="Print trade-by-trade live vs BT comparison")
     args = parser.parse_args()
 
     # ── Load config ──────────────────────────────────────────────────────────
@@ -362,6 +507,11 @@ def main():
     init_eth_cost       = estimate_avg_cost(all_fills, window_ts,
                                             fallback_price=first_fill_price)
 
+    # Reference price at window start = price of last fill BEFORE the window.
+    # This aligns BT grid levels with where the live bot's grid was actually placed.
+    prev_fills     = [f for f in all_fills if f.get("ts", "") < window_ts]
+    init_ref_price = float(prev_fills[-1]["price"]) if prev_fills else first_fill_price
+
     print(f"Comparison period : last 24h ({since_date} UTC → {end_date} UTC)")
     print(f"Initial state     : cash=${init_cash:,.2f}  ETH={init_eth:.5f} @ ${init_eth_cost:.2f}")
     print(f"Period fills      : {len(period_fills)}")
@@ -392,23 +542,33 @@ def main():
         source    = "binance",
     )
 
-    if df_binance.empty:
-        print("Failed to fetch Binance price data.")
-        return
-
     import pandas as pd
     if not df_mexc.empty:
         df_mexc["ts"] = pd.to_datetime(df_mexc["ts"], utc=True)
         df_mexc = df_mexc.sort_values("ts").reset_index(drop=True)
 
+    if df_mexc.empty and df_binance.empty:
+        print("Failed to fetch price data from both MEXC and Binance.")
+        return
+
     # Use last candle close as current price if state doesn't have it
     if cur_price <= 0:
-        cur_price = float(df_binance["close"].iloc[-1])
+        ref_df = df_mexc if not df_mexc.empty else df_binance
+        cur_price = float(ref_df["close"].iloc[-1])
 
     # ── Run backtest (MEXC data + realistic mode = best live match) ──────────
+    # ── Detect effective params from actual fills (handles weekend mode) ────────
+    eff_params = detect_effective_params(period_fills, strat, ex)
+    print(f"Effective params  : pct={eff_params['eff_pct']}%  "
+          f"buy_quote=${eff_params['eff_buy_quote']:.2f}  "
+          f"pro_levels={eff_params['eff_pro_levels']}"
+          + (" [WEEKEND MODE]" if abs(eff_params['eff_pct'] - float(strat['lower_pct'])) > 0.001 else ""))
+
     df_bt = df_mexc if not df_mexc.empty else df_binance
     print(f"Running backtest (realistic mode, {'MEXC' if not df_mexc.empty else 'Binance'} data) …")
-    bt = run_backtest(strat, ex, init_cash, init_eth, init_eth_cost, df_bt, mode="realistic")
+    print(f"Init ref price    : ${init_ref_price:.2f} (last fill before window)")
+    bt, bt_trades = run_backtest(strat, ex, init_cash, init_eth, init_eth_cost, df_bt,
+                                 mode="realistic", eff_params=eff_params, init_ref_price=init_ref_price)
 
     # ── Live metrics (LIFO runs on ALL fills; cycles counted only in window) ──
     live = compute_live_metrics(all_fills, window_ts=window_ts)
@@ -420,7 +580,7 @@ def main():
         missed = analyse_missed_cycles(
             fills = period_fills,
             df    = df_mexc,
-            pct   = float(strat["lower_pct"]) / 100,
+            pct   = eff_params["eff_pct"] / 100,
         )
         print(f"Missed cycles (genuine bot gaps): {missed['missed_cycles']}")
 
@@ -428,6 +588,9 @@ def main():
     report = format_report(since_date, end_date, days, live, bt, strat, ex,
                            cur_cash, cur_eth, cur_price, missed=missed)
     print(report)
+
+    if args.trades:
+        print_trade_comparison(period_fills, bt_trades)
 
     if args.telegram:
         send_telegram(report, args.secrets)

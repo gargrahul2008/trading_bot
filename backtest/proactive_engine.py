@@ -118,7 +118,7 @@ class ProactiveBacktestEngine:
         # State
         self.cash = _dec(initial_cash)
         self.eth_qty = _dec(initial_eth)
-        self.reference_price: Optional[Decimal] = None
+        self.reference_price: Optional[Decimal] = None  # set externally before run() for live-match
 
         # LIFO lot stack for cost basis tracking (same as live bot)
         # Each entry: [qty, price]
@@ -336,7 +336,17 @@ class ProactiveBacktestEngine:
     # ------------------------------------------------------------------
 
     def _price_path(self, o: Decimal, h: Decimal, l: Decimal, c: Decimal) -> str:
-        """Returns 'low_first' or 'high_first'."""
+        """Returns 'low_first' or 'high_first'.
+
+        low_first  = try buys first (price hit low before high — bullish candle)
+        high_first = try sells first (price hit high before low — bearish candle)
+
+        optimistic  : low_first on bullish → catches buy at low + sell at high
+                      (unlimited iters, both sides fill)
+        realistic   : same direction (chronologically correct), but max ~2 fills
+                      per candle — buy at low then sell at high if both hit
+        pessimistic : reversed direction — worst-case fill order
+        """
         if self.price_path_mode in ("optimistic", "realistic"):
             return "low_first" if c >= o else "high_first"
         elif self.price_path_mode == "pessimistic":
@@ -407,12 +417,19 @@ class ProactiveBacktestEngine:
             except Exception:
                 pass
 
-            # Initialise reference on first candle
+            # Initialise reference on first candle.
+            # If reference_price was pre-seeded externally (e.g. from last live fill),
+            # skip overwriting it but still do the initial inventory rebalance.
             if self.reference_price is None:
                 self.reference_price = o
                 if self.rebalance_threshold_steps > 0:
                     self._rebalance_buy(o, o, ts)
                     self._rebalance_sell(o, o, ts)
+            elif not hasattr(self, "_init_rebal_done"):
+                self._init_rebal_done = True
+                if self.rebalance_threshold_steps > 0:
+                    self._rebalance_buy(self.reference_price, o, ts)
+                    self._rebalance_sell(self.reference_price, o, ts)
 
             # Simulate intra-candle fills (can re-center multiple times per candle)
             path = self._price_path(o, h, l, c)
@@ -435,11 +452,12 @@ class ProactiveBacktestEngine:
         On any fill → re-center → repeat (handles multiple fills per candle).
         Max iterations = 2*N to prevent infinite loops on flat candles.
 
-        'realistic' mode: max 1 fill per candle, simulating the dead window
-        (cancel + re-order) that the live bot incurs after each fill.
-        Direction is close-based (bullish candle → try high/sell first).
+        'realistic' mode: hard cap of 4 fills per 1-minute candle.
+        After each fill the live bot cancels all orders and re-places
+        (API round trip ~4-6s), so ~4 fills per 60s is the physical ceiling
+        regardless of whether pro_levels is 2 (weekday) or 4 (weekend).
         """
-        max_iters = 1 if self.price_path_mode == "realistic" else self.pro_levels * 4
+        max_iters = 4 if self.price_path_mode == "realistic" else self.pro_levels * 4
         for _ in range(max_iters):
             ref = self.reference_price
             if ref is None:

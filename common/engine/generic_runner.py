@@ -1423,18 +1423,22 @@ class GenericRunner:
                 return False
             # Reduce buy qty if we can't afford it
             available_cash = max(self.state.cash - quote_reserve, D0)
-            if ref > D0 and deficit_eth * ref > available_cash:
-                deficit_eth = self._round_qty_pro(available_cash / ref, strategy)
-            if deficit_eth <= D0:
+            usdc_to_spend = deficit_eth * ref
+            if usdc_to_spend > available_cash:
+                usdc_to_spend = available_cash
+            if usdc_to_spend <= D0:
                 return False
+            # Use quoteOrderQty (USDC to spend) for market BUY — MEXC requires this
+            # format for market buy orders; passing base qty causes "quantity scale invalid".
+            usdc_to_spend = usdc_to_spend.quantize(_dec("0.01"), rounding=ROUND_DOWN)
             req = PlaceOrderRequest(
-                symbol=sym, side="BUY", qty=deficit_eth,
+                symbol=sym, side="BUY", quote_qty=usdc_to_spend,
                 product_type=self.exec_cfg.product_type, order_type="MARKET",
             )
             oid = self.exec.place_with_adaptive_qty(req, reason="rebalance_restore")
             if not oid:
                 return False
-            LOG.info("PRO rebalance_sync BUY qty=%s oid=%s", deficit_eth, oid)
+            LOG.info("PRO rebalance_sync BUY quote_qty=%s oid=%s", usdc_to_spend, oid)
             filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid)
             if terminal and filled_qty > 0:
                 self._apply_fill(sym, "BUY", filled_qty, avg_px if avg_px > D0 else ref, cum_q,
@@ -1498,6 +1502,30 @@ class GenericRunner:
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
         quote_reserve = _dec(self.exec_cfg.quote_reserve)
         n_levels = int(getattr(self.exec_cfg, "pro_levels", 1))
+
+        # Weekend/mode overrides written to state.extras by cron scripts.
+        # compound_buy_quote/sell_quote: daily compounding step (already established).
+        # weekend_upper_pct / weekend_lower_pct / weekend_pro_levels: tighter grid on weekends.
+        eff_upper_pct  = _dec(self.state.extras.get("weekend_upper_pct")  or cfg.upper_pct)
+        eff_lower_pct  = _dec(self.state.extras.get("weekend_lower_pct")  or cfg.lower_pct)
+        eff_buy_quote  = _dec(self.state.extras.get("compound_buy_quote") or cfg.buy_quote)
+        eff_sell_quote = _dec(self.state.extras.get("compound_sell_quote") or cfg.sell_quote)
+        n_levels = int(self.state.extras.get("weekend_pro_levels") or n_levels)
+
+        # Safety bounds: compound step must stay within 0.3x–4x of config value.
+        # Protects against state corruption, cron race conditions, or runaway compounding.
+        # Weekend half-step (~0.5x) is expected; 0.3x gives headroom. 4x allows ~300% growth.
+        _cfg_bq = _dec(cfg.buy_quote)
+        _cfg_sq = _dec(cfg.sell_quote)
+        if _cfg_bq > 0 and not (Decimal("0.3") * _cfg_bq <= eff_buy_quote <= Decimal("4") * _cfg_bq):
+            LOG.error("SAFETY: compound_buy_quote=%s is outside [0.3x, 4x] of config=%s — "
+                      "reverting to config value", eff_buy_quote, _cfg_bq)
+            eff_buy_quote = _cfg_bq
+        if _cfg_sq > 0 and not (Decimal("0.3") * _cfg_sq <= eff_sell_quote <= Decimal("4") * _cfg_sq):
+            LOG.error("SAFETY: compound_sell_quote=%s is outside [0.3x, 4x] of config=%s — "
+                      "reverting to config value", eff_sell_quote, _cfg_sq)
+            eff_sell_quote = _cfg_sq
+
         orders_to_place: list = []   # collected by both BUY and SELL blocks, placed in parallel
 
         # ---- BUY side: place levels 1..N if fewer than n_levels are tracked ----
@@ -1506,15 +1534,11 @@ class GenericRunner:
         # When the list is partial we cancel the stale remainder and rebuild all levels
         # from scratch around the current ref to avoid mismatched price levels.
         if len(self._get_pro_oid_list(sym, "BUY")) < n_levels:
-            if self._get_pro_oid_list(sym, "BUY"):  # partial — cancel stale before rebuild
-                LOG.info("PRO %s BUY: only %d/%d levels tracked — cancelling stale and rebuilding",
-                         sym, len(self._get_pro_oid_list(sym, "BUY")), n_levels)
-                self._cancel_pro_orders(sym, "BUY")
             buy_levels: list = []
             total_buy_cost = D0
             for k in range(1, n_levels + 1):
                 lvl_price = self._round_price_to_tick(
-                    ref * (Decimal("1") - k * cfg.lower_pct / Decimal("100"))
+                    ref * (Decimal("1") - k * eff_lower_pct / Decimal("100"))
                 )
                 if lvl_price <= D0:
                     continue
@@ -1522,22 +1546,34 @@ class GenericRunner:
                     qty = _dec(cfg.fixed_qty_buy)
                 elif cfg.sizing_mode == "banded_qty":
                     band_mid = (lvl_price // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
-                    qty = self._round_qty_pro(_dec(cfg.buy_quote) / band_mid, strategy)
+                    qty = self._round_qty_pro(eff_buy_quote / band_mid, strategy)
                 else:
-                    qty = self._round_qty_pro(_dec(cfg.buy_quote) / lvl_price, strategy)
+                    qty = self._round_qty_pro(eff_buy_quote / lvl_price, strategy)
                 buy_levels.append((k, lvl_price, qty))
                 total_buy_cost += qty * lvl_price
 
             available_cash = max(self.state.cash - quote_reserve, D0)
-            if total_buy_cost > available_cash and cfg.rebalance_threshold_steps > 0:
-                LOG.info("PRO %s BUY: insufficient cash (need=%s have=%s), rebalancing",
-                         sym, total_buy_cost, available_cash)
-                self._rebalance_sync(sym, strategy, "buy", ref)
-                self._update_extras_crypto({sym: price})
-                available_cash = max(self.state.cash - quote_reserve, D0)
+            tracked_buy = self._get_pro_oid_list(sym, "BUY")
 
             placed_cash = D0
             orders_to_place: list = []
+            if tracked_buy and total_buy_cost > available_cash:
+                # Partial orders already placed but insufficient cash to fill all levels.
+                # Accept the partial — cancel+rebuild would just loop. Skip placement entirely.
+                buy_levels = []
+            else:
+                # Cancel partial orders only if we have enough cash to fill all levels.
+                if tracked_buy and total_buy_cost <= available_cash:
+                    LOG.info("PRO %s BUY: only %d/%d levels tracked — cancelling stale and rebuilding",
+                             sym, len(tracked_buy), n_levels)
+                    self._cancel_pro_orders(sym, "BUY")
+
+                if total_buy_cost > available_cash and cfg.rebalance_threshold_steps > 0:
+                    LOG.info("PRO %s BUY: insufficient cash (need=%s have=%s), rebalancing",
+                             sym, total_buy_cost, available_cash)
+                    self._rebalance_sync(sym, strategy, "buy", ref)
+                    self._update_extras_crypto({sym: price})
+                    available_cash = max(self.state.cash - quote_reserve, D0)
             for k, lvl_price, qty in buy_levels:
                 if qty <= D0:
                     continue
@@ -1548,21 +1584,17 @@ class GenericRunner:
                     break
                 orders_to_place.append((
                     "BUY", k, lvl_price, qty,
-                    f"pro_buy_L{k}|ref-{k}x{float(cfg.lower_pct)}%",
+                    f"pro_buy_L{k}|ref-{k}x{float(eff_lower_pct)}%",
                 ))
                 placed_cash += order_cost
 
         # ---- SELL side: place levels 1..N if fewer than n_levels are tracked ----
         if len(self._get_pro_oid_list(sym, "SELL")) < n_levels:
-            if self._get_pro_oid_list(sym, "SELL"):  # partial — cancel stale before rebuild
-                LOG.info("PRO %s SELL: only %d/%d levels tracked — cancelling stale and rebuilding",
-                         sym, len(self._get_pro_oid_list(sym, "SELL")), n_levels)
-                self._cancel_pro_orders(sym, "SELL")
             sell_levels: list = []
             total_sell_qty = D0
             for k in range(1, n_levels + 1):
                 lvl_price = self._round_price_to_tick(
-                    ref * (Decimal("1") + k * cfg.upper_pct / Decimal("100"))
+                    ref * (Decimal("1") + k * eff_upper_pct / Decimal("100"))
                 )
                 if lvl_price <= D0:
                     continue
@@ -1570,33 +1602,53 @@ class GenericRunner:
                     qty = _dec(cfg.fixed_qty_sell)
                 elif cfg.sizing_mode == "banded_qty":
                     band_mid = (lvl_price // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
-                    qty = self._round_qty_pro(_dec(cfg.sell_quote) / band_mid, strategy)
+                    qty = self._round_qty_pro(eff_sell_quote / band_mid, strategy)
                 else:
-                    qty = self._round_qty_pro(_dec(cfg.sell_quote) / lvl_price, strategy)
+                    qty = self._round_qty_pro(eff_sell_quote / lvl_price, strategy)
                 sell_levels.append((k, lvl_price, qty))
                 total_sell_qty += qty
 
             base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
-            if total_sell_qty > base_qty and cfg.rebalance_threshold_steps > 0:
-                LOG.info("PRO %s SELL: insufficient ETH (need=%s have=%s), rebalancing",
-                         sym, total_sell_qty, base_qty)
-                self._rebalance_sync(sym, strategy, "sell", ref)
-                self._update_extras_crypto({sym: price})
-                base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+            tracked_sell = self._get_pro_oid_list(sym, "SELL")
 
-            placed_qty = D0
-            for k, lvl_price, qty in sell_levels:
-                if qty <= D0:
-                    continue
-                if placed_qty + qty > base_qty:
-                    LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
-                                sym, k, lvl_price)
-                    break
-                orders_to_place.append((
-                    "SELL", k, lvl_price, qty,
-                    f"pro_sell_L{k}|ref+{k}x{float(cfg.upper_pct)}%",
-                ))
-                placed_qty += qty
+            if tracked_sell and total_sell_qty > base_qty:
+                # Partial orders already placed but insufficient inventory to fill all levels.
+                # Accept the partial — cancel+rebuild would just loop. Skip placement entirely.
+                pass
+            else:
+                pending_buys = self._get_pro_oid_list(sym, "BUY")
+                if total_sell_qty > base_qty and cfg.rebalance_threshold_steps > 0 and not pending_buys:
+                    # Only rebalance (buy more ETH) when no BUY orders are pending.
+                    # After a sell fills, the pending BUY will naturally restore ETH when it fills.
+                    # Rebalancing while a BUY is pending would over-buy ETH.
+                    LOG.info("PRO %s SELL: insufficient ETH (need=%s have=%s), rebalancing",
+                             sym, total_sell_qty, base_qty)
+                    self._rebalance_sync(sym, strategy, "sell", ref)
+                    self._update_extras_crypto({sym: price})
+                    base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+                elif total_sell_qty > base_qty and pending_buys:
+                    LOG.info("PRO %s SELL: insufficient ETH (need=%s have=%s) — waiting for pending BUY to fill",
+                             sym, total_sell_qty, base_qty)
+
+                # Cancel partial orders only if we have enough inventory to fill all levels.
+                if tracked_sell and total_sell_qty <= base_qty:
+                    LOG.info("PRO %s SELL: only %d/%d levels tracked — cancelling stale and rebuilding",
+                             sym, len(tracked_sell), n_levels)
+                    self._cancel_pro_orders(sym, "SELL")
+
+                placed_qty = D0
+                for k, lvl_price, qty in sell_levels:
+                    if qty <= D0:
+                        continue
+                    if placed_qty + qty > base_qty:
+                        LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
+                                    sym, k, lvl_price)
+                        break
+                    orders_to_place.append((
+                        "SELL", k, lvl_price, qty,
+                        f"pro_sell_L{k}|ref+{k}x{float(eff_upper_pct)}%",
+                    ))
+                    placed_qty += qty
 
         # ---- Place all collected orders in parallel ----
         if orders_to_place:
@@ -1613,6 +1665,10 @@ class GenericRunner:
         ss = self.state.symbol_states[sym]
         cfg = strategy.cfg
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
+
+        # Weekend/mode overrides (mirrors _place_proactive_orders resolution)
+        eff_upper_pct = _dec(self.state.extras.get("weekend_upper_pct") or cfg.upper_pct)
+        eff_lower_pct = _dec(self.state.extras.get("weekend_lower_pct") or cfg.lower_pct)
 
         # --- Single orderbook fetch for this tick ---
         open_oids: set = set()
@@ -1657,7 +1713,7 @@ class GenericRunner:
             filled_qty, avg_px, cum_q, _ = result
             if filled_qty > D0:
                 fill_px = avg_px if avg_px > D0 else price
-                reason = f"pro_buy|ref-{float(cfg.lower_pct)}%" if side == "BUY" else f"pro_sell|ref+{float(cfg.upper_pct)}%"
+                reason = f"pro_buy|ref-{float(eff_lower_pct)}%" if side == "BUY" else f"pro_sell|ref+{float(eff_upper_pct)}%"
                 self._apply_fill(sym, side, filled_qty, fill_px, cum_q,
                                  reason=reason, order_id=oid, status="FILLED")
                 return True
@@ -1679,7 +1735,7 @@ class GenericRunner:
         # Drift check — only if no fills this iteration (fills take priority)
         if not filled_buy and not filled_sell and ref > D0:
             drift_pct = abs(price - ref) / ref * Decimal("100")
-            drift_threshold = cfg.lower_pct + cfg.upper_pct
+            drift_threshold = eff_lower_pct + eff_upper_pct
             if drift_pct > drift_threshold:
                 LOG.info("PRO %s drift=%.4f%% > threshold=%.4f%%, re-centering ref=%s->%s",
                          sym, float(drift_pct), float(drift_threshold), ref, price)
@@ -1690,11 +1746,11 @@ class GenericRunner:
         # Post-fill: cancel ALL remaining orders on both sides → guard re-center → place fresh N+N
         if filled_buy and not filled_sell:
             self._cancel_pro_orders(sym, "BUY",
-                                    partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+                                    partial_reason=f"pro_buy|ref-{float(eff_lower_pct)}%")
             self._cancel_pro_orders(sym, "SELL",
-                                    partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+                                    partial_reason=f"pro_sell|ref+{float(eff_upper_pct)}%")
             new_ref = _dec(ss.reference_price)
-            new_sell_level = new_ref * (Decimal("1") + cfg.upper_pct / Decimal("100"))
+            new_sell_level = new_ref * (Decimal("1") + eff_upper_pct / Decimal("100"))
             if price >= new_sell_level:
                 LOG.info("PRO %s BUY filled, price=%s >= new_sell=%s, re-centering", sym, price, new_sell_level)
                 ss.reference_price = price
@@ -1703,11 +1759,11 @@ class GenericRunner:
 
         elif filled_sell and not filled_buy:
             self._cancel_pro_orders(sym, "SELL",
-                                    partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+                                    partial_reason=f"pro_sell|ref+{float(eff_upper_pct)}%")
             self._cancel_pro_orders(sym, "BUY",
-                                    partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+                                    partial_reason=f"pro_buy|ref-{float(eff_lower_pct)}%")
             new_ref = _dec(ss.reference_price)
-            new_buy_level = new_ref * (Decimal("1") - cfg.lower_pct / Decimal("100"))
+            new_buy_level = new_ref * (Decimal("1") - eff_lower_pct / Decimal("100"))
             if price <= new_buy_level:
                 LOG.info("PRO %s SELL filled, price=%s <= new_buy=%s, re-centering", sym, price, new_buy_level)
                 ss.reference_price = price
@@ -1718,9 +1774,9 @@ class GenericRunner:
             # Both sides filled in same poll (big move) — cancel all remaining, re-center on current price
             LOG.info("PRO %s both BUY+SELL filled, re-centering ref on price=%s", sym, price)
             self._cancel_pro_orders(sym, "BUY",
-                                    partial_reason=f"pro_buy|ref-{float(cfg.lower_pct)}%")
+                                    partial_reason=f"pro_buy|ref-{float(eff_lower_pct)}%")
             self._cancel_pro_orders(sym, "SELL",
-                                    partial_reason=f"pro_sell|ref+{float(cfg.upper_pct)}%")
+                                    partial_reason=f"pro_sell|ref+{float(eff_upper_pct)}%")
             ss.reference_price = price
             if allow_new:
                 self._place_proactive_orders(sym, strategy, price)

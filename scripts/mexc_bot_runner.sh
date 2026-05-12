@@ -77,6 +77,17 @@ stop_cleanly() {
 
 trap stop_cleanly SIGTERM SIGINT
 
+# ── Single-instance enforcement ───────────────────────────────────────────
+# If another runner or bot instance is already running, exit immediately.
+# Prevents the watchdog or a manual invocation from spawning duplicates.
+
+LOCKFILE="/tmp/mexc_bot_runner.lock"
+exec 9>"$LOCKFILE"
+if ! flock -n 9; then
+    echo "[runner] Another runner instance already holds the lock — exiting."
+    exit 0
+fi
+
 # ── Main loop ──────────────────────────────────────────────────────────────
 
 echo "[runner] Starting bot runner (PID $$)"
