@@ -154,6 +154,7 @@ def main() -> None:
         pro_levels=int(ex.get("pro_levels") or 1),
         mtf_leverage=to_decimal(ex.get("mtf_leverage") or 0),
         isolated_cash=bool(ex.get("isolated_cash", False)),
+        max_pro_sell_qty=(int(ex["max_pro_sell_qty"]) if ex.get("max_pro_sell_qty") else None),
     )
 
     state = GlobalState.load(state_path)

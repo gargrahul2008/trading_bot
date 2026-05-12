@@ -1,7 +1,7 @@
 {
   "_comment": "SHISHIND sell-first grid — 30,000 shares from existing holdings, zero new capital",
   "_capital_notes": {
-    "symbol": "NSE:SHISHIND-EQ",
+    "symbol": "BSE:SHISHIND-B",
     "reference_price": 12.78,
     "shares_per_level": 5000,
     "levels": 6,
@@ -17,15 +17,16 @@
   "broker": {
     "type": "fyers",
     "auth_mode": "http",
-    "token_url": "http://MAIN_VPS_IP:8502/token",
-    "token_secret": "REPLACE_WITH_SECRET_FROM_scripts/token_server_secret.txt",
+    "token_url": "http://64.227.135.117:8502/token",
+    "token_secret": "48f0392ef758cfafdff208938a49853fba471071f57baa4f",
     "user_key": "user2",
     "log_path": ""
   },
   "strategy": {
-    "symbols": ["NSE:SHISHIND-EQ"],
+    "symbols": ["BSE:SHISHIND-B"],
     "upper_pct": 0.7,
     "lower_pct": 0.7,
+    "pro_drift_recenter": false,
     "sizing_mode": "fixed_qty",
     "fixed_qty_buy": 5000,
     "fixed_qty_sell": 5000,
@@ -37,6 +38,7 @@
     "product_type": "CNC",
     "isolated_cash": true,
     "pro_levels": 6,
+    "max_pro_sell_qty": 30000,
     "allow_btst_auto": true,
     "sync_on_start": true,
     "adopt_broker_inventory": true,

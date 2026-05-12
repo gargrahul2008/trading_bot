@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, Optional
 
 from common.engine.strategy_base import OrderIntent
 
@@ -51,6 +51,12 @@ class LadderPctConfig:
     # 0 = disabled; e.g. threshold=4, target=8
     rebalance_threshold_steps: int = 0
     rebalance_target_steps: int = 8
+
+    # Drift re-centering: when price drifts > pro_drift_pct% from ref, re-center.
+    # Set pro_drift_recenter=False to disable (bot places in-the-money orders instead).
+    # pro_drift_pct: custom threshold %; if None, uses lower_pct + upper_pct.
+    pro_drift_recenter: bool = True
+    pro_drift_pct: Optional[Decimal] = None
 
 class LadderPctStrategy:
     def __init__(self, cfg: LadderPctConfig):
@@ -207,5 +213,7 @@ def create_strategy(strategy_cfg: dict) -> LadderPctStrategy:
         min_qty=_dec(strategy_cfg.get("min_qty", 0)),
         rebalance_threshold_steps=int(strategy_cfg.get("rebalance_threshold_steps", 0)),
         rebalance_target_steps=int(strategy_cfg.get("rebalance_target_steps", 8)),
+        pro_drift_recenter=bool(strategy_cfg.get("pro_drift_recenter", True)),
+        pro_drift_pct=_dec(strategy_cfg["pro_drift_pct"]) if strategy_cfg.get("pro_drift_pct") is not None else None,
     )
     return LadderPctStrategy(cfg)

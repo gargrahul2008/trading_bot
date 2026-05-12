@@ -30,6 +30,7 @@ class ExecutionConfig:
     pro_levels: int = 1                 # number of resting limit orders per side in proactive mode
     mtf_leverage: Decimal = D0          # MTF leverage multiplier (e.g. 3 for 3X); 0/1 = no leverage (default)
     isolated_cash: bool = False         # if True: skip funds_cash() sync on startup; cash tracked from fills only
+    max_pro_sell_qty: Optional[int] = None  # hard cap on cumulative net PRO sells per symbol; None = unlimited
 
 class OrderExecutor:
     def __init__(self, broker: Broker, state, cfg: ExecutionConfig, *, rejects_path: str):
@@ -139,7 +140,7 @@ class OrderExecutor:
         )
         return sellable
 
-    def place_with_adaptive_qty(self, req: PlaceOrderRequest, *, reason: str) -> Optional[str]:
+    def place_with_adaptive_qty(self, req: PlaceOrderRequest, *, reason: str, sellable_hint: Optional[Decimal] = None) -> Optional[str]:
         symbol = req.symbol
         side = req.side
         qty = Decimal(req.qty)
@@ -148,7 +149,7 @@ class OrderExecutor:
             return None
 
         if side == "SELL":
-            sellable = self.compute_broker_sellable(symbol)
+            sellable = sellable_hint if sellable_hint is not None else self.compute_broker_sellable(symbol)
             allow_buffer = bool(self.state.extras.get("use_inventory_buffer"))
 
             if allow_buffer:
