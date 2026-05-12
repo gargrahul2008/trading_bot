@@ -31,6 +31,7 @@ class ExecutionConfig:
     mtf_leverage: Decimal = D0          # MTF leverage multiplier (e.g. 3 for 3X); 0/1 = no leverage (default)
     isolated_cash: bool = False         # if True: skip funds_cash() sync on startup; cash tracked from fills only
     max_pro_sell_qty: Optional[int] = None  # hard cap on cumulative net PRO sells per symbol; None = unlimited
+    pro_disclosed_pct: Decimal = D0    # fraction of order qty to disclose (e.g. 0.10 = 10%); 0 = no disclosed qty
 
 class OrderExecutor:
     def __init__(self, broker: Broker, state, cfg: ExecutionConfig, *, rejects_path: str):

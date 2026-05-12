@@ -58,6 +58,11 @@ class LadderPctConfig:
     pro_drift_recenter: bool = True
     pro_drift_pct: Optional[Decimal] = None
 
+    # Fixed absolute price step (e.g. 0.09). When set, overrides upper_pct/lower_pct for
+    # grid level pricing so that ref ± k*fixed_step gives exact, reusable prices across
+    # fills — enabling smart order reuse instead of cancel-all + place-all on each fill.
+    fixed_step: Optional[Decimal] = None
+
 class LadderPctStrategy:
     def __init__(self, cfg: LadderPctConfig):
         self.cfg = cfg
@@ -215,5 +220,6 @@ def create_strategy(strategy_cfg: dict) -> LadderPctStrategy:
         rebalance_target_steps=int(strategy_cfg.get("rebalance_target_steps", 8)),
         pro_drift_recenter=bool(strategy_cfg.get("pro_drift_recenter", True)),
         pro_drift_pct=_dec(strategy_cfg["pro_drift_pct"]) if strategy_cfg.get("pro_drift_pct") is not None else None,
+        fixed_step=_dec(strategy_cfg["fixed_step"]) if strategy_cfg.get("fixed_step") is not None else None,
     )
     return LadderPctStrategy(cfg)
