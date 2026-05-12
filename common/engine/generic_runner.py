@@ -82,6 +82,7 @@ class GenericRunner:
             ledger_path=_ledger_path if os.path.exists(_ledger_path) else None,
         )
         self._last_price_point: Dict[str, str] = {}
+        self._pro_oid_qty: Dict[str, Decimal] = {}  # oid -> intended qty, for partial-fill detection
         os.makedirs(os.path.dirname(self.price_points_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(self.pnl_daily_path) or ".", exist_ok=True)
         os.makedirs(os.path.dirname(self.price_daily_path) or ".", exist_ok=True)
@@ -528,6 +529,16 @@ class GenericRunner:
             ss.pending_order_id = None
             ss.pending_reason = None
             ss.pending_since = None
+
+        # Track cumulative net PRO sells for max_pro_sell_qty cap
+        max_pro_sell = getattr(self.exec_cfg, "max_pro_sell_qty", None)
+        if max_pro_sell and qty > 0:
+            _key = f"pro_net_sold_{symbol}"
+            _cur = _dec(self.state.extras.get(_key, "0"))
+            if reason.startswith("pro_sell"):
+                self.state.extras[_key] = str(_cur + qty)
+            elif reason.startswith("pro_buy"):
+                self.state.extras[_key] = str(max(D0, _cur - qty))
 
         expected = _dec(ss.pending_expected_price) if ss.pending_expected_price is not None else D0
         expected_src = ss.pending_expected_source or None
@@ -1202,14 +1213,18 @@ class GenericRunner:
         old = self.state.extras.get(old_key)
         return [old] if old else []
 
-    def _add_pro_oid(self, sym: str, side: str, oid: str) -> None:
+    def _add_pro_oid(self, sym: str, side: str, oid: str, qty: Decimal = D0) -> None:
         key = f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"
         lst = self._get_pro_oid_list(sym, side)
         if oid not in lst:
             lst.append(oid)
         self.state.extras[key] = lst
+        if qty > D0:
+            self._pro_oid_qty[oid] = qty
 
     def _clear_pro_oids(self, sym: str, side: str) -> None:
+        for oid in self._get_pro_oid_list(sym, side):
+            self._pro_oid_qty.pop(oid, None)
         self.state.extras[f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"] = []
         self.state.extras.pop(f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}", None)
 
@@ -1220,6 +1235,7 @@ class GenericRunner:
         if oid in lst:
             lst.remove(oid)
         self.state.extras[key] = lst
+        self._pro_oid_qty.pop(oid, None)
 
     # Legacy single-oid shims used by status logging and snapshot
     def _get_pro_oids(self, sym: str):
@@ -1445,12 +1461,14 @@ class GenericRunner:
                                  reason="rebalance_restore", order_id=oid, status="FILLED")
             return terminal
 
-    def _place_orders_parallel(self, sym: str, orders: list) -> None:
+    def _place_orders_parallel(self, sym: str, orders: list, *, pre_sellable=None) -> None:
         """
         Place multiple orders concurrently using a thread pool.
         Each entry in `orders` is (side, level_k, limit_price, qty, reason).
         Results are collected and OIDs registered after all threads complete.
         Falls back to sequential placement if threading fails.
+        pre_sellable: if provided, used as the sellable qty for SELL orders instead of
+        fetching from broker per-thread (avoids N concurrent positions/holdings API calls).
         """
         import concurrent.futures
 
@@ -1461,7 +1479,8 @@ class GenericRunner:
                 product_type=self.exec_cfg.product_type,
                 order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
             )
-            oid = self.exec.place_with_adaptive_qty(req, reason=reason)
+            hint = pre_sellable if side == "SELL" else None
+            oid = self.exec.place_with_adaptive_qty(req, reason=reason, sellable_hint=hint)
             return side, k, lvl_price, qty, oid
 
         try:
@@ -1471,7 +1490,7 @@ class GenericRunner:
                     try:
                         side, k, lvl_price, qty, oid = fut.result()
                         if oid:
-                            self._add_pro_oid(sym, side, oid)
+                            self._add_pro_oid(sym, side, oid, qty)
                             LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s",
                                      sym, side, k, oid, qty, lvl_price)
                     except Exception as e:
@@ -1484,9 +1503,10 @@ class GenericRunner:
                     product_type=self.exec_cfg.product_type,
                     order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
                 )
-                oid = self.exec.place_with_adaptive_qty(req, reason=reason)
+                hint = pre_sellable if side == "SELL" else None
+                oid = self.exec.place_with_adaptive_qty(req, reason=reason, sellable_hint=hint)
                 if oid:
-                    self._add_pro_oid(sym, side, oid)
+                    self._add_pro_oid(sym, side, oid, qty)
                     LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s",
                              sym, side, k, oid, qty, lvl_price)
 
@@ -1588,8 +1608,28 @@ class GenericRunner:
                 ))
                 placed_cash += order_cost
 
+            # Track how many of the placed buy orders are above current market price
+            # (in-the-money). Used by the post-fill step-down to shift ref by exactly
+            # this count, so the rebuild doesn't repeat the same above-market levels.
+            _itm = sum(1 for e in orders_to_place if e[2] > price)
+            self.state.extras[f"_itm_buy_placed_{sym}"] = _itm
+
         # ---- SELL side: place levels 1..N if fewer than n_levels are tracked ----
-        if len(self._get_pro_oid_list(sym, "SELL")) < n_levels:
+        # Compute remaining sell capacity against the hard cap (if configured)
+        max_pro_sell = getattr(self.exec_cfg, "max_pro_sell_qty", None)
+        remaining_sell_cap: "Decimal | None" = None
+        if max_pro_sell:
+            net_sold = _dec(self.state.extras.get(f"pro_net_sold_{sym}", "0"))
+            remaining_sell_cap = max(D0, _dec(str(max_pro_sell)) - net_sold)
+            if remaining_sell_cap <= D0:
+                LOG.info("PRO %s SELL: max_pro_sell_qty=%s reached (net_sold=%s) — no sell orders",
+                         sym, max_pro_sell, net_sold)
+
+        _do_place_sell = (
+            len(self._get_pro_oid_list(sym, "SELL")) < n_levels
+            and (remaining_sell_cap is None or remaining_sell_cap > D0)
+        )
+        if _do_place_sell:
             sell_levels: list = []
             total_sell_qty = D0
             for k in range(1, n_levels + 1):
@@ -1644,15 +1684,33 @@ class GenericRunner:
                         LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
                                     sym, k, lvl_price)
                         break
+                    if remaining_sell_cap is not None and placed_qty + qty > remaining_sell_cap:
+                        LOG.info("PRO %s SELL L%d @ %s: max_pro_sell_qty cap reached (remaining=%s), stopping",
+                                 sym, k, lvl_price, remaining_sell_cap)
+                        break
                     orders_to_place.append((
                         "SELL", k, lvl_price, qty,
                         f"pro_sell_L{k}|ref+{k}x{float(eff_upper_pct)}%",
                     ))
                     placed_qty += qty
 
+            # Track how many of the placed sell orders are below current market price
+            # (in-the-money). Used by the post-fill step-up to shift ref by exactly
+            # this count, so the rebuild doesn't repeat the same below-market levels.
+            _itm_sell = sum(1 for e in orders_to_place if e[0] == "SELL" and e[2] < price)
+            self.state.extras[f"_itm_sell_placed_{sym}"] = _itm_sell
+
         # ---- Place all collected orders in parallel ----
         if orders_to_place:
-            self._place_orders_parallel(sym, orders_to_place)
+            # Pre-fetch sellable once so parallel SELL threads don't each call
+            # positions() + holdings() + orderbook() — that burst triggers -429.
+            pre_sellable = None
+            if any(entry[0] == "SELL" for entry in orders_to_place):
+                try:
+                    pre_sellable = self.exec.compute_broker_sellable(sym)
+                except Exception as e:
+                    LOG.warning("PRO %s: sellable pre-fetch failed (%s) — fetching per order", sym, e)
+            self._place_orders_parallel(sym, orders_to_place, pre_sellable=pre_sellable)
 
     def _poll_proactive_symbol(self, sym: str, strategy, price: Decimal, allow_new: bool = True) -> None:
         """
@@ -1688,6 +1746,9 @@ class GenericRunner:
             LOG.warning("PRO %s: orderbook fetch failed: %s — skipping tick", sym, e)
             return
 
+        # Cache for _place_proactive_orders to detect cash-limited (vs stale) partial sets
+        self._last_open_oids = open_oids
+
         def _check_terminal(side: str, oid: str) -> bool:
             """Returns True if a fill was recorded, removes OID from tracking."""
             nonlocal filled_buy, filled_sell
@@ -1714,8 +1775,15 @@ class GenericRunner:
             if filled_qty > D0:
                 fill_px = avg_px if avg_px > D0 else price
                 reason = f"pro_buy|ref-{float(eff_lower_pct)}%" if side == "BUY" else f"pro_sell|ref+{float(eff_upper_pct)}%"
+                intended_qty = self._pro_oid_qty.get(oid, D0)
+                is_partial = intended_qty > D0 and filled_qty < intended_qty
+                if is_partial:
+                    remainder = intended_qty - filled_qty
+                    LOG.warning("PRO %s %s partial fill oid=%s: filled=%s of %s (remainder=%s @ intended %.4f) — ref unchanged",
+                                sym, side, oid, filled_qty, intended_qty, remainder, float(fill_px))
                 self._apply_fill(sym, side, filled_qty, fill_px, cum_q,
-                                 reason=reason, order_id=oid, status="FILLED")
+                                 reason=reason, order_id=oid, status="FILLED",
+                                 skip_ref_update=is_partial)
                 return True
             else:
                 LOG.info("PRO %s %s terminal (no fill) oid=%s", sym, side, oid)
@@ -1732,10 +1800,13 @@ class GenericRunner:
             if _check_terminal("SELL", oid):
                 filled_sell = True
 
-        # Drift check — only if no fills this iteration (fills take priority)
-        if not filled_buy and not filled_sell and ref > D0:
+        # Drift re-center — configurable via pro_drift_recenter / pro_drift_pct on strategy cfg.
+        # Only fires when no fills this iteration (fills take priority).
+        _drift_enabled = getattr(cfg, "pro_drift_recenter", True)
+        if _drift_enabled and not filled_buy and not filled_sell and ref > D0:
             drift_pct = abs(price - ref) / ref * Decimal("100")
-            drift_threshold = eff_lower_pct + eff_upper_pct
+            _custom_pct = getattr(cfg, "pro_drift_pct", None)
+            drift_threshold = _dec(str(_custom_pct)) if _custom_pct is not None else (eff_lower_pct + eff_upper_pct)
             if drift_pct > drift_threshold:
                 LOG.info("PRO %s drift=%.4f%% > threshold=%.4f%%, re-centering ref=%s->%s",
                          sym, float(drift_pct), float(drift_threshold), ref, price)
@@ -1750,10 +1821,25 @@ class GenericRunner:
             self._cancel_pro_orders(sym, "SELL",
                                     partial_reason=f"pro_sell|ref+{float(eff_upper_pct)}%")
             new_ref = _dec(ss.reference_price)
+            l1_buy_price = new_ref * (Decimal("1") - eff_lower_pct / Decimal("100"))
             new_sell_level = new_ref * (Decimal("1") + eff_upper_pct / Decimal("100"))
             if price >= new_sell_level:
+                # Guard re-center: price ran past sell level after buy
                 LOG.info("PRO %s BUY filled, price=%s >= new_sell=%s, re-centering", sym, price, new_sell_level)
                 ss.reference_price = price
+            elif price < l1_buy_price:
+                # In-the-money fill: one or more orders were placed above market (gap open).
+                # Step ref down by exactly the number of ITM orders that were placed so
+                # the next rebuild's L1 lands below current price, stopping the loop.
+                itm_count = int(self.state.extras.get(f"_itm_buy_placed_{sym}", 0))
+                if itm_count > 0:
+                    new_stepped_ref = new_ref
+                    for _ in range(itm_count):
+                        new_stepped_ref = new_stepped_ref * (Decimal("1") - cfg.lower_pct / Decimal("100"))
+                    LOG.info("PRO %s BUY %d in-the-money fill(s), stepping ref %s->%s",
+                             sym, itm_count, new_ref, new_stepped_ref)
+                    ss.reference_price = new_stepped_ref
+                    self.state.extras[f"_itm_buy_placed_{sym}"] = 0
             if allow_new:
                 self._place_proactive_orders(sym, strategy, price)
 
@@ -1763,10 +1849,25 @@ class GenericRunner:
             self._cancel_pro_orders(sym, "BUY",
                                     partial_reason=f"pro_buy|ref-{float(eff_lower_pct)}%")
             new_ref = _dec(ss.reference_price)
+            l1_sell_price = new_ref * (Decimal("1") + eff_upper_pct / Decimal("100"))
             new_buy_level = new_ref * (Decimal("1") - eff_lower_pct / Decimal("100"))
             if price <= new_buy_level:
+                # Guard re-center: price dropped past buy level after sell
                 LOG.info("PRO %s SELL filled, price=%s <= new_buy=%s, re-centering", sym, price, new_buy_level)
                 ss.reference_price = price
+            elif price > l1_sell_price:
+                # In-the-money fill: one or more sell orders were placed below market (gap up).
+                # Step ref up by exactly the number of ITM orders placed so the next
+                # rebuild's SELL L1 lands above current price, stopping the loop.
+                itm_count = int(self.state.extras.get(f"_itm_sell_placed_{sym}", 0))
+                if itm_count > 0:
+                    new_stepped_ref = new_ref
+                    for _ in range(itm_count):
+                        new_stepped_ref = new_stepped_ref * (Decimal("1") + cfg.upper_pct / Decimal("100"))
+                    LOG.info("PRO %s SELL %d in-the-money fill(s), stepping ref %s->%s",
+                             sym, itm_count, new_ref, new_stepped_ref)
+                    ss.reference_price = new_stepped_ref
+                    self.state.extras[f"_itm_sell_placed_{sym}"] = 0
             if allow_new:
                 self._place_proactive_orders(sym, strategy, price)
 

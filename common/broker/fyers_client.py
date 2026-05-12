@@ -147,10 +147,13 @@ class FyersClient(Broker):
         # Other brokers use string statuses.
         if isinstance(status_int, int):
             if status_int == 1:
+                # Partially filled then cancelled: preserve the actual filled qty so the
+                # caller can recover it. A fully unexecuted cancel has filled=0.
+                cum_quote = avg_price * to_decimal(filled) if avg_price > 0 else to_decimal(0)
                 return OrderTerminal(
                     order_id=str(order_id), symbol=sym, side=side,  # type: ignore
-                    status="CANCELLED", filled_qty=to_decimal(0), avg_price=to_decimal(0),
-                    cum_quote_qty=to_decimal(0),
+                    status="CANCELLED", filled_qty=to_decimal(filled), avg_price=avg_price,
+                    cum_quote_qty=cum_quote,
                     message=str(found.get("message") or found.get("msg") or ""),
                     ts=dt.datetime.now(dt.timezone.utc), raw=found,
                 )
@@ -168,10 +171,12 @@ class FyersClient(Broker):
         else:
             status_raw = str(status_int or "").upper()
             if status_raw in {"REJECTED", "CANCELLED", "CANCELED"}:
+                # Preserve partial fills on cancelled orders (same as integer path above).
+                cum_quote = avg_price * to_decimal(filled) if avg_price > 0 else to_decimal(0)
                 return OrderTerminal(
                     order_id=str(order_id), symbol=sym, side=side,  # type: ignore
                     status="REJECTED" if status_raw == "REJECTED" else "CANCELLED",
-                    filled_qty=to_decimal(0), avg_price=to_decimal(0), cum_quote_qty=to_decimal(0),
+                    filled_qty=to_decimal(filled), avg_price=avg_price, cum_quote_qty=cum_quote,
                     message=str(found.get("message") or found.get("msg") or ""),
                     ts=dt.datetime.now(dt.timezone.utc), raw=found,
                 )
