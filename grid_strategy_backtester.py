@@ -49,6 +49,8 @@ class GridStrategyBacktester:
         self.total_fees = 0.0
         self.total_interest = 0.0
         self.last_buy_price: Optional[float] = None
+        self.last_sell_price: Optional[float] = None
+        self.base_anchor_price: Optional[float] = None
 
         self.trades: List[Dict[str, Any]] = []
         self.equity: List[Dict[str, Any]] = []
@@ -190,6 +192,8 @@ class GridStrategyBacktester:
             "reason": reason,
             "lot_tag": tag,
             "mode": self.mode(),
+            "last_buy_price_after": self.last_buy_price,
+            "last_sell_price_after": self.last_sell_price,
             "open_qty_after": self.open_qty,
             "core_open_qty_after": self.core_open_qty,
             "grid_open_qty_after": self.grid_open_qty,
@@ -226,6 +230,8 @@ class GridStrategyBacktester:
             "realized_this_sell": realized_this_sell,
             "sold_lot_price": sold_from_lot_price,
             "sold_lot_tag": sold_lot_tag,
+            "last_buy_price_after": self.last_buy_price,
+            "last_sell_price_after": self.last_sell_price,
             "open_qty_after": self.open_qty,
             "core_open_qty_after": self.core_open_qty,
             "grid_open_qty_after": self.grid_open_qty,
@@ -278,6 +284,8 @@ class GridStrategyBacktester:
             "mode": self.mode(),
             "realized_this_sell": realized_this_sell,
             "sold_lot_tag": last_sold_tag if qty - remaining > 0 else None,
+            "last_buy_price_after": self.last_buy_price,
+            "last_sell_price_after": self.last_sell_price,
             "open_qty_after": self.open_qty,
             "core_open_qty_after": self.core_open_qty,
             "grid_open_qty_after": self.grid_open_qty,
@@ -289,6 +297,10 @@ class GridStrategyBacktester:
 
     def sell_grid_lifo(self, dt, qty: int, price: float, reason: str):
         self.sell_tagged_lifo(dt, qty, price, reason, allowed_tags={"grid"})
+        if qty > 0:
+            self.last_sell_price = price
+            if self.trades:
+                self.trades[-1]["last_sell_price_after"] = self.last_sell_price
 
     def next_buy_gap(self) -> float:
         if self.mode() == "CAUTION":
@@ -327,6 +339,55 @@ class GridStrategyBacktester:
             return None
         return self.lots[lot_index].price * (1 + self.cfg.min_profit_pct)
 
+    def upper_sell_anchor_price(self) -> Optional[float]:
+        if self.grid_open_qty <= 0:
+            return None
+        if self.last_sell_price is not None:
+            return self.last_sell_price
+        return self.base_anchor_price
+
+    def upper_sell_target_price(self) -> Optional[float]:
+        anchor = self.upper_sell_anchor_price()
+        if anchor is None:
+            return None
+        return anchor * (1 + self.cfg.grid_pct)
+
+    def next_buy_candidates(self) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+
+        if self.last_buy_price is not None:
+            candidates.append({
+                "threshold": self.last_buy_price * (1 - self.next_buy_gap()),
+                "reason": f"{self.mode().lower()} grid buy",
+            })
+
+        if self.last_sell_price is not None:
+            candidates.append({
+                "threshold": self.last_sell_price * (1 - self.cfg.grid_pct),
+                "reason": "upper grid buyback",
+            })
+
+        return candidates
+
+    def next_sell_candidates(self) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+
+        latest_lot_target = self.sell_target_for_latest_lot()
+        if latest_lot_target is not None:
+            candidates.append({
+                "threshold": latest_lot_target,
+                "reason": "grid target hit",
+            })
+
+        upper_target = self.upper_sell_target_price()
+        if upper_target is not None:
+            candidates.append({
+                "threshold": upper_target,
+                "reason": "upper grid trim",
+            })
+
+        return candidates
+
     def maybe_sell(self, dt, high_price: float, close_price: float, max_sells: Optional[int] = None) -> int:
         sells_done = 0
         intrabar_mode = self.effective_intrabar_mode()
@@ -335,28 +396,38 @@ class GridStrategyBacktester:
             if max_sells is not None and sells_done >= max_sells:
                 return sells_done
 
-            target = self.sell_target_for_latest_lot()
-            if target is None:
+            candidates = self.next_sell_candidates()
+            if not candidates:
                 return sells_done
 
-            if intrabar_mode == "close_only":
-                trigger = close_price >= target
-                fill_price = close_price
-            else:
-                trigger = high_price >= target
-                fill_price = target
+            triggered_candidates = []
+            for candidate in candidates:
+                threshold = float(candidate["threshold"])
+                if intrabar_mode == "close_only":
+                    trigger = close_price >= threshold
+                    fill_price = close_price
+                else:
+                    trigger = high_price >= threshold
+                    fill_price = threshold
 
-            if not trigger:
+                if trigger:
+                    triggered_candidates.append({
+                        **candidate,
+                        "fill_price": fill_price,
+                    })
+
+            if not triggered_candidates:
                 return sells_done
 
+            chosen = min(triggered_candidates, key=lambda item: float(item["threshold"]))
             sell_qty = self.cfg.chunk_qty
-            reason = "grid target hit"
+            reason = str(chosen["reason"])
 
             if self.improved and self.mode() == "RECOVERY":
                 sell_qty += self.cfg.recovery_extra_sell_qty
-                reason = "recovery: grid sell + inventory reduction"
+                reason = f"recovery: {reason} + inventory reduction"
 
-            self.sell_grid_lifo(dt, sell_qty, fill_price, reason)
+            self.sell_grid_lifo(dt, sell_qty, float(chosen["fill_price"]), reason)
             sells_done += 1
 
             if intrabar_mode in {"close_only", "one_order_per_candle", "conservative"}:
@@ -365,26 +436,35 @@ class GridStrategyBacktester:
         return sells_done
 
     def maybe_buy(self, dt, low_price: float, close_price: float) -> bool:
-        if self.last_buy_price is None:
+        candidates = self.next_buy_candidates()
+        if not candidates:
             return False
 
-        gap = self.next_buy_gap()
-        next_buy_price = self.last_buy_price * (1 - gap)
         intrabar_mode = self.effective_intrabar_mode()
+        triggered_candidates = []
 
-        if intrabar_mode == "close_only":
-            trigger = close_price <= next_buy_price
-            fill_price = close_price
-        else:
-            trigger = low_price <= next_buy_price
-            fill_price = next_buy_price
+        for candidate in candidates:
+            threshold = float(candidate["threshold"])
+            if intrabar_mode == "close_only":
+                trigger = close_price <= threshold
+                fill_price = close_price
+            else:
+                trigger = low_price <= threshold
+                fill_price = threshold
 
-        if not trigger:
+            if trigger:
+                triggered_candidates.append({
+                    **candidate,
+                    "fill_price": fill_price,
+                })
+
+        if not triggered_candidates:
             return False
 
-        reason = f"{self.mode().lower()} grid buy"
+        chosen = max(triggered_candidates, key=lambda item: float(item["threshold"]))
+        reason = str(chosen["reason"])
         prior_trade_count = len(self.trades)
-        self.buy(dt, self.cfg.chunk_qty, fill_price, reason, tag="grid")
+        self.buy(dt, self.cfg.chunk_qty, float(chosen["fill_price"]), reason, tag="grid")
         return len(self.trades) > prior_trade_count and self.trades[-1]["side"] == "BUY"
 
     def maybe_repair(self, dt, close_price: float) -> bool:
@@ -419,6 +499,9 @@ class GridStrategyBacktester:
             close_price,
             "repair: use booked profit to reduce highest-cost inventory",
         )
+        self.last_sell_price = close_price
+        if self.trades:
+            self.trades[-1]["last_sell_price_after"] = self.last_sell_price
         return True
 
     def mark_equity(self, dt, price: float):
@@ -440,6 +523,9 @@ class GridStrategyBacktester:
             "grid_unrealized_pnl": self.unrealized_pnl_by_tag(price, "grid"),
             "total_fees": self.total_fees,
             "total_interest": self.total_interest,
+            "base_anchor_price": self.base_anchor_price,
+            "last_buy_price": self.last_buy_price,
+            "last_sell_price": self.last_sell_price,
             "mtf_borrowed_amount": self.mtf_borrowed_amount(),
             "mtf_borrowed_fraction": self.mtf_borrowed_fraction(),
             "total_pnl": self.total_pnl(price),
@@ -480,10 +566,12 @@ class GridStrategyBacktester:
     def initialize_position(self, dt, price: float):
         core_qty = self.target_core_qty()
         initial_grid_qty = self.cfg.initial_qty - core_qty
+        self.base_anchor_price = price
 
         self.buy(dt, core_qty, price, "initial core buy", tag="core")
         if initial_grid_qty > 0:
             self.buy(dt, initial_grid_qty, price, "initial grid buy", tag="grid")
+            self.last_sell_price = price
 
     def run(self, price_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         df = price_df.copy()
@@ -523,9 +611,8 @@ class GridStrategyBacktester:
             self.accrue_interest(dt, previous_dt)
 
             if intrabar_mode == "conservative":
-                buy_hit = self.last_buy_price is not None and low <= self.last_buy_price * (1 - self.next_buy_gap())
-                sell_target = self.sell_target_for_latest_lot()
-                sell_hit = sell_target is not None and high >= sell_target
+                buy_hit = any(low <= float(candidate["threshold"]) for candidate in self.next_buy_candidates())
+                sell_hit = any(high >= float(candidate["threshold"]) for candidate in self.next_sell_candidates())
 
                 if buy_hit:
                     self.maybe_buy(dt, low, close)
