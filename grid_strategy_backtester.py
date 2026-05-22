@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from common.broker.auth_json import get_fyers_creds_from_json
+from common.broker.auth_json import get_fyers_creds_from_json, list_fyers_users
 
 
 @dataclass
@@ -524,13 +524,39 @@ def fetch_fyers_history(symbol: str, start: str, end: str, resolution: str = "1"
     if not client_id or not access_token:
         auth_file = os.getenv("FYERS_AUTH_FILE", "fyers_auth.json")
         user_key = os.getenv("FYERS_USER_KEY", "user1")
-        try:
-            client_id, access_token = get_fyers_creds_from_json(auth_file, user_key=user_key)
-        except Exception as exc:
+        auth_candidates = []
+        raw_auth_path = os.path.expanduser(auth_file)
+        if os.path.isabs(raw_auth_path):
+            auth_candidates.append(raw_auth_path)
+        else:
+            auth_candidates.append(os.path.abspath(raw_auth_path))
+            auth_candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), raw_auth_path))
+
+        seen = set()
+        auth_candidates = [path for path in auth_candidates if not (path in seen or seen.add(path))]
+        last_error = None
+
+        for candidate in auth_candidates:
+            if not os.path.exists(candidate):
+                last_error = f"auth file not found: {candidate}"
+                continue
+            try:
+                client_id, access_token = get_fyers_creds_from_json(candidate, user_key=user_key)
+                break
+            except Exception as exc:
+                try:
+                    available_users = sorted(list_fyers_users(candidate).keys())
+                except Exception:
+                    available_users = []
+                last_error = (
+                    f"failed to load FYERS auth from {candidate} for {user_key}: {exc}. "
+                    f"Available users: {available_users}"
+                )
+        else:
             raise RuntimeError(
                 "Missing FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables, "
-                f"and failed to load FYERS auth from {auth_file} for {user_key}: {exc}"
-            ) from exc
+                f"and FYERS auth fallback failed. Tried {auth_candidates}. Last error: {last_error}"
+            )
 
     if not client_id or not access_token:
         raise RuntimeError(
