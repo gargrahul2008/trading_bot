@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from common.broker.auth_json import get_fyers_creds_from_json
+
 
 @dataclass
 class Lot:
@@ -520,9 +522,20 @@ def fetch_fyers_history(symbol: str, start: str, end: str, resolution: str = "1"
     access_token = os.getenv("FYERS_ACCESS_TOKEN")
 
     if not client_id or not access_token:
+        auth_file = os.getenv("FYERS_AUTH_FILE", "fyers_auth.json")
+        user_key = os.getenv("FYERS_USER_KEY", "user1")
+        try:
+            client_id, access_token = get_fyers_creds_from_json(auth_file, user_key=user_key)
+        except Exception as exc:
+            raise RuntimeError(
+                "Missing FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables, "
+                f"and failed to load FYERS auth from {auth_file} for {user_key}: {exc}"
+            ) from exc
+
+    if not client_id or not access_token:
         raise RuntimeError(
-            "Missing FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables. "
-            "Do not hardcode credentials in the script."
+            "Missing FYERS auth. Set FYERS_CLIENT_ID/FYERS_ACCESS_TOKEN or provide "
+            "FYERS_AUTH_FILE and FYERS_USER_KEY for fyers_auth.json fallback."
         )
 
     fyers = fyersModel.FyersModel(
