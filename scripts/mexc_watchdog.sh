@@ -2,19 +2,19 @@
 # mexc_watchdog.sh — Cron watchdog: ensures MEXC bot is always running.
 #
 # Runs every minute via cron. If neither the bot nor the runner script is
-# alive, it restarts the runner inside the 'mexc' screen session and sends
-# a Telegram alert.
+# alive, it restarts the runner as a background process and sends a Telegram alert.
+# Runner output is appended to logs/mexc_runner.log.
 #
 # Crontab entry (add with: crontab -e):
 #   * * * * * /root/trading_bot/scripts/mexc_watchdog.sh >> /root/trading_bot/logs/mexc_watchdog.log 2>&1
 
 cd /root/trading_bot
 
-SCREEN_NAME="mexc"
 RUNNER="scripts/mexc_bot_runner.sh"
 SECRETS="strategies/pct_ladder/secrets/telegram.json"
 PYTHON="env/bin/python"
 LOCKFILE="/tmp/mexc_watchdog.lock"
+RUNNER_LOG="logs/mexc_runner.log"
 
 # ── Prevent concurrent watchdog runs ──────────────────────────────────────
 exec 9>"$LOCKFILE"
@@ -31,7 +31,7 @@ fi
 
 # ── Bot is down — alert and restart ───────────────────────────────────────
 NOW=$(date '+%Y-%m-%d %H:%M:%S')
-echo "[$NOW] MEXC bot not running — restarting via screen '$SCREEN_NAME'"
+echo "[$NOW] MEXC bot not running — restarting in background"
 
 # Send Telegram alert
 "$PYTHON" - "$SECRETS" "🔴 *Bot DOWN* — watchdog restarting\n${NOW}" <<'PYEOF' || true
@@ -65,11 +65,7 @@ for chat_id in chat_ids:
         print(f"telegram failed: {e}", file=sys.stderr)
 PYEOF
 
-# Restart inside screen
-if screen -list | grep -q "\.${SCREEN_NAME}"; then
-    screen -S "$SCREEN_NAME" -p 0 -X stuff "/root/trading_bot/scripts/mexc_bot_runner.sh\n"
-else
-    screen -dmS "$SCREEN_NAME" bash -c "/root/trading_bot/scripts/mexc_bot_runner.sh; exec bash"
-fi
+# Restart as background process
+nohup /root/trading_bot/scripts/mexc_bot_runner.sh >> "/root/trading_bot/$RUNNER_LOG" 2>&1 &
 
-echo "[$NOW] Restart command sent to screen '$SCREEN_NAME'"
+echo "[$NOW] Runner started in background (PID $!), logging to $RUNNER_LOG"

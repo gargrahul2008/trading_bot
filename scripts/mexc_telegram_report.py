@@ -56,6 +56,39 @@ def _parse_pct(reason: str) -> Decimal:
     return Decimal(m.group(1)) / Decimal("100") if m else D0
 
 
+def _lifo_realized(trades_seq) -> float:
+    """Separate-stack LIFO matching. Returns total realized PnL from matched pairs."""
+    buy_stack: list = []
+    sell_stack: list = []
+    realized = 0.0
+    for side, qty, px in trades_seq:
+        if qty < 1e-9:
+            continue
+        if side == "BUY":
+            remaining = qty
+            while remaining > 1e-9 and sell_stack:
+                take = min(remaining, sell_stack[-1][0])
+                realized += take * (sell_stack[-1][1] - px)
+                remaining -= take
+                sell_stack[-1][0] -= take
+                if sell_stack[-1][0] < 1e-9:
+                    sell_stack.pop()
+            if remaining > 1e-9:
+                buy_stack.append([remaining, px])
+        elif side == "SELL":
+            remaining = qty
+            while remaining > 1e-9 and buy_stack:
+                take = min(remaining, buy_stack[-1][0])
+                realized += take * (px - buy_stack[-1][1])
+                remaining -= take
+                buy_stack[-1][0] -= take
+                if buy_stack[-1][0] < 1e-9:
+                    buy_stack.pop()
+            if remaining > 1e-9:
+                sell_stack.append([remaining, px])
+    return realized
+
+
 def _fmt_ist(dt: datetime.datetime) -> str:
     return dt.astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
 
@@ -187,74 +220,61 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
     buy_quote = _dec(cfg_strategy.get("buy_quote", 0))
     upper_pct = _dec(cfg_strategy.get("upper_pct", 0))
 
-    # LIFO stack — each entry: [remaining_qty, price, is_rebal]
-    # BUYs are pushed to the end (top); SELLs match from top (latest buy first).
+    # Unified LIFO stack for period cycle counting — [remaining_qty, price, is_rebal]
     open_buys: list[list] = []
 
     all_time_pnl        = D0
-    all_time_rebal_pnl  = D0
-    all_time_cycles     = 0
-    all_time_rebal_cyc  = 0
     period_pnl          = D0
     period_rebal_pnl    = D0
     period_cycles       = 0
     period_rebal_cycles = 0
     rebalance_qty       = D0
     period_ladder_values: list[Decimal] = []
-    period_fills_seq: list[tuple] = []   # (side, qty, price) for stock-PnL segment walk
-    # Average-cost realized PnL: tracks running avg cost of all bot-bought ETH.
-    # For each sell: realized_pnl = qty × (sell_price − avg_cost_at_that_moment).
-    # This is the "real" PnL — what the sell actually earned vs what was paid for that ETH.
-    avg_cost_qty  = D0   # running ETH qty (from all buys, used to maintain avg cost)
-    avg_cost_cost = D0   # running total cost paid for all bought ETH
-    period_rebal_avg_pnl   = D0  # realized PnL (avg-cost) for rebalance sells in period
-    period_ladder_avg_pnl  = D0  # realized PnL (avg-cost) for ladder sells in period
-    all_time_rebal_avg_pnl = D0  # realized PnL (avg-cost) for ALL rebalance sells since start
-    # Rebalance pool: tracks open ETH that came from rebalance buys.
-    # On rebal BUY: add to pool. On ANY sell: drain proportionally (sold ETH is from mixed pool).
-    # Used to compute unrealized rebalance PnL = pool_qty × (current_price − pool_avg_cost).
-    rebal_pool_qty  = D0
-    rebal_pool_cost = D0
+
+    # Flow tracking (all-time)
+    grid_net_usdc  = D0
+    grid_net_eth   = D0
+    rebal_net_usdc = D0
+    rebal_net_eth  = D0
+    total_net_usdc = D0
+    total_net_eth  = D0
+
+    # Trade sequences for separate-stack LIFO (all-time)
+    grid_seq:  list[tuple] = []
+    rebal_seq: list[tuple] = []
 
     def process_trade(side, qty, price, is_rebal, in_period):
-        nonlocal all_time_pnl, all_time_rebal_pnl, all_time_cycles, all_time_rebal_cyc
-        nonlocal period_pnl, period_rebal_pnl, period_cycles, period_rebal_cycles
+        """Unified LIFO for period cycle counting. Standard matching (all sells, not just profitable)."""
+        nonlocal all_time_pnl, period_cycles, period_rebal_cycles
+        nonlocal period_pnl, period_rebal_pnl
 
         if side == "BUY":
-            # BUY always opens a new long position on the stack.
             open_buys.append([qty, price, is_rebal])
             return
 
-        # SELL: find the most recent buy lot BELOW the sell price (one lot only).
-        # Matching only one lot avoids cross-lot spillage that creates artificial losses
-        # when a sell partially consumes a cheap lot then spills into an expensive one.
-        # Remaining unmatched sell qty is discarded (spot-only bot; no shorting).
-        i = len(open_buys) - 1
-        while i >= 0:
-            entry = open_buys[i]
-            if price > entry[1]:  # profitable match found
-                take = min(qty, entry[0])
-                cycle_pnl = take * (price - entry[1])
-                any_rebal = is_rebal or entry[2]
-                entry[0] -= take
-                if entry[0] <= D0:
-                    open_buys.pop(i)
-                # Count 1 cycle for this sell
+        # SELL: consume from top of stack (standard LIFO)
+        rem = qty
+        sell_pnl = D0
+        any_rebal = is_rebal
+        while rem > D0 and open_buys:
+            entry = open_buys[-1]
+            take = min(rem, entry[0])
+            sell_pnl += take * (price - entry[1])
+            any_rebal = any_rebal or entry[2]
+            entry[0] -= take
+            if entry[0] <= D0:
+                open_buys.pop()
+            rem -= take
+
+        if sell_pnl != D0 or rem < qty:
+            all_time_pnl += sell_pnl
+            if in_period:
                 if any_rebal:
-                    all_time_rebal_pnl += cycle_pnl
-                    all_time_rebal_cyc += 1
-                    if in_period:
-                        period_rebal_pnl    += cycle_pnl
-                        period_rebal_cycles += 1
+                    period_rebal_pnl += sell_pnl
+                    period_rebal_cycles += 1
                 else:
-                    all_time_pnl    += cycle_pnl
-                    all_time_cycles += 1
-                    if in_period:
-                        period_pnl    += cycle_pnl
-                        period_cycles += 1
-                return
-            i -= 1
-        # No profitable buy found — sell discarded (initial inventory depletion)
+                    period_pnl += sell_pnl
+                    period_cycles += 1
 
     for r in fills:
         ts_str = r.get("ts", "")
@@ -280,40 +300,36 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
             rebalance_qty += qty
 
         if side in ("BUY", "SELL"):
-            # Maintain running average cost (all bot buys, regardless of period)
             notional = cqq if cqq > D0 else qty * price
+
+            # Flow tracking
             if side == "BUY":
-                avg_cost_qty  += qty
-                avg_cost_cost += notional
+                total_net_usdc -= notional
+                total_net_eth  += qty
                 if is_reb:
-                    # Track rebalance pool separately for unrealized calc
-                    rebal_pool_qty  += qty
-                    rebal_pool_cost += notional
-            elif side == "SELL" and avg_cost_qty > D0:
-                avg_cost  = avg_cost_cost / avg_cost_qty
-                avg_pnl   = qty * (price - avg_cost)
-                # Reduce cost basis by the sold portion
-                sell_qty  = min(qty, avg_cost_qty)
-                avg_cost_cost -= sell_qty * avg_cost
-                avg_cost_qty  -= sell_qty
-                # Drain rebalance pool proportionally — sold ETH comes from mixed holdings
-                if rebal_pool_qty > D0 and avg_cost_qty + sell_qty > D0:
-                    rebal_fraction = rebal_pool_qty / (avg_cost_qty + sell_qty)
-                    rebal_drained  = min(sell_qty * rebal_fraction, rebal_pool_qty)
-                    pool_avg       = rebal_pool_cost / rebal_pool_qty
-                    rebal_pool_qty  -= rebal_drained
-                    rebal_pool_cost -= rebal_drained * pool_avg
-                if is_reb:
-                    all_time_rebal_avg_pnl += avg_pnl
-                    if in_period:
-                        period_rebal_avg_pnl += avg_pnl
+                    rebal_net_usdc -= notional
+                    rebal_net_eth  += qty
                 else:
-                    if in_period:
-                        period_ladder_avg_pnl += avg_pnl
+                    grid_net_usdc -= notional
+                    grid_net_eth  += qty
+            else:
+                total_net_usdc += notional
+                total_net_eth  -= qty
+                if is_reb:
+                    rebal_net_usdc += notional
+                    rebal_net_eth  -= qty
+                else:
+                    grid_net_usdc += notional
+                    grid_net_eth  -= qty
+
+            # Build sequences for separate-stack LIFO
+            entry = (side, float(qty), float(price))
+            if is_reb:
+                rebal_seq.append(entry)
+            else:
+                grid_seq.append(entry)
 
             process_trade(side, qty, price, is_reb, in_period)
-            if in_period:
-                period_fills_seq.append((side, qty, price, is_reb))
 
         if in_period and not is_reb and cqq > D0:
             period_ladder_values.append(cqq)
@@ -322,23 +338,23 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
                   if period_ladder_values else buy_quote)
 
     return {
-        "cycles_completed":     period_cycles,
-        "avg_ladder_size":      avg_ladder,
-        "current_ladder_size":  buy_quote,
-        "upper_pct":            upper_pct,
-        "rebalance_qty":        rebalance_qty,
-        "rebal_cycles":         period_rebal_cycles,
-        "rebal_pnl":            period_rebal_pnl,           # theoretical LIFO (unused in message now)
-        "rebal_avg_pnl":        period_rebal_avg_pnl,    # realized PnL: rebal sells vs avg cost
-        "ladder_avg_pnl":       period_ladder_avg_pnl,  # realized PnL: ladder sells vs avg cost
-        "avg_cost":             avg_cost_cost / avg_cost_qty if avg_cost_qty > D0 else D0,
-        "total_bot_pnl":        all_time_pnl,
-        "period_pnl":           period_pnl,
-        "total_rebal_pnl":      all_time_rebal_pnl,
-        "total_rebal_avg_pnl":  all_time_rebal_avg_pnl,
-        "rebal_pool_qty":       rebal_pool_qty,
-        "rebal_pool_cost":      rebal_pool_cost,
-        "period_fills_seq":     period_fills_seq,
+        "cycles_completed":    period_cycles,
+        "period_pnl":          period_pnl,
+        "avg_ladder_size":     avg_ladder,
+        "current_ladder_size": buy_quote,
+        "upper_pct":           upper_pct,
+        "rebalance_qty":       rebalance_qty,
+        "rebal_cycles":        period_rebal_cycles,
+        "period_rebal_pnl":   period_rebal_pnl,
+        "total_bot_pnl":       all_time_pnl,
+        "grid_net_usdc":      float(grid_net_usdc),
+        "grid_net_eth":       float(grid_net_eth),
+        "rebal_net_usdc":     float(rebal_net_usdc),
+        "rebal_net_eth":      float(rebal_net_eth),
+        "total_net_usdc":     float(total_net_usdc),
+        "total_net_eth":      float(total_net_eth),
+        "grid_seq":           grid_seq,
+        "rebal_seq":          rebal_seq,
     }
 
 
@@ -363,29 +379,28 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
         fmt = f"{{:+.{decimals}f}}"
         return fmt.format(v)
 
-    # Cycle PnL (theoretical LIFO spread — the only non-real number)
-    pp = float(m['period_pnl'])
-    pp_str = _sgn(pp, 0)
+    pp_str = _sgn(float(m['period_pnl']), 0)
+    rp_str = _sgn(float(m['period_rebal_pnl']), 0)
 
-    # Rebalance all-time realized PnL (avg-cost) since Apr 13
-    rc = float(m['total_rebal_avg_pnl'])
-    rc_str = _sgn(rc, 0)
+    # Separate-stack LIFO for all-time realized PnL
+    grid_realized  = _lifo_realized(m['grid_seq'])
+    rebal_realized = _lifo_realized(m['rebal_seq'])
 
-    # Rebalance unrealized PnL computed after price is known (see below)
-    rebal_pool_qty  = float(m['rebal_pool_qty'])
-    rebal_pool_cost = float(m['rebal_pool_cost'])
-    rebal_unrealized_str = ""  # filled in after price is resolved from state
+    # Flow totals from compute_metrics
+    grid_net_usdc  = m['grid_net_usdc']
+    grid_net_eth   = m['grid_net_eth']
+    rebal_net_usdc = m['rebal_net_usdc']
+    rebal_net_eth  = m['rebal_net_eth']
+    total_net_usdc = m['total_net_usdc']
+    total_net_eth  = m['total_net_eth']
 
-    # Ladder realized PnL: (sell_price − avg_buy_cost) × qty for ladder sells in period
-    # Positive = sold above average cost (true profit)
-    # Negative = sold below average cost (selling into a falling market)
-    lc = float(m['ladder_avg_pnl'])
-    lc_str = _sgn(lc, 0)
-
-    # Portfolio value + compound step size from state
-    pv_str = ""
-    compound_s_str = None
+    # Read state for portfolio data
+    price = D0
+    pv = D0
     pv_snapshot = None
+    compound_s_str = None
+    eth_holding_pnl = None
+    net_pnl = None
 
     if state_path:
         try:
@@ -395,11 +410,12 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
             cash       = _dec(state.get("cash") or "0")
             broker_eth = _dec(state.get("extras", {}).get(f"broker_base_qty_{symbol}") or "0")
             if broker_eth <= D0:
-                ss         = (state.get("symbol_states") or {}).get(symbol) or {}
+                ss = (state.get("symbol_states") or {}).get(symbol) or {}
                 broker_eth = _dec(ss.get("traded_qty") or "0")
 
-            # Prefer pnl_summary.json for cash — it includes locked USDC (frozen in open orders)
-            # state.cash only reflects free balance, understating PV by ~N×buy_quote
+            start_pv = float(_dec(state.get("extras", {}).get("portfolio_start_value") or "0"))
+
+            # Prefer pnl_summary.json for balances
             try:
                 summary_path = os.path.join(os.path.dirname(state_path), "pnl_summary.json")
                 with open(summary_path, encoding="utf-8") as f:
@@ -416,55 +432,62 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
                 if px > D0:
                     price = px
             except Exception:
-                pass  # fall back to state values
+                pass
 
-            pv     = cash + broker_eth * price
-            pv_str = f", PV{int(pv)}"
-
+            pv = cash + broker_eth * price
             pv_snapshot = {"ts": now.isoformat(), "pv": float(pv), "price": float(price)}
 
             cbq = _dec(state.get("extras", {}).get("compound_buy_quote") or "0")
             if cbq > D0:
                 cbq_f = float(cbq)
                 compound_s_str = f"{int(cbq_f)}" if cbq_f == int(cbq_f) else f"{cbq_f:.2f}"
-            # Weekend mode: override pct display if active
             wpct = state.get("extras", {}).get("weekend_upper_pct")
             if wpct:
                 pct_str = f"{float(wpct):g}"
+
+            # Compute ETH holding PnL from start state
+            fp = float(price)
+            if total_net_eth != 0 and fp > 0 and start_pv > 0:
+                start_eth  = float(broker_eth) - total_net_eth
+                start_usdc = float(cash) - total_net_usdc
+                if start_eth > 0.1:
+                    start_price = (start_pv - start_usdc) / start_eth
+                    eth_holding_pnl = start_eth * (fp - start_price)
         except Exception:
             pass
 
     effective_s_str = compound_s_str if compound_s_str is not None else s_str
+    fp = float(price)
 
-    # PV with S (ETH price MTM on full holding) and B (ladder avg-cost realized PnL)
-    if pv_snapshot and last_report_path and broker_eth > D0:
-        try:
-            with open(last_report_path, encoding="utf-8") as f:
-                last = json.load(f)
-            last_price = _dec(last.get("price", 0))
-            if last_price > D0:
-                dP      = float(_dec(pv_snapshot["price"])) - float(last_price)
-                eth_mtm = float(broker_eth) * dP
-                pv_str  = f", PV{int(pv_snapshot['pv'])}(S{_sgn(eth_mtm, 0)},B{lc_str})"
-        except Exception:
-            pass
+    # 4-bucket PnL: flow-based totals, separate-stack realized, derived unrealized
+    grid_total  = grid_net_usdc  + grid_net_eth  * fp if fp > 0 else 0.0
+    rebal_total = rebal_net_usdc + rebal_net_eth * fp if fp > 0 else 0.0
+    grid_unrealized  = grid_total  - grid_realized
+    rebal_unrealized = rebal_total - rebal_realized
+    trading_total = grid_total + rebal_total
+    net_pnl = (eth_holding_pnl or 0.0) + trading_total
 
-    # Rebalance unrealized PnL: open rebal pool marked to current price
-    if rebal_pool_qty > 1e-6 and price > D0:
-        pool_avg_cost = rebal_pool_cost / rebal_pool_qty
-        rebal_unreal  = rebal_pool_qty * (float(price) - pool_avg_cost)
-        rebal_unrealized_str = f",U{_sgn(rebal_unreal, 0)}"
-
+    # Format message
     line1 = f"{_fmt_short(since)} -> {_fmt_short(now)}"
     line2 = (
         f"C{m['cycles_completed']}({pp_str}), "
-        f"A{int(float(m['avg_ladder_size']))}, "
         f"S{effective_s_str}({pct_str}%), "
-        f"R{m['rebal_cycles']}({rc_str}{rebal_unrealized_str}), "
-        f"P{float(m['total_bot_pnl']):.2f}"
-        f"{pv_str}"
+        f"Rb{m['rebal_cycles']}({rp_str})"
     )
-    return f"{line1}\n{line2}", pv_snapshot
+    line3 = (
+        f"Bot{_sgn(grid_realized, 0)}(u{_sgn(grid_unrealized, 0)}), "
+        f"Rbl{_sgn(rebal_realized, 0)}(u{_sgn(rebal_unrealized, 0)})"
+    )
+    parts4 = []
+    if eth_holding_pnl is not None:
+        parts4.append(f"H{_sgn(eth_holding_pnl, 0)}")
+    if net_pnl is not None:
+        parts4.append(f"Net{_sgn(net_pnl, 0)}")
+    if float(pv) > 0:
+        parts4.append(f"PV{int(float(pv))}")
+    line4 = ", ".join(parts4)
+
+    return f"{line1}\n{line2}\n{line3}\n{line4}", pv_snapshot
 
 
 def send_telegram(token: str, chat_id: str, text: str) -> None:

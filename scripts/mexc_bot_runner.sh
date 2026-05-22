@@ -9,8 +9,8 @@
 # Graceful stop: send SIGTERM to this script (kills bot + stops loop).
 #   kill $(pgrep -f mexc_bot_runner.sh)
 #
-# Usage (run inside a screen session):
-#   screen -S mexc bash -c "/root/trading_bot/scripts/mexc_bot_runner.sh"
+# Usage (run in background, logs to logs/mexc_runner.log):
+#   nohup /root/trading_bot/scripts/mexc_bot_runner.sh >> logs/mexc_runner.log 2>&1 &
 
 set -euo pipefail
 cd /root/trading_bot
@@ -105,8 +105,10 @@ while [ "$STOP_REQUESTED" -eq 0 ]; do
     "$PYTHON" run_strategy.py --config "$CONFIG" &
     BOT_PID=$!
 
-    # Wait for bot to exit
-    wait "$BOT_PID" 2>/dev/null
+    # Wait for bot to exit.
+    # '|| true' prevents set -e from killing the runner when the bot exits
+    # with a non-zero code (e.g. 137 from SIGKILL by compound cron).
+    wait "$BOT_PID" 2>/dev/null || true
     EXIT_CODE=$?
     BOT_PID=""
 

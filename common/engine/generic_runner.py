@@ -1400,23 +1400,36 @@ class GenericRunner:
                     return False
                 cost_per_trade = _dec(cfg.fixed_qty_buy) * ref
             else:
-                cost_per_trade = _dec(cfg.buy_quote)
+                # Use effective (compounded) quote for consistency with normal order sizing.
+                cost_per_trade = _dec(self.state.extras.get("compound_buy_quote") or cfg.buy_quote)
             target_cash = _dec(target_steps) * cost_per_trade
             available_cash = max(self.state.cash - quote_reserve, D0)
-            deficit = target_cash - available_cash
-            if deficit <= D0:
+            if available_cash >= target_cash:
                 return True  # already enough
-            sell_qty = self._round_qty_pro(deficit / ref, strategy)
+            # Sell a full step's worth of ETH (not just the deficit).
+            # Selling only the deficit produces sub-minimum quantities that exchanges reject;
+            # selling a full step ensures the order meets venue minimum qty requirements.
+            sell_qty = self._round_qty_pro(cost_per_trade / ref, strategy)
             # cap to what we actually hold
             base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
             sell_qty = min(sell_qty, base_qty)
             sell_qty = self._round_qty_pro(sell_qty, strategy)
             if sell_qty <= D0:
                 return False
-            req = PlaceOrderRequest(
-                symbol=sym, side="SELL", qty=sell_qty,
-                product_type=self.exec_cfg.product_type, order_type="MARKET",
-            )
+            mode = (self.exec_cfg.order_mode or "market").lower()
+            if mode == "marketable_limit":
+                sl = _dec(self.exec_cfg.slippage_bps) / _dec("10000")
+                limit_px = self._round_price_to_tick(ref * (Decimal("1") - sl))
+                req = PlaceOrderRequest(
+                    symbol=sym, side="SELL", qty=sell_qty,
+                    product_type=self.exec_cfg.product_type, order_type="LIMIT",
+                    limit_price=limit_px, time_in_force="GTC",
+                )
+            else:
+                req = PlaceOrderRequest(
+                    symbol=sym, side="SELL", qty=sell_qty,
+                    product_type=self.exec_cfg.product_type, order_type="MARKET",
+                )
             oid = self.exec.place_with_adaptive_qty(req, reason="rebalance_restore")
             if not oid:
                 return False
@@ -1449,17 +1462,32 @@ class GenericRunner:
                 usdc_to_spend = available_cash
             if usdc_to_spend <= D0:
                 return False
-            # Use quoteOrderQty (USDC to spend) for market BUY — MEXC requires this
-            # format for market buy orders; passing base qty causes "quantity scale invalid".
-            usdc_to_spend = usdc_to_spend.quantize(_dec("0.01"), rounding=ROUND_DOWN)
-            req = PlaceOrderRequest(
-                symbol=sym, side="BUY", quote_qty=usdc_to_spend,
-                product_type=self.exec_cfg.product_type, order_type="MARKET",
-            )
+            mode = (self.exec_cfg.order_mode or "market").lower()
+            if mode == "marketable_limit":
+                buy_qty = self._round_qty_pro(usdc_to_spend / ref, strategy)
+                if buy_qty <= D0:
+                    return False
+                sl = _dec(self.exec_cfg.slippage_bps) / _dec("10000")
+                limit_px = self._round_price_to_tick(ref * (Decimal("1") + sl))
+                req = PlaceOrderRequest(
+                    symbol=sym, side="BUY", qty=buy_qty,
+                    product_type=self.exec_cfg.product_type, order_type="LIMIT",
+                    limit_price=limit_px, time_in_force="GTC",
+                )
+            else:
+                # Use quoteOrderQty (USDC to spend) for market BUY — MEXC requires this
+                # format for market buy orders; passing base qty causes "quantity scale invalid".
+                usdc_to_spend = usdc_to_spend.quantize(_dec("0.01"), rounding=ROUND_DOWN)
+                req = PlaceOrderRequest(
+                    symbol=sym, side="BUY", quote_qty=usdc_to_spend,
+                    product_type=self.exec_cfg.product_type, order_type="MARKET",
+                )
             oid = self.exec.place_with_adaptive_qty(req, reason="rebalance_restore")
             if not oid:
                 return False
-            LOG.info("PRO rebalance_sync BUY quote_qty=%s oid=%s", usdc_to_spend, oid)
+            LOG.info("PRO rebalance_sync BUY %s=%s oid=%s",
+                     "qty" if mode == "marketable_limit" else "quote_qty",
+                     buy_qty if mode == "marketable_limit" else usdc_to_spend, oid)
             filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid)
             if terminal and filled_qty > 0:
                 self._apply_fill(sym, "BUY", filled_qty, avg_px if avg_px > D0 else ref, cum_q,

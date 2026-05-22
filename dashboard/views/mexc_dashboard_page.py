@@ -112,6 +112,39 @@ def _count_cycles(store: dict, step: float = 0.0) -> int:
     return total
 
 
+def _lifo_realized(trades_seq) -> float:
+    """Separate-stack LIFO matching. Returns total realized PnL from matched pairs."""
+    buy_stack: list = []
+    sell_stack: list = []
+    realized = 0.0
+    for side, qty, px in trades_seq:
+        if qty < 1e-9:
+            continue
+        if side == "BUY":
+            remaining = qty
+            while remaining > 1e-9 and sell_stack:
+                take = min(remaining, sell_stack[-1][0])
+                realized += take * (sell_stack[-1][1] - px)
+                remaining -= take
+                sell_stack[-1][0] -= take
+                if sell_stack[-1][0] < 1e-9:
+                    sell_stack.pop()
+            if remaining > 1e-9:
+                buy_stack.append([remaining, px])
+        elif side == "SELL":
+            remaining = qty
+            while remaining > 1e-9 and buy_stack:
+                take = min(remaining, buy_stack[-1][0])
+                realized += take * (px - buy_stack[-1][1])
+                remaining -= take
+                buy_stack[-1][0] -= take
+                if buy_stack[-1][0] < 1e-9:
+                    buy_stack.pop()
+            if remaining > 1e-9:
+                sell_stack.append([remaining, px])
+    return realized
+
+
 def render_page() -> None:
     st.title("MEXC ETH/USDC Bot Dashboard")
 
@@ -189,6 +222,155 @@ def render_page() -> None:
     else:
         c4.metric("PnL Since Start", "—")
 
+    # ── PnL Breakdown: where's my money? ────────────────────────────────
+    st.subheader("Where's My Money?")
+
+    # Data sources
+    start_pv = _sf(extras.get("portfolio_start_value")) or initial_equity
+    strategy_unrealized = _sf(bot.get("unrealized_now")) or 0.0
+    strategy_realized = _sf(bot.get("realized_all_time")) or 0.0
+    sym_snap = (snapshot.get("symbols") or {}).get("ETHUSDC") or {}
+    strategy_eth = _sf(sym_snap.get("traded_qty")) or 0.0
+    strategy_avg_px = _sf(sym_snap.get("avg_price")) or 0.0
+
+    # --- Compute exact start state from trade replay ---
+    # Net ETH/USDC changes from all fills → back-compute start holdings
+    net_eth_trades = 0.0
+    net_usdc_trades = 0.0
+    # Track grid vs rebalance flows separately
+    grid_net_usdc = 0.0
+    grid_net_eth = 0.0
+    rebal_net_usdc = 0.0
+    rebal_net_eth = 0.0
+    if not df_all.empty and "side" in df_all.columns:
+        for _, row in df_all.iterrows():
+            side = str(row.get("side", "")).upper()
+            qty = float(row.get("qty", 0) or 0)
+            quote = float(row.get("cum_quote_qty", 0) or 0)
+            reason = str(row.get("reason", ""))
+            is_rebal = reason.startswith("rebalance_")
+            if side == "BUY":
+                net_eth_trades += qty
+                net_usdc_trades -= quote
+                if is_rebal:
+                    rebal_net_usdc -= quote
+                    rebal_net_eth += qty
+                else:
+                    grid_net_usdc -= quote
+                    grid_net_eth += qty
+            elif side == "SELL":
+                net_eth_trades -= qty
+                net_usdc_trades += quote
+                if is_rebal:
+                    rebal_net_usdc += quote
+                    rebal_net_eth -= qty
+                else:
+                    grid_net_usdc += quote
+                    grid_net_eth -= qty
+
+    start_usdc = usdc_balance - net_usdc_trades if net_usdc_trades != 0 else None
+    start_eth = eth_qty - net_eth_trades if net_eth_trades != 0 else None
+    start_price = ((start_pv - start_usdc) / start_eth) if start_usdc is not None and start_eth and start_eth > 0.1 else None
+
+    # 4-bucket PnL: separate-stack LIFO for realized, flow-derived unrealized
+    grid_realized = 0.0
+    rebal_realized = 0.0
+    if not df_all.empty and "side" in df_all.columns:
+        sorted_tr = df_all.sort_values("ts") if "ts" in df_all.columns else df_all
+        grid_seq, rebal_seq = [], []
+        for _, row in sorted_tr.iterrows():
+            s = str(row.get("side", "")).upper()
+            q = float(row.get("qty", 0) or 0)
+            p = float(row.get("price", 0) or 0)
+            r = str(row.get("reason", ""))
+            (rebal_seq if r.startswith("rebalance_") else grid_seq).append((s, q, p))
+        grid_realized = _lifo_realized(grid_seq)
+        rebal_realized = _lifo_realized(rebal_seq)
+
+    grid_total = grid_net_usdc + grid_net_eth * eth_price if eth_price else 0.0
+    rebal_total = rebal_net_usdc + rebal_net_eth * eth_price if eth_price else 0.0
+    grid_unrealized = grid_total - grid_realized
+    rebal_unrealized = rebal_total - rebal_realized
+
+    # --- "Then vs Now" snapshot ---
+    st.markdown("**Then vs Now**")
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Started With", _fmt(start_pv))
+    t2.metric("Current Value", _fmt(portfolio_value))
+    if pnl_since_start is not None:
+        t3.metric("Change", _fmt(pnl_since_start),
+                  delta=f"{pct_since_start:+.2f}%", delta_color="normal")
+
+    if start_usdc is not None and start_price is not None and start_eth is not None:
+        col_then, col_now = st.columns(2)
+        with col_then:
+            st.caption(f"**Start** (ETH ${start_price:,.0f})")
+            st.markdown(
+                f"- USDC: **${start_usdc:,.0f}**\n"
+                f"- ETH: **{start_eth:.1f}** × ${start_price:,.0f} = **${start_eth * start_price:,.0f}**"
+            )
+        with col_now:
+            st.caption(f"**Now** (ETH ${eth_price:,.0f})")
+            st.markdown(
+                f"- USDC: **${usdc_balance:,.0f}**\n"
+                f"- ETH: **{eth_qty:.1f}** × ${eth_price:,.0f} = **${eth_value:,.0f}**\n"
+                f"  - {start_eth:.1f} original\n"
+                f"  - {net_eth_trades:+.1f} from trading ({strategy_eth:.1f} open @ avg ${strategy_avg_px:,.0f})"
+            )
+
+    # --- PnL Breakdown ---
+    st.markdown("**PnL Breakdown**")
+
+    eth_holding_pnl = None
+    if start_price is not None and start_eth is not None:
+        eth_holding_pnl = start_eth * (eth_price - start_price)
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Bot Realized", _fmt(grid_realized),
+              delta=f"net {grid_net_eth:+.1f} ETH, {_fmt(grid_net_usdc)} USDC",
+              delta_color="off")
+    p2.metric("Bot Unrealized", _fmt(grid_unrealized),
+              delta=f"{grid_net_eth:+.4f} ETH open" if abs(grid_net_eth) > 0.001 else "flat",
+              delta_color="off")
+    p3.metric("Rebal Realized", _fmt(rebal_realized),
+              delta=f"net {rebal_net_eth:+.1f} ETH, {_fmt(rebal_net_usdc)} USDC",
+              delta_color="off")
+    p4.metric("Rebal Unrealized", _fmt(rebal_unrealized),
+              delta=f"{rebal_net_eth:+.4f} ETH open" if abs(rebal_net_eth) > 0.001 else "flat",
+              delta_color="off")
+
+    trading_total = grid_total + rebal_total
+    net_computed = (eth_holding_pnl or 0.0) + trading_total
+    t1, t2, t3 = st.columns(3)
+    if eth_holding_pnl is not None:
+        price_chg_pct = (eth_price / start_price - 1) * 100 if start_price else 0
+        t1.metric("ETH Holding PnL", _fmt(eth_holding_pnl),
+                  delta=f"{start_eth:.1f} ETH × {price_chg_pct:+.1f}%", delta_color="off")
+    else:
+        t1.metric("ETH Holding PnL", "—")
+    t2.metric("All Trading PnL", _fmt(trading_total),
+              delta="bot + rebalance", delta_color="off")
+    t3.metric("Net PnL", _fmt(net_computed),
+              delta=f"vs actual: {_fmt(pnl_since_start)}" if pnl_since_start is not None else None,
+              delta_color="off")
+
+    if pnl_since_start is not None and eth_holding_pnl is not None:
+        st.info(
+            f"**Holding + Bot + Rebalance = Net PnL:**  \n"
+            f"1. ETH price {'fell' if eth_holding_pnl < 0 else 'rose'} "
+            f"${abs(eth_price - start_price):,.0f} on {start_eth:.1f} original ETH → "
+            f"**{_fmt(eth_holding_pnl)}**  \n"
+            f"2. Bot realized (grid spreads) → **{_fmt(grid_realized)}**  \n"
+            f"3. Bot unrealized ({grid_net_eth:+.1f} ETH × price) → **{_fmt(grid_unrealized)}**  \n"
+            f"4. Rebal realized → **{_fmt(rebal_realized)}**  \n"
+            f"5. Rebal unrealized ({rebal_net_eth:+.1f} ETH × price) → **{_fmt(rebal_unrealized)}**  \n"
+            f"{'---'}  \n"
+            f"Total: {_fmt(eth_holding_pnl)} + {_fmt(grid_total)} + {_fmt(rebal_total)} = "
+            f"**{_fmt(net_computed)}** (actual: {_fmt(pnl_since_start)})"
+        )
+
+    st.divider()
+
     st.subheader("Bot Performance")
     st.caption("Realized PnL uses avg-cost basis (tracked by engine per fill). Cycles from snapshot.")
     b1, b2, b3, b4 = st.columns(4)
@@ -198,7 +380,7 @@ def render_page() -> None:
     b4.metric("Cycles All-time", ca_count)
 
     st.subheader("Compounding (LIFO Actual PnL)")
-    st.caption("LIFO PnL = sum of (sell_price − buy_price) × qty for profitable buy→sell pairs only. Updated daily by compound cron.")
+    st.caption("LIFO PnL = sum of (sell_price - buy_price) x qty for profitable buy-sell pairs only. Updated daily by compound cron.")
     d1, d2, d3, d4 = st.columns(4)
     d1.metric("Initial Equity", _fmt(initial_equity))
     d2.metric("Initial Step", _fmt(initial_step))
