@@ -21,6 +21,7 @@ class BacktestConfig:
     symbol: str = "RELIANCE"
     chunk_qty: int = 70
     initial_qty: int = 420
+    core_qty: Optional[int] = None
     grid_pct: float = 0.005
     min_profit_pct: float = 0.006
     fee_per_share: float = 0.0
@@ -56,6 +57,20 @@ class GridStrategyBacktester:
     def open_qty(self) -> int:
         return sum(lot.qty for lot in self.lots)
 
+    def target_core_qty(self) -> int:
+        return self.cfg.initial_qty if self.cfg.core_qty is None else self.cfg.core_qty
+
+    def open_qty_by_tag(self, tag: str) -> int:
+        return sum(lot.qty for lot in self.lots if lot.tag == tag)
+
+    @property
+    def core_open_qty(self) -> int:
+        return self.open_qty_by_tag("core")
+
+    @property
+    def grid_open_qty(self) -> int:
+        return self.open_qty_by_tag("grid")
+
     def effective_intrabar_mode(self) -> str:
         if not self.cfg.use_intrabar:
             return "close_only"
@@ -75,11 +90,23 @@ class GridStrategyBacktester:
             return 0.0
         return sum(lot.qty * lot.price for lot in self.lots) / self.open_qty
 
+    def avg_cost_by_tag(self, tag: str) -> float:
+        qty = self.open_qty_by_tag(tag)
+        if qty == 0:
+            return 0.0
+        return self.open_cost_by_tag(tag) / qty
+
     def open_cost(self) -> float:
         return sum(lot.qty * lot.price for lot in self.lots)
 
+    def open_cost_by_tag(self, tag: str) -> float:
+        return sum(lot.qty * lot.price for lot in self.lots if lot.tag == tag)
+
     def unrealized_pnl(self, price: float) -> float:
         return sum((price - lot.price) * lot.qty for lot in self.lots)
+
+    def unrealized_pnl_by_tag(self, price: float, tag: str) -> float:
+        return sum((price - lot.price) * lot.qty for lot in self.lots if lot.tag == tag)
 
     def total_pnl(self, price: float) -> float:
         return self.realized_grid_pnl + self.unrealized_pnl(price) - self.total_fees - self.total_interest
@@ -132,7 +159,7 @@ class GridStrategyBacktester:
         })
         return interest
 
-    def buy(self, dt, qty: int, price: float, reason: str):
+    def buy(self, dt, qty: int, price: float, reason: str, tag: str = "grid"):
         if qty <= 0:
             return
 
@@ -152,7 +179,7 @@ class GridStrategyBacktester:
         fee = self.fee(qty)
         self.cash -= qty * price + fee
         self.total_fees += fee
-        self.lots.append(Lot(qty=qty, price=price))
+        self.lots.append(Lot(qty=qty, price=price, tag=tag))
         self.last_buy_price = price
 
         self.trades.append({
@@ -161,8 +188,11 @@ class GridStrategyBacktester:
             "qty": qty,
             "price": price,
             "reason": reason,
+            "lot_tag": tag,
             "mode": self.mode(),
             "open_qty_after": self.open_qty,
+            "core_open_qty_after": self.core_open_qty,
+            "grid_open_qty_after": self.grid_open_qty,
             "realized_grid_pnl_after": self.realized_grid_pnl,
         })
 
@@ -181,6 +211,7 @@ class GridStrategyBacktester:
         self.realized_grid_pnl += realized_this_sell
         lot.qty -= matched
         sold_from_lot_price = lot.price
+        sold_lot_tag = lot.tag
 
         if lot.qty == 0:
             self.lots.pop(lot_index)
@@ -194,12 +225,16 @@ class GridStrategyBacktester:
             "mode": self.mode(),
             "realized_this_sell": realized_this_sell,
             "sold_lot_price": sold_from_lot_price,
+            "sold_lot_tag": sold_lot_tag,
             "open_qty_after": self.open_qty,
+            "core_open_qty_after": self.core_open_qty,
+            "grid_open_qty_after": self.grid_open_qty,
             "realized_grid_pnl_after": self.realized_grid_pnl,
         })
 
-    def sell_lifo(self, dt, qty: int, price: float, reason: str):
-        qty = min(qty, self.open_qty)
+    def sell_tagged_lifo(self, dt, qty: int, price: float, reason: str, allowed_tags: set[str]):
+        available_qty = sum(lot.qty for lot in self.lots if lot.tag in allowed_tags)
+        qty = min(qty, available_qty)
         if qty <= 0:
             return
 
@@ -209,9 +244,19 @@ class GridStrategyBacktester:
 
         remaining = qty
         realized_this_sell = 0.0
+        last_sold_tag = None
 
         while remaining > 0 and self.lots:
-            lot = self.lots[-1]
+            lot_index = None
+            for idx in range(len(self.lots) - 1, -1, -1):
+                if self.lots[idx].tag in allowed_tags:
+                    lot_index = idx
+                    break
+
+            if lot_index is None:
+                break
+
+            lot = self.lots[lot_index]
             matched = min(remaining, lot.qty)
             pnl = (price - lot.price) * matched
             self.realized_grid_pnl += pnl
@@ -219,21 +264,31 @@ class GridStrategyBacktester:
 
             lot.qty -= matched
             remaining -= matched
+            last_sold_tag = lot.tag
 
             if lot.qty == 0:
-                self.lots.pop()
+                self.lots.pop(lot_index)
 
         self.trades.append({
             "datetime": dt,
             "side": "SELL",
-            "qty": qty,
+            "qty": qty - remaining,
             "price": price,
             "reason": reason,
             "mode": self.mode(),
             "realized_this_sell": realized_this_sell,
+            "sold_lot_tag": last_sold_tag if qty - remaining > 0 else None,
             "open_qty_after": self.open_qty,
+            "core_open_qty_after": self.core_open_qty,
+            "grid_open_qty_after": self.grid_open_qty,
             "realized_grid_pnl_after": self.realized_grid_pnl,
         })
+
+    def sell_lifo(self, dt, qty: int, price: float, reason: str):
+        self.sell_tagged_lifo(dt, qty, price, reason, allowed_tags={"core", "grid"})
+
+    def sell_grid_lifo(self, dt, qty: int, price: float, reason: str):
+        self.sell_tagged_lifo(dt, qty, price, reason, allowed_tags={"grid"})
 
     def next_buy_gap(self) -> float:
         if self.mode() == "CAUTION":
@@ -260,16 +315,23 @@ class GridStrategyBacktester:
         invested = self.open_qty * current_price
         return invested / total_equity
 
+    def latest_grid_lot_index(self) -> Optional[int]:
+        for idx in range(len(self.lots) - 1, -1, -1):
+            if self.lots[idx].tag == "grid":
+                return idx
+        return None
+
     def sell_target_for_latest_lot(self) -> Optional[float]:
-        if not self.lots:
+        lot_index = self.latest_grid_lot_index()
+        if lot_index is None:
             return None
-        return self.lots[-1].price * (1 + self.cfg.min_profit_pct)
+        return self.lots[lot_index].price * (1 + self.cfg.min_profit_pct)
 
     def maybe_sell(self, dt, high_price: float, close_price: float, max_sells: Optional[int] = None) -> int:
         sells_done = 0
         intrabar_mode = self.effective_intrabar_mode()
 
-        while self.lots:
+        while self.grid_open_qty > 0:
             if max_sells is not None and sells_done >= max_sells:
                 return sells_done
 
@@ -294,7 +356,7 @@ class GridStrategyBacktester:
                 sell_qty += self.cfg.recovery_extra_sell_qty
                 reason = "recovery: grid sell + inventory reduction"
 
-            self.sell_lifo(dt, sell_qty, fill_price, reason)
+            self.sell_grid_lifo(dt, sell_qty, fill_price, reason)
             sells_done += 1
 
             if intrabar_mode in {"close_only", "one_order_per_candle", "conservative"}:
@@ -322,18 +384,22 @@ class GridStrategyBacktester:
 
         reason = f"{self.mode().lower()} grid buy"
         prior_trade_count = len(self.trades)
-        self.buy(dt, self.cfg.chunk_qty, fill_price, reason)
+        self.buy(dt, self.cfg.chunk_qty, fill_price, reason, tag="grid")
         return len(self.trades) > prior_trade_count and self.trades[-1]["side"] == "BUY"
 
     def maybe_repair(self, dt, close_price: float) -> bool:
-        if not self.improved or not self.cfg.allow_repair or not self.lots:
+        if not self.improved or not self.cfg.allow_repair or self.grid_open_qty <= 0:
             return False
         if self.mode() != "RECOVERY":
             return False
         if self.realized_grid_pnl <= 0:
             return False
 
-        highest_index = max(range(len(self.lots)), key=lambda idx: self.lots[idx].price)
+        grid_indexes = [idx for idx, lot in enumerate(self.lots) if lot.tag == "grid"]
+        if not grid_indexes:
+            return False
+
+        highest_index = max(grid_indexes, key=lambda idx: self.lots[idx].price)
         highest = self.lots[highest_index]
         if highest.price <= close_price:
             return False
@@ -361,9 +427,17 @@ class GridStrategyBacktester:
             "close": price,
             "mode": self.mode(),
             "open_qty": self.open_qty,
+            "core_open_qty": self.core_open_qty,
+            "grid_open_qty": self.grid_open_qty,
             "avg_cost": self.avg_cost(),
+            "core_avg_cost": self.avg_cost_by_tag("core"),
+            "grid_avg_cost": self.avg_cost_by_tag("grid"),
+            "core_open_cost": self.open_cost_by_tag("core"),
+            "grid_open_cost": self.open_cost_by_tag("grid"),
             "realized_grid_pnl": self.realized_grid_pnl,
             "unrealized_pnl": self.unrealized_pnl(price),
+            "core_unrealized_pnl": self.unrealized_pnl_by_tag(price, "core"),
+            "grid_unrealized_pnl": self.unrealized_pnl_by_tag(price, "grid"),
             "total_fees": self.total_fees,
             "total_interest": self.total_interest,
             "mtf_borrowed_amount": self.mtf_borrowed_amount(),
@@ -379,10 +453,14 @@ class GridStrategyBacktester:
             raise ValueError("chunk_qty must be positive")
         if self.cfg.initial_qty <= 0:
             raise ValueError("initial_qty must be positive")
+        if self.target_core_qty() <= 0:
+            raise ValueError("core_qty must be positive")
+        if self.target_core_qty() > self.cfg.initial_qty:
+            raise ValueError("core_qty cannot exceed initial_qty")
         if self.cfg.mtf_leverage < 1.0:
             raise ValueError("mtf_leverage must be greater than or equal to 1.0")
-        if self.cfg.normal_max_qty < self.cfg.initial_qty:
-            raise ValueError("normal_max_qty must be at least initial_qty")
+        if self.cfg.normal_max_qty < self.target_core_qty():
+            raise ValueError("normal_max_qty must be at least core_qty")
         if self.cfg.caution_max_qty < self.cfg.normal_max_qty:
             raise ValueError("caution_max_qty must be greater than or equal to normal_max_qty")
         if self.cfg.hard_max_qty < self.cfg.caution_max_qty:
@@ -398,6 +476,14 @@ class GridStrategyBacktester:
             required_cash = self.cfg.initial_qty * price + self.fee(self.cfg.initial_qty)
             if self.cash < required_cash:
                 raise ValueError("Starting cash cannot fund initial buy")
+
+    def initialize_position(self, dt, price: float):
+        core_qty = self.target_core_qty()
+        initial_grid_qty = self.cfg.initial_qty - core_qty
+
+        self.buy(dt, core_qty, price, "initial core buy", tag="core")
+        if initial_grid_qty > 0:
+            self.buy(dt, initial_grid_qty, price, "initial grid buy", tag="grid")
 
     def run(self, price_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         df = price_df.copy()
@@ -422,7 +508,7 @@ class GridStrategyBacktester:
         first = df.iloc[0]
         first_close = float(first["close"])
         self.validate_initial_buy(first_close)
-        self.buy(first["datetime"], self.cfg.initial_qty, first_close, "initial lump-sum/base buy")
+        self.initialize_position(first["datetime"], first_close)
         self.mark_equity(first["datetime"], first_close)
         previous_dt = first["datetime"]
 
@@ -474,7 +560,10 @@ def summarize(equity: pd.DataFrame, trades: pd.DataFrame) -> Dict[str, Any]:
         "final_total_pnl": float(equity["total_pnl"].iloc[-1]),
         "max_drawdown": max_drawdown(equity["total_pnl"]),
         "max_open_qty": int(equity["open_qty"].max()),
+        "max_grid_open_qty": int(equity["grid_open_qty"].max()),
         "final_open_qty": int(equity["open_qty"].iloc[-1]),
+        "final_core_open_qty": int(equity["core_open_qty"].iloc[-1]),
+        "final_grid_open_qty": int(equity["grid_open_qty"].iloc[-1]),
         "final_breakeven_price": float(equity["breakeven_price"].iloc[-1]),
         "realized_grid_pnl": float(equity["realized_grid_pnl"].iloc[-1]),
         "total_interest": float(equity["total_interest"].iloc[-1]),
@@ -588,7 +677,7 @@ def fetch_fyers_history(symbol: str, start: str, end: str, resolution: str = "1"
         raise RuntimeError("FYERS returned no candles for the requested symbol/date range.")
 
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s")
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
     return df[["datetime", "open", "high", "low", "close", "volume"]].sort_values("datetime").reset_index(drop=True)
 
 
@@ -759,9 +848,11 @@ def plot_diagnostics(result: Dict[str, pd.DataFrame], output_path: Optional[str]
     axes[2].legend()
 
     ax4 = axes[3]
-    ax4.plot(improved_equity["datetime"], improved_equity["open_qty"], label="Open qty")
+    ax4.plot(improved_equity["datetime"], improved_equity["open_qty"], label="Total open qty")
+    ax4.plot(improved_equity["datetime"], improved_equity["core_open_qty"], label="Core qty")
+    ax4.plot(improved_equity["datetime"], improved_equity["grid_open_qty"], label="Grid qty")
     ax4.set_title("Improved strategy inventory and breakeven")
-    ax4.set_ylabel("Open qty")
+    ax4.set_ylabel("Quantity")
     ax4b = ax4.twinx()
     ax4b.plot(improved_equity["datetime"], improved_equity["breakeven_price"], label="Breakeven price")
     ax4b.set_ylabel("Breakeven price")
@@ -799,6 +890,7 @@ def config_to_dict(
         "starting_cash": starting_cash,
         "chunk_qty": cfg.chunk_qty,
         "initial_qty": cfg.initial_qty,
+        "core_qty": cfg.core_qty if cfg.core_qty is not None else cfg.initial_qty,
         "grid_pct": cfg.grid_pct,
         "min_profit_pct": cfg.min_profit_pct,
         "fee_per_share": cfg.fee_per_share,
@@ -829,6 +921,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--chunk-qty", type=int, default=70)
     parser.add_argument("--initial-qty", type=int, default=420)
+    parser.add_argument("--core-qty", type=int, default=None, help="Protected core holding quantity. Defaults to initial_qty")
     parser.add_argument("--grid-pct", type=float, default=0.005, help="0.005 means 0.5 percent")
     parser.add_argument("--min-profit-pct", type=float, default=0.006, help="0.006 means 0.6 percent target for sell")
     parser.add_argument("--fee-per-share", type=float, default=0.0)
@@ -856,6 +949,7 @@ if __name__ == "__main__":
         symbol=args.symbol,
         chunk_qty=args.chunk_qty,
         initial_qty=args.initial_qty,
+        core_qty=args.core_qty,
         grid_pct=args.grid_pct,
         min_profit_pct=args.min_profit_pct,
         fee_per_share=args.fee_per_share,
