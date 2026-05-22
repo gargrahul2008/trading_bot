@@ -19,18 +19,27 @@ class Lot:
 @dataclass
 class BacktestConfig:
     symbol: str = "RELIANCE"
+    capital_allocated: Optional[float] = None
     chunk_qty: int = 70
     initial_qty: int = 420
     core_qty: Optional[int] = None
+    initial_capital_frac: Optional[float] = None
+    core_capital_frac: Optional[float] = None
+    chunk_capital: Optional[float] = None
+    chunk_capital_frac: Optional[float] = None
     grid_pct: float = 0.005
     min_profit_pct: float = 0.006
     fee_per_share: float = 0.0
     mtf_interest_annual: float = 0.0
     mtf_leverage: float = 1.0
+    normal_capital_frac: Optional[float] = None
+    caution_capital_frac: Optional[float] = None
+    hard_capital_frac: Optional[float] = None
     normal_max_qty: int = 560
     caution_max_qty: int = 840
     hard_max_qty: int = 1050
     recovery_extra_sell_qty: int = 70
+    recovery_extra_sell_capital: Optional[float] = None
     allow_repair: bool = False
     repair_profit_fraction: float = 0.50
     use_intrabar: bool = True
@@ -51,6 +60,8 @@ class GridStrategyBacktester:
         self.last_buy_price: Optional[float] = None
         self.last_sell_price: Optional[float] = None
         self.base_anchor_price: Optional[float] = None
+        self.resolved_initial_qty: Optional[int] = None
+        self.resolved_core_qty: Optional[int] = None
 
         self.trades: List[Dict[str, Any]] = []
         self.equity: List[Dict[str, Any]] = []
@@ -59,7 +70,60 @@ class GridStrategyBacktester:
     def open_qty(self) -> int:
         return sum(lot.qty for lot in self.lots)
 
+    def capital_mode_enabled(self) -> bool:
+        return self.cfg.capital_allocated is not None and self.cfg.capital_allocated > 0
+
+    def gross_exposure_limit(self) -> Optional[float]:
+        if not self.capital_mode_enabled():
+            return None
+        return float(self.cfg.capital_allocated) * float(self.cfg.mtf_leverage)
+
+    def exposure_ratio(self) -> Optional[float]:
+        gross_limit = self.gross_exposure_limit()
+        if gross_limit is None or gross_limit <= 0:
+            return None
+        return self.open_cost() / gross_limit
+
+    def current_chunk_qty(self, price: float) -> int:
+        if self.cfg.chunk_capital is not None and self.cfg.chunk_capital > 0:
+            return max(1, int(self.cfg.chunk_capital // price))
+        if self.capital_mode_enabled() and self.cfg.chunk_capital_frac is not None and self.cfg.chunk_capital_frac > 0:
+            chunk_capital = float(self.cfg.capital_allocated) * float(self.cfg.chunk_capital_frac)
+            return max(1, int(chunk_capital // price))
+        return self.cfg.chunk_qty
+
+    def current_recovery_extra_sell_qty(self, price: float) -> int:
+        if self.cfg.recovery_extra_sell_capital is not None and self.cfg.recovery_extra_sell_capital > 0:
+            return max(1, int(self.cfg.recovery_extra_sell_capital // price))
+        return self.cfg.recovery_extra_sell_qty
+
+    def resolve_initial_qty(self, price: float) -> int:
+        if self.cfg.initial_capital_frac is not None:
+            if not self.capital_mode_enabled():
+                raise ValueError("initial_capital_frac requires capital_allocated")
+            initial_capital = float(self.cfg.capital_allocated) * float(self.cfg.initial_capital_frac)
+            qty = int(initial_capital // price)
+            if qty <= 0:
+                raise ValueError("Initial capital allocation is too small to buy even one share")
+            return qty
+        return self.cfg.initial_qty
+
+    def resolve_core_qty(self, price: float, initial_qty: int) -> int:
+        if self.cfg.core_capital_frac is not None:
+            if not self.capital_mode_enabled():
+                raise ValueError("core_capital_frac requires capital_allocated")
+            core_capital = float(self.cfg.capital_allocated) * float(self.cfg.core_capital_frac)
+            qty = int(core_capital // price)
+            if qty <= 0:
+                raise ValueError("Core capital allocation is too small to buy even one share")
+            return min(initial_qty, qty)
+        if self.cfg.core_qty is None:
+            return initial_qty
+        return self.cfg.core_qty
+
     def target_core_qty(self) -> int:
+        if self.resolved_core_qty is not None:
+            return self.resolved_core_qty
         return self.cfg.initial_qty if self.cfg.core_qty is None else self.cfg.core_qty
 
     def open_qty_by_tag(self, tag: str) -> int:
@@ -81,6 +145,15 @@ class GridStrategyBacktester:
     def mode(self) -> str:
         if not self.improved:
             return "BASELINE"
+        if self.capital_mode_enabled() and self.cfg.normal_capital_frac is not None and self.cfg.caution_capital_frac is not None:
+            ratio = self.exposure_ratio()
+            if ratio is None:
+                return "NORMAL"
+            if ratio >= self.cfg.caution_capital_frac:
+                return "RECOVERY"
+            if ratio >= self.cfg.normal_capital_frac:
+                return "CAUTION"
+            return "NORMAL"
         if self.open_qty >= self.cfg.caution_max_qty:
             return "RECOVERY"
         if self.open_qty >= self.cfg.normal_max_qty:
@@ -310,10 +383,18 @@ class GridStrategyBacktester:
     def can_buy(self, qty: Optional[int] = None, price: Optional[float] = None) -> bool:
         buy_qty = qty or 0
 
-        if self.improved and buy_qty > 0 and self.open_qty + buy_qty > self.cfg.hard_max_qty:
+        if qty is not None and price is not None and self.capital_mode_enabled():
+            projected_open_cost = self.open_cost() + qty * price
+            gross_limit = self.gross_exposure_limit()
+            if gross_limit is not None:
+                hard_fraction = self.cfg.hard_capital_frac if self.cfg.hard_capital_frac is not None else 1.0
+                if projected_open_cost > gross_limit * hard_fraction:
+                    return False
+
+        if self.improved and not self.capital_mode_enabled() and buy_qty > 0 and self.open_qty + buy_qty > self.cfg.hard_max_qty:
             return False
 
-        if qty is not None and price is not None and self.use_cash_runway:
+        if qty is not None and price is not None and self.use_cash_runway and not self.capital_mode_enabled():
             required_cash = qty * price + self.fee(qty)
             if self.cash < required_cash:
                 return False
@@ -321,6 +402,9 @@ class GridStrategyBacktester:
         return True
 
     def cash_usage_ratio(self, current_price: float) -> float:
+        gross_limit = self.gross_exposure_limit()
+        if gross_limit is not None and gross_limit > 0:
+            return self.open_cost() / gross_limit
         total_equity = self.cash + self.open_qty * current_price
         if total_equity <= 0:
             return 1.0
@@ -420,11 +504,11 @@ class GridStrategyBacktester:
                 return sells_done
 
             chosen = min(triggered_candidates, key=lambda item: float(item["threshold"]))
-            sell_qty = self.cfg.chunk_qty
+            sell_qty = self.current_chunk_qty(float(chosen["fill_price"]))
             reason = str(chosen["reason"])
 
             if self.improved and self.mode() == "RECOVERY":
-                sell_qty += self.cfg.recovery_extra_sell_qty
+                sell_qty += self.current_recovery_extra_sell_qty(float(chosen["fill_price"]))
                 reason = f"recovery: {reason} + inventory reduction"
 
             self.sell_grid_lifo(dt, sell_qty, float(chosen["fill_price"]), reason)
@@ -464,7 +548,8 @@ class GridStrategyBacktester:
         chosen = max(triggered_candidates, key=lambda item: float(item["threshold"]))
         reason = str(chosen["reason"])
         prior_trade_count = len(self.trades)
-        self.buy(dt, self.cfg.chunk_qty, float(chosen["fill_price"]), reason, tag="grid")
+        buy_qty = self.current_chunk_qty(float(chosen["fill_price"]))
+        self.buy(dt, buy_qty, float(chosen["fill_price"]), reason, tag="grid")
         return len(self.trades) > prior_trade_count and self.trades[-1]["side"] == "BUY"
 
     def maybe_repair(self, dt, close_price: float) -> bool:
@@ -487,9 +572,10 @@ class GridStrategyBacktester:
         loss_per_share = highest.price - close_price
         profit_budget = self.realized_grid_pnl * self.cfg.repair_profit_fraction
         affordable_qty = int(profit_budget // loss_per_share)
-        repair_qty = min(self.cfg.chunk_qty, highest.qty, affordable_qty)
+        repair_chunk_qty = self.current_chunk_qty(close_price)
+        repair_qty = min(repair_chunk_qty, highest.qty, affordable_qty)
 
-        if repair_qty < self.cfg.chunk_qty:
+        if repair_qty < repair_chunk_qty:
             return False
 
         self._sell_from_lot_index(
@@ -526,6 +612,10 @@ class GridStrategyBacktester:
             "base_anchor_price": self.base_anchor_price,
             "last_buy_price": self.last_buy_price,
             "last_sell_price": self.last_sell_price,
+            "gross_exposure_limit": self.gross_exposure_limit(),
+            "current_exposure": self.open_cost(),
+            "available_exposure": None if self.gross_exposure_limit() is None else self.gross_exposure_limit() - self.open_cost(),
+            "exposure_ratio": self.exposure_ratio(),
             "mtf_borrowed_amount": self.mtf_borrowed_amount(),
             "mtf_borrowed_fraction": self.mtf_borrowed_fraction(),
             "total_pnl": self.total_pnl(price),
@@ -535,38 +625,66 @@ class GridStrategyBacktester:
         })
 
     def validate_config(self):
-        if self.cfg.chunk_qty <= 0:
+        if self.cfg.chunk_qty <= 0 and (self.cfg.chunk_capital is None and self.cfg.chunk_capital_frac is None):
             raise ValueError("chunk_qty must be positive")
         if self.cfg.initial_qty <= 0:
             raise ValueError("initial_qty must be positive")
-        if self.target_core_qty() <= 0:
-            raise ValueError("core_qty must be positive")
-        if self.target_core_qty() > self.cfg.initial_qty:
-            raise ValueError("core_qty cannot exceed initial_qty")
         if self.cfg.mtf_leverage < 1.0:
             raise ValueError("mtf_leverage must be greater than or equal to 1.0")
-        if self.cfg.normal_max_qty < self.target_core_qty():
-            raise ValueError("normal_max_qty must be at least core_qty")
         if self.cfg.caution_max_qty < self.cfg.normal_max_qty:
             raise ValueError("caution_max_qty must be greater than or equal to normal_max_qty")
         if self.cfg.hard_max_qty < self.cfg.caution_max_qty:
             raise ValueError("hard_max_qty must be greater than or equal to caution_max_qty")
         if self.effective_intrabar_mode() not in {"optimistic", "one_order_per_candle", "conservative", "close_only"}:
             raise ValueError("intrabar_mode must be one of: optimistic, one_order_per_candle, conservative, close_only")
+        if self.cfg.capital_allocated is not None and self.cfg.capital_allocated <= 0:
+            raise ValueError("capital_allocated must be positive")
+        for name in ("initial_capital_frac", "core_capital_frac", "chunk_capital_frac", "normal_capital_frac", "caution_capital_frac", "hard_capital_frac"):
+            value = getattr(self.cfg, name)
+            if value is not None and not (0 < value <= 1):
+                raise ValueError(f"{name} must be between 0 and 1")
+        if self.cfg.initial_capital_frac is not None and self.cfg.core_capital_frac is not None:
+            if self.cfg.core_capital_frac > self.cfg.initial_capital_frac:
+                raise ValueError("core_capital_frac cannot exceed initial_capital_frac")
+        if self.cfg.normal_capital_frac is not None and self.cfg.caution_capital_frac is not None:
+            if self.cfg.caution_capital_frac < self.cfg.normal_capital_frac:
+                raise ValueError("caution_capital_frac must be greater than or equal to normal_capital_frac")
+        if self.cfg.hard_capital_frac is not None and self.cfg.caution_capital_frac is not None:
+            if self.cfg.hard_capital_frac < self.cfg.caution_capital_frac:
+                raise ValueError("hard_capital_frac must be greater than or equal to caution_capital_frac")
 
     def validate_initial_buy(self, price: float):
-        if self.improved and self.cfg.initial_qty > self.cfg.hard_max_qty:
+        initial_qty = self.resolve_initial_qty(price)
+        core_qty = self.resolve_core_qty(price, initial_qty)
+
+        if initial_qty <= 0:
+            raise ValueError("Resolved initial quantity must be positive")
+        if core_qty <= 0:
+            raise ValueError("Resolved core quantity must be positive")
+        if core_qty > initial_qty:
+            raise ValueError("Resolved core quantity cannot exceed resolved initial quantity")
+
+        if self.improved and not self.capital_mode_enabled() and initial_qty > self.cfg.hard_max_qty:
             raise ValueError("initial_qty cannot exceed hard_max_qty")
 
-        if self.use_cash_runway:
-            required_cash = self.cfg.initial_qty * price + self.fee(self.cfg.initial_qty)
+        if self.use_cash_runway and not self.capital_mode_enabled():
+            required_cash = initial_qty * price + self.fee(initial_qty)
             if self.cash < required_cash:
                 raise ValueError("Starting cash cannot fund initial buy")
 
     def initialize_position(self, dt, price: float):
-        core_qty = self.target_core_qty()
-        initial_grid_qty = self.cfg.initial_qty - core_qty
         self.base_anchor_price = price
+        initial_qty = self.resolve_initial_qty(price)
+        core_qty = self.resolve_core_qty(price, initial_qty)
+        self.resolved_initial_qty = initial_qty
+        self.resolved_core_qty = core_qty
+
+        if not self.improved:
+            self.buy(dt, initial_qty, price, "initial tradable buy", tag="grid")
+            self.last_sell_price = price
+            return
+
+        initial_grid_qty = initial_qty - core_qty
 
         self.buy(dt, core_qty, price, "initial core buy", tag="core")
         if initial_grid_qty > 0:
@@ -975,18 +1093,27 @@ def config_to_dict(
         "provider": provider,
         "resolution": resolution,
         "starting_cash": starting_cash,
+        "capital_allocated": cfg.capital_allocated,
         "chunk_qty": cfg.chunk_qty,
+        "chunk_capital": cfg.chunk_capital,
+        "chunk_capital_frac": cfg.chunk_capital_frac,
         "initial_qty": cfg.initial_qty,
+        "initial_capital_frac": cfg.initial_capital_frac,
         "core_qty": cfg.core_qty if cfg.core_qty is not None else cfg.initial_qty,
+        "core_capital_frac": cfg.core_capital_frac,
         "grid_pct": cfg.grid_pct,
         "min_profit_pct": cfg.min_profit_pct,
         "fee_per_share": cfg.fee_per_share,
         "mtf_interest_annual": cfg.mtf_interest_annual,
         "mtf_leverage": cfg.mtf_leverage,
+        "normal_capital_frac": cfg.normal_capital_frac,
+        "caution_capital_frac": cfg.caution_capital_frac,
+        "hard_capital_frac": cfg.hard_capital_frac,
         "normal_max_qty": cfg.normal_max_qty,
         "caution_max_qty": cfg.caution_max_qty,
         "hard_max_qty": cfg.hard_max_qty,
         "recovery_extra_sell_qty": cfg.recovery_extra_sell_qty,
+        "recovery_extra_sell_capital": cfg.recovery_extra_sell_capital,
         "allow_repair": cfg.allow_repair,
         "repair_profit_fraction": cfg.repair_profit_fraction,
         "use_intrabar": cfg.use_intrabar,
@@ -1006,18 +1133,27 @@ if __name__ == "__main__":
     parser.add_argument("--starting-cash", type=float, default=None, help="Optional runway cash. Example: 1000000")
     parser.add_argument("--output-prefix", default=None)
 
+    parser.add_argument("--capital-allocated", type=float, default=None, help="Capital allocated to this symbol before leverage")
     parser.add_argument("--chunk-qty", type=int, default=70)
+    parser.add_argument("--chunk-capital", type=float, default=None, help="Optional per-trade chunk capital in rupees")
+    parser.add_argument("--chunk-capital-frac", type=float, default=None, help="Optional per-trade chunk as fraction of allocated capital")
     parser.add_argument("--initial-qty", type=int, default=420)
+    parser.add_argument("--initial-capital-frac", type=float, default=None, help="Optional initial deployment as fraction of allocated capital")
     parser.add_argument("--core-qty", type=int, default=None, help="Protected core holding quantity. Defaults to initial_qty")
+    parser.add_argument("--core-capital-frac", type=float, default=None, help="Optional protected core as fraction of allocated capital")
     parser.add_argument("--grid-pct", type=float, default=0.005, help="0.005 means 0.5 percent")
     parser.add_argument("--min-profit-pct", type=float, default=0.006, help="0.006 means 0.6 percent target for sell")
     parser.add_argument("--fee-per-share", type=float, default=0.0)
     parser.add_argument("--mtf-interest-annual", type=float, default=0.0, help="Example: 0.12 means 12 percent annual carry")
     parser.add_argument("--mtf-leverage", type=float, default=1.0, help="Example: 3.0 means interest is charged on 2/3 of inventory cost")
+    parser.add_argument("--normal-capital-frac", type=float, default=None, help="Exposure ratio where improved mode enters CAUTION")
+    parser.add_argument("--caution-capital-frac", type=float, default=None, help="Exposure ratio where improved mode enters RECOVERY")
+    parser.add_argument("--hard-capital-frac", type=float, default=None, help="Max exposure ratio allowed for new buys")
     parser.add_argument("--normal-max-qty", type=int, default=560)
     parser.add_argument("--caution-max-qty", type=int, default=840)
     parser.add_argument("--hard-max-qty", type=int, default=1050)
     parser.add_argument("--recovery-extra-sell-qty", type=int, default=70)
+    parser.add_argument("--recovery-extra-sell-capital", type=float, default=None, help="Optional extra recovery sell size in rupees")
     parser.add_argument("--allow-repair", action="store_true")
     parser.add_argument("--repair-profit-fraction", type=float, default=0.50)
     parser.add_argument(
@@ -1034,18 +1170,27 @@ if __name__ == "__main__":
 
     cfg = BacktestConfig(
         symbol=args.symbol,
+        capital_allocated=args.capital_allocated,
         chunk_qty=args.chunk_qty,
+        chunk_capital=args.chunk_capital,
+        chunk_capital_frac=args.chunk_capital_frac,
         initial_qty=args.initial_qty,
+        initial_capital_frac=args.initial_capital_frac,
         core_qty=args.core_qty,
+        core_capital_frac=args.core_capital_frac,
         grid_pct=args.grid_pct,
         min_profit_pct=args.min_profit_pct,
         fee_per_share=args.fee_per_share,
         mtf_interest_annual=args.mtf_interest_annual,
         mtf_leverage=args.mtf_leverage,
+        normal_capital_frac=args.normal_capital_frac,
+        caution_capital_frac=args.caution_capital_frac,
+        hard_capital_frac=args.hard_capital_frac,
         normal_max_qty=args.normal_max_qty,
         caution_max_qty=args.caution_max_qty,
         hard_max_qty=args.hard_max_qty,
         recovery_extra_sell_qty=args.recovery_extra_sell_qty,
+        recovery_extra_sell_capital=args.recovery_extra_sell_capital,
         allow_repair=args.allow_repair,
         repair_profit_fraction=args.repair_profit_fraction,
         use_intrabar=intrabar_mode != "close_only",
