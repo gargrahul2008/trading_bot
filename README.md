@@ -69,6 +69,28 @@ streamlit run dashboard/streamlit_app.py
 - Example config: `strategies/pct_ladder/config.fyers.json_auth.example.json`
 - The auth page stores the latest `access_token` back into `fyers_auth.json`, and `run_strategy.py` reads from that file directly.
 
+### FYERS auto-auth via TOTP
+- If your FYERS login uses TOTP 2FA, you can refresh the token without manual OTP entry.
+- Add these fields to the user record in `fyers_auth.json`:
+  - `fy_id`
+  - `pin`
+  - `totp_key`
+  - optional `app_id_type` (default `"2"` for web login)
+- Example one-time refresh:
+```bash
+python scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user1 --once
+```
+- Example long-running daily refresh at 08:30 IST:
+```bash
+python scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user1 --loop --daily-at 08:30 --timezone Asia/Kolkata
+```
+- The script updates the selected user inside `fyers_auth.json` with:
+  - `access_token`
+  - `auth_code`
+  - `refresh_token` when returned by FYERS
+  - `token_updated_at`
+- If you want it to start automatically after reboot, use cron or systemd to launch the script.
+
 ### Dashboard access file
 Example `dashboard_access.json`:
 ```json

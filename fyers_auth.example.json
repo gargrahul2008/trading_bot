@@ -4,6 +4,10 @@
       "label": "User 1",
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
+      "fy_id": "YOUR_FYERS_ID",
+      "pin": "YOUR_4_DIGIT_PIN",
+      "totp_key": "YOUR_TOTP_SECRET",
+      "app_id_type": "2",
       "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
       "access_token": ""
     },
@@ -11,6 +15,10 @@
       "label": "User 2",
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
+      "fy_id": "YOUR_FYERS_ID",
+      "pin": "YOUR_4_DIGIT_PIN",
+      "totp_key": "YOUR_TOTP_SECRET",
+      "app_id_type": "2",
       "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
       "access_token": ""
     },
@@ -18,6 +26,10 @@
       "label": "User 3",
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
+      "fy_id": "YOUR_FYERS_ID",
+      "pin": "YOUR_4_DIGIT_PIN",
+      "totp_key": "YOUR_TOTP_SECRET",
+      "app_id_type": "2",
       "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
       "access_token": ""
     },
@@ -25,6 +37,10 @@
       "label": "User 4",
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
+      "fy_id": "YOUR_FYERS_ID",
+      "pin": "YOUR_4_DIGIT_PIN",
+      "totp_key": "YOUR_TOTP_SECRET",
+      "app_id_type": "2",
       "redirect_uri": "http://127.0.0.1:8501/fyers-auth",
       "access_token": ""
     }
