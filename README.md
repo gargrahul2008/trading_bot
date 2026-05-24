@@ -72,17 +72,27 @@ streamlit run dashboard/streamlit_app.py
 ### FYERS auto-auth via TOTP
 - If your FYERS login uses TOTP 2FA, you can refresh the token without manual OTP entry.
 - Add these fields to the user record in `fyers_auth.json`:
+  - `auto_refresh`
   - `fy_id`
   - `pin`
   - `totp_key`
   - optional `app_id_type` (default `"2"` for web login)
+- Set `auto_refresh: true` only for the users you want this script to update.
 - Example one-time refresh:
 ```bash
 python scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user1 --once
 ```
+- Example one-time refresh for all users with `auto_refresh: true`:
+```bash
+python scripts/fyers_auto_auth.py --auth-file fyers_auth.json --enabled-only --once
+```
 - Example long-running daily refresh at 08:30 IST:
 ```bash
 python scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user1 --loop --daily-at 08:30 --timezone Asia/Kolkata
+```
+- Example long-running daily refresh for all enabled users:
+```bash
+python scripts/fyers_auto_auth.py --auth-file fyers_auth.json --enabled-only --loop --daily-at 08:30 --timezone Asia/Kolkata
 ```
 - The script updates the selected user inside `fyers_auth.json` with:
   - `access_token`

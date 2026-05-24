@@ -2,6 +2,7 @@
   "users": {
     "user1": {
       "label": "User 1",
+      "auto_refresh": false,
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
       "fy_id": "YOUR_FYERS_ID",
@@ -13,6 +14,7 @@
     },
     "user2": {
       "label": "User 2",
+      "auto_refresh": false,
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
       "fy_id": "YOUR_FYERS_ID",
@@ -24,6 +26,7 @@
     },
     "user3": {
       "label": "User 3",
+      "auto_refresh": false,
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
       "fy_id": "YOUR_FYERS_ID",
@@ -35,6 +38,7 @@
     },
     "user4": {
       "label": "User 4",
+      "auto_refresh": false,
       "client_id": "YOUR_APP_ID",
       "secret_key": "YOUR_SECRET_KEY",
       "fy_id": "YOUR_FYERS_ID",

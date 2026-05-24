@@ -156,12 +156,25 @@ def exchange_auth_code(*, client_id: str, secret_key: str, redirect_uri: str, au
     return response
 
 
-def auto_refresh_user(auth_file: str, *, user_key: str) -> Dict[str, Any]:
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _auto_refresh_enabled(rec: Dict[str, Any]) -> bool:
+    return _is_truthy(rec.get("auto_refresh"))
+
+
+def auto_refresh_user(auth_file: str, *, user_key: str, require_enabled: bool = False) -> Dict[str, Any]:
     raw = load_auth_file(auth_file)
     users = raw.get("users") or {}
     rec = users.get(user_key)
     if not isinstance(rec, dict):
         raise KeyError(f"User {user_key!r} not found in {auth_file}")
+    if require_enabled and not _auto_refresh_enabled(rec):
+        raise ValueError(f"User {user_key!r} is not enabled for auto refresh")
     _require_user_fields(rec, user_key=user_key)
 
     client_id = str(rec["client_id"]).strip()
@@ -214,6 +227,21 @@ def auto_refresh_user(auth_file: str, *, user_key: str) -> Dict[str, Any]:
     return token_response
 
 
+def auto_refresh_enabled_users(auth_file: str) -> Dict[str, Dict[str, Any]]:
+    raw = load_auth_file(auth_file)
+    users = raw.get("users") or {}
+    if not isinstance(users, dict):
+        return {}
+    results: Dict[str, Dict[str, Any]] = {}
+    for user_key, rec in users.items():
+        if not isinstance(user_key, str) or not isinstance(rec, dict):
+            continue
+        if not _auto_refresh_enabled(rec):
+            continue
+        results[user_key] = auto_refresh_user(auth_file, user_key=user_key, require_enabled=True)
+    return results
+
+
 def _next_run_delay_seconds(*, hhmm: str, tz_name: str) -> float:
     tz = ZoneInfo(tz_name)
     now = dt.datetime.now(tz)
@@ -239,7 +267,8 @@ def _run_loop(*, auth_file: str, user_key: str, daily_at: str, tz_name: str) -> 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Refresh FYERS access token using stored TOTP/PIN and save it into fyers_auth.json.")
     ap.add_argument("--auth-file", default=str(REPO_ROOT / "fyers_auth.json"))
-    ap.add_argument("--user-key", required=True)
+    ap.add_argument("--user-key", help="Refresh only this one user.")
+    ap.add_argument("--enabled-only", action="store_true", help="Refresh all users where auto_refresh=true in fyers_auth.json.")
     ap.add_argument("--daily-at", default="08:30", help="IST/local run time in HH:MM format when --loop is enabled.")
     ap.add_argument("--timezone", default="Asia/Kolkata")
     ap.add_argument("--loop", action="store_true", help="Keep running and refresh daily at --daily-at.")
@@ -247,14 +276,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _run_once(*, auth_file: str, user_key: str | None, enabled_only: bool) -> int:
+    if enabled_only:
+        results = auto_refresh_enabled_users(auth_file)
+        if not results:
+            print(f"[fyers_auto_auth] no users with auto_refresh=true in {auth_file}", flush=True)
+            return 0
+        for key in results:
+            print(f"[fyers_auto_auth] token refreshed for {key} in {auth_file}", flush=True)
+        return 0
+    if not user_key:
+        raise SystemExit("Provide --user-key or use --enabled-only.")
+    auto_refresh_user(auth_file, user_key=user_key)
+    print(f"[fyers_auto_auth] token refreshed for {user_key} in {auth_file}", flush=True)
+    return 0
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     if args.loop and args.once:
         raise SystemExit("Use either --loop or --once, not both.")
+    if args.user_key and args.enabled_only:
+        raise SystemExit("Use either --user-key or --enabled-only, not both.")
     if not args.loop:
-        auto_refresh_user(args.auth_file, user_key=args.user_key)
-        print(f"[fyers_auto_auth] token refreshed for {args.user_key} in {args.auth_file}", flush=True)
+        return _run_once(auth_file=args.auth_file, user_key=args.user_key, enabled_only=args.enabled_only)
+    if args.enabled_only:
+        while True:
+            delay = _next_run_delay_seconds(hhmm=args.daily_at, tz_name=args.timezone)
+            print(f"[fyers_auto_auth] next enabled-only run at {args.daily_at} {args.timezone} in {int(delay)}s", flush=True)
+            time.sleep(delay)
+            try:
+                results = auto_refresh_enabled_users(args.auth_file)
+                if not results:
+                    print(f"[fyers_auto_auth] no users with auto_refresh=true in {args.auth_file}", flush=True)
+                    continue
+                for key in results:
+                    print(f"[fyers_auto_auth] token refreshed for {key} at {_now_utc_iso()}", flush=True)
+            except Exception as exc:
+                print(f"[fyers_auto_auth] enabled-only refresh failed: {exc}", file=sys.stderr, flush=True)
         return 0
+    if not args.user_key:
+        raise SystemExit("Provide --user-key when using --loop, or use --enabled-only.")
     _run_loop(auth_file=args.auth_file, user_key=args.user_key, daily_at=args.daily_at, tz_name=args.timezone)
     return 0
 
