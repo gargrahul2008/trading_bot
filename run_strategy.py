@@ -191,6 +191,7 @@ def main() -> None:
         sync_on_start=bool(ex.get("sync_on_start") or False),
         adopt_broker_inventory=bool(ex.get("adopt_broker_inventory") or False),
         manual_adjustments_path=manual_adjustments_path,
+        regular_market_open=str(ex["regular_market_open"]) if ex.get("regular_market_open") else None,
     )
 
     state.extras["reconcile_crypto_balances"] = bool(ex.get("reconcile_crypto_balances", False))

@@ -40,6 +40,7 @@ class BacktestConfig:
     hard_max_qty: int = 1050
     recovery_extra_sell_qty: int = 70
     recovery_extra_sell_capital: Optional[float] = None
+    runway_pct: float = 0.0
     allow_repair: bool = False
     repair_profit_fraction: float = 0.50
     use_intrabar: bool = True
@@ -59,6 +60,7 @@ class GridStrategyBacktester:
         self.total_interest = 0.0
         self.last_buy_price: Optional[float] = None
         self.last_sell_price: Optional[float] = None
+        self._awaiting_buyback = False
         self.base_anchor_price: Optional[float] = None
         self.resolved_initial_qty: Optional[int] = None
         self.resolved_core_qty: Optional[int] = None
@@ -256,6 +258,7 @@ class GridStrategyBacktester:
         self.total_fees += fee
         self.lots.append(Lot(qty=qty, price=price, tag=tag))
         self.last_buy_price = price
+        self._awaiting_buyback = False
 
         self.trades.append({
             "datetime": dt,
@@ -372,11 +375,15 @@ class GridStrategyBacktester:
         self.sell_tagged_lifo(dt, qty, price, reason, allowed_tags={"grid"})
         if qty > 0:
             self.last_sell_price = price
+            self._awaiting_buyback = True
             if self.trades:
                 self.trades[-1]["last_sell_price_after"] = self.last_sell_price
 
     def next_buy_gap(self) -> float:
-        if self.mode() == "CAUTION":
+        mode = self.mode()
+        if mode == "RECOVERY":
+            return self.cfg.grid_pct * 4
+        if mode == "CAUTION":
             return self.cfg.grid_pct * 2
         return self.cfg.grid_pct
 
@@ -421,7 +428,12 @@ class GridStrategyBacktester:
         lot_index = self.latest_grid_lot_index()
         if lot_index is None:
             return None
-        return self.lots[lot_index].price * (1 + self.cfg.min_profit_pct)
+        lot = self.lots[lot_index]
+        lot_target = lot.price * (1 + self.cfg.min_profit_pct)
+        if self.last_sell_price is not None:
+            cascade_floor = self.last_sell_price * (1 + self.cfg.grid_pct)
+            lot_target = max(lot_target, cascade_floor)
+        return lot_target
 
     def upper_sell_anchor_price(self) -> Optional[float]:
         if self.grid_open_qty <= 0:
@@ -445,7 +457,7 @@ class GridStrategyBacktester:
                 "reason": f"{self.mode().lower()} grid buy",
             })
 
-        if self.last_sell_price is not None:
+        if self.last_sell_price is not None and self._awaiting_buyback:
             candidates.append({
                 "threshold": self.last_sell_price * (1 - self.cfg.grid_pct),
                 "reason": "upper grid buyback",
@@ -471,6 +483,12 @@ class GridStrategyBacktester:
             })
 
         return candidates
+
+    def min_grid_qty_for_runway(self, price: float) -> int:
+        if not self.cfg.runway_pct or self.cfg.runway_pct <= 0:
+            return 0
+        min_chunks = int(self.cfg.runway_pct / self.cfg.grid_pct)
+        return min_chunks * self.current_chunk_qty(price)
 
     def maybe_sell(self, dt, high_price: float, close_price: float, max_sells: Optional[int] = None) -> int:
         sells_done = 0
@@ -511,6 +529,12 @@ class GridStrategyBacktester:
                 sell_qty += self.current_recovery_extra_sell_qty(float(chosen["fill_price"]))
                 reason = f"recovery: {reason} + inventory reduction"
 
+            min_grid = self.min_grid_qty_for_runway(float(chosen["fill_price"]))
+            if self.grid_open_qty - sell_qty < min_grid:
+                sell_qty = self.grid_open_qty - min_grid
+                if sell_qty <= 0:
+                    return sells_done
+
             self.sell_grid_lifo(dt, sell_qty, float(chosen["fill_price"]), reason)
             sells_done += 1
 
@@ -520,6 +544,8 @@ class GridStrategyBacktester:
         return sells_done
 
     def maybe_buy(self, dt, low_price: float, close_price: float) -> bool:
+        if self.improved and self.mode() == "RECOVERY":
+            return False
         candidates = self.next_buy_candidates()
         if not candidates:
             return False
@@ -732,9 +758,10 @@ class GridStrategyBacktester:
                 buy_hit = any(low <= float(candidate["threshold"]) for candidate in self.next_buy_candidates())
                 sell_hit = any(high >= float(candidate["threshold"]) for candidate in self.next_sell_candidates())
 
+                acted = False
                 if buy_hit:
-                    self.maybe_buy(dt, low, close)
-                elif sell_hit:
+                    acted = self.maybe_buy(dt, low, close)
+                if not acted and sell_hit:
                     self.maybe_sell(dt, high, close, max_sells=1)
             else:
                 max_sells = 1 if intrabar_mode == "one_order_per_candle" else None
@@ -865,24 +892,41 @@ def fetch_fyers_history(symbol: str, start: str, end: str, resolution: str = "1"
         log_path="",
     )
 
-    response = fyers.history(data={
-        "symbol": symbol,
-        "resolution": resolution,
-        "date_format": "1",
-        "range_from": start,
-        "range_to": end,
-        "cont_flag": "1",
-    })
+    # Fyers limits 1-min data to 100-day windows — fetch in chunks
+    from datetime import datetime as _dt, timedelta as _td
+    chunk_days = 99
+    start_dt = _dt.strptime(start, "%Y-%m-%d")
+    end_dt = _dt.strptime(end, "%Y-%m-%d")
+    all_candles: list = []
 
-    if not isinstance(response, dict) or response.get("s") != "ok":
-        raise RuntimeError(f"FYERS history API error: {response}")
+    chunk_start = start_dt
+    while chunk_start < end_dt:
+        chunk_end = min(chunk_start + _td(days=chunk_days), end_dt)
+        response = fyers.history(data={
+            "symbol": symbol,
+            "resolution": resolution,
+            "date_format": "1",
+            "range_from": chunk_start.strftime("%Y-%m-%d"),
+            "range_to": chunk_end.strftime("%Y-%m-%d"),
+            "cont_flag": "1",
+        })
 
-    candles = response.get("candles", [])
-    if not candles:
+        if not isinstance(response, dict) or response.get("s") != "ok":
+            raise RuntimeError(f"FYERS history API error: {response}")
+
+        candles = response.get("candles", [])
+        if candles:
+            all_candles.extend(candles)
+            print(f"  [fyers] {chunk_start.strftime('%Y-%m-%d')} → {chunk_end.strftime('%Y-%m-%d')}: {len(candles):,} candles")
+
+        chunk_start = chunk_end + _td(days=1)
+
+    if not all_candles:
         raise RuntimeError("FYERS returned no candles for the requested symbol/date range.")
 
-    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    df = df.drop_duplicates(subset="datetime")
     return df[["datetime", "open", "high", "low", "close", "volume"]].sort_values("datetime").reset_index(drop=True)
 
 
@@ -1011,6 +1055,20 @@ def plot_backtest_result(result: Dict[str, pd.DataFrame], output_path: Optional[
     return output_path
 
 
+def _shade_modes(ax, datetimes, modes):
+    """Add colored background bands for NORMAL/CAUTION/RECOVERY modes."""
+    mode_colors = {"NORMAL": "#d4edda", "CAUTION": "#fff3cd", "RECOVERY": "#f8d7da", "BASELINE": "#e2e3e5"}
+    prev_mode = modes.iloc[0]
+    start_dt = datetimes.iloc[0]
+    for i in range(1, len(modes)):
+        if modes.iloc[i] != prev_mode or i == len(modes) - 1:
+            end_dt = datetimes.iloc[i]
+            color = mode_colors.get(prev_mode, "#f0f0f0")
+            ax.axvspan(start_dt, end_dt, alpha=0.3, color=color, linewidth=0)
+            prev_mode = modes.iloc[i]
+            start_dt = end_dt
+
+
 def plot_diagnostics(result: Dict[str, pd.DataFrame], output_path: Optional[str] = None):
     prices = result["prices"].copy()
     improved_trades = result["improved_trades"].copy()
@@ -1022,26 +1080,41 @@ def plot_diagnostics(result: Dict[str, pd.DataFrame], output_path: Optional[str]
     baseline_equity["datetime"] = pd.to_datetime(baseline_equity["datetime"])
     improved_equity["datetime"] = pd.to_datetime(improved_equity["datetime"])
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 14), sharex=False)
+    fig, axes = plt.subplots(5, 1, figsize=(14, 18), sharex=False,
+                             gridspec_kw={"height_ratios": [3, 2, 2, 2, 1]})
 
-    axes[0].plot(prices["datetime"], prices["close"], label="Close")
+    # Panel 1: Price + buy/sell markers + mode background
+    ax0 = axes[0]
+    _shade_modes(ax0, improved_equity["datetime"], improved_equity["mode"])
+    ax0.plot(prices["datetime"], prices["close"], color="black", linewidth=0.8, label="Close")
     buys = improved_trades[improved_trades["side"] == "BUY"]
     sells = improved_trades[improved_trades["side"] == "SELL"]
     if len(buys):
-        axes[0].scatter(buys["datetime"], buys["price"], marker="^", label="BUY")
+        ax0.scatter(buys["datetime"], buys["price"], marker="^", s=20, color="green",
+                    alpha=0.7, label=f"BUY ({len(buys)})", zorder=3)
     if len(sells):
-        axes[0].scatter(sells["datetime"], sells["price"], marker="v", label="SELL")
-    axes[0].set_title("Price with improved-strategy buy/sell markers")
-    axes[0].set_ylabel("Price")
-    axes[0].legend()
+        ax0.scatter(sells["datetime"], sells["price"], marker="v", s=20, color="red",
+                    alpha=0.7, label=f"SELL ({len(sells)})", zorder=3)
+    from matplotlib.patches import Patch
+    mode_patches = [
+        Patch(facecolor="#d4edda", alpha=0.5, label="NORMAL"),
+        Patch(facecolor="#fff3cd", alpha=0.5, label="CAUTION"),
+        Patch(facecolor="#f8d7da", alpha=0.5, label="RECOVERY"),
+    ]
+    handles, labels = ax0.get_legend_handles_labels()
+    ax0.legend(handles=handles + mode_patches, fontsize=8, ncol=3)
+    ax0.set_title("Price + Mode Zones + Trades")
+    ax0.set_ylabel("Price")
 
+    # Panel 2: PnL equity curve
     axes[1].plot(baseline_equity["datetime"], baseline_equity["total_pnl"], label="Baseline total PnL")
     axes[1].plot(improved_equity["datetime"], improved_equity["total_pnl"], label="Improved total PnL")
     axes[1].axhline(0, linewidth=1)
     axes[1].set_title("Total PnL equity curve")
     axes[1].set_ylabel("PnL")
-    axes[1].legend()
+    axes[1].legend(fontsize=8)
 
+    # Panel 3: PnL components
     axes[2].plot(improved_equity["datetime"], improved_equity["realized_grid_pnl"], label="Realized grid PnL")
     axes[2].plot(improved_equity["datetime"], improved_equity["unrealized_pnl"], label="Unrealized inventory PnL")
     axes[2].plot(improved_equity["datetime"], -improved_equity["total_interest"], label="Accumulated interest cost")
@@ -1050,21 +1123,38 @@ def plot_diagnostics(result: Dict[str, pd.DataFrame], output_path: Optional[str]
     axes[2].axhline(0, linewidth=1)
     axes[2].set_title("Improved strategy PnL components")
     axes[2].set_ylabel("PnL")
-    axes[2].legend()
+    axes[2].legend(fontsize=8)
 
-    ax4 = axes[3]
-    ax4.plot(improved_equity["datetime"], improved_equity["open_qty"], label="Total open qty")
-    ax4.plot(improved_equity["datetime"], improved_equity["core_open_qty"], label="Core qty")
-    ax4.plot(improved_equity["datetime"], improved_equity["grid_open_qty"], label="Grid qty")
-    ax4.set_title("Improved strategy inventory and breakeven")
-    ax4.set_ylabel("Quantity")
-    ax4b = ax4.twinx()
-    ax4b.plot(improved_equity["datetime"], improved_equity["breakeven_price"], label="Breakeven price")
-    ax4b.set_ylabel("Breakeven price")
+    # Panel 4: Inventory with mode background
+    ax3 = axes[3]
+    _shade_modes(ax3, improved_equity["datetime"], improved_equity["mode"])
+    ax3.fill_between(improved_equity["datetime"], 0, improved_equity["open_qty"],
+                     alpha=0.3, color="steelblue", label="Total open qty")
+    ax3.fill_between(improved_equity["datetime"], 0, improved_equity["core_open_qty"],
+                     alpha=0.5, color="orange", label="Core qty")
+    ax3.plot(improved_equity["datetime"], improved_equity["grid_open_qty"],
+             color="green", linewidth=0.8, label="Grid qty")
+    ax3.set_title("Inventory (grid vs core) + Mode Zones")
+    ax3.set_ylabel("Quantity")
+    ax3b = ax3.twinx()
+    ax3b.plot(improved_equity["datetime"], improved_equity["breakeven_price"],
+              color="purple", linewidth=0.8, alpha=0.6, label="Breakeven price")
+    ax3b.set_ylabel("Breakeven price")
+    lines1, labels1 = ax3.get_legend_handles_labels()
+    lines2, labels2 = ax3b.get_legend_handles_labels()
+    ax3.legend(handles=lines1 + lines2, fontsize=8, loc="upper left")
 
-    lines1, labels1 = ax4.get_legend_handles_labels()
-    lines2, labels2 = ax4b.get_legend_handles_labels()
-    ax4.legend(lines1 + lines2, labels1 + labels2)
+    # Panel 5: Mode timeline (compact strip)
+    ax4 = axes[4]
+    mode_map = {"NORMAL": 0, "CAUTION": 1, "RECOVERY": 2, "BASELINE": -1}
+    mode_colors_line = {"NORMAL": "#28a745", "CAUTION": "#ffc107", "RECOVERY": "#dc3545", "BASELINE": "#6c757d"}
+    mode_num = improved_equity["mode"].map(mode_map).fillna(-1)
+    _shade_modes(ax4, improved_equity["datetime"], improved_equity["mode"])
+    ax4.plot(improved_equity["datetime"], mode_num, color="black", linewidth=0.5)
+    ax4.set_yticks([0, 1, 2])
+    ax4.set_yticklabels(["NORMAL", "CAUTION", "RECOVERY"])
+    ax4.set_ylim(-0.5, 2.5)
+    ax4.set_title("Mode Timeline")
 
     for ax in axes:
         ax.tick_params(axis="x", rotation=45)
@@ -1115,6 +1205,7 @@ def config_to_dict(
         "recovery_extra_sell_qty": cfg.recovery_extra_sell_qty,
         "recovery_extra_sell_capital": cfg.recovery_extra_sell_capital,
         "allow_repair": cfg.allow_repair,
+        "runway_pct": cfg.runway_pct,
         "repair_profit_fraction": cfg.repair_profit_fraction,
         "use_intrabar": cfg.use_intrabar,
         "intrabar_mode": cfg.intrabar_mode,

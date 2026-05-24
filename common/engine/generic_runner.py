@@ -47,7 +47,8 @@ class GenericRunner:
     def __init__(self, *, broker: Broker, state: GlobalState, symbols: List[str], exec_cfg: ExecutionConfig,
                  trades_path: str, rejects_path: str, market_tz: str, market_open: str, market_close: str,
                  eod_cancel_time: str, poll_seconds: int, closed_poll_seconds: int, cancel_all_open_orders: bool,
-                 sync_on_start: bool, adopt_broker_inventory: bool, manual_adjustments_path: str | None = None):
+                 sync_on_start: bool, adopt_broker_inventory: bool, manual_adjustments_path: str | None = None,
+                 regular_market_open: str | None = None):
         self.broker = broker
         self.state = state
         self.symbols = symbols
@@ -58,6 +59,7 @@ class GenericRunner:
         self.manual_adjustments_path = manual_adjustments_path
         self.market_tz = market_tz
         self.open_t = parse_hhmm(market_open)
+        self.regular_open_t = parse_hhmm(regular_market_open) if regular_market_open else self.open_t
         self.close_t = parse_hhmm(market_close)
         self.eod_cancel_t = parse_hhmmss(eod_cancel_time)
         self.poll_seconds = int(poll_seconds)
@@ -1508,8 +1510,18 @@ class GenericRunner:
         import math
         _disc_pct = _dec(getattr(self.exec_cfg, "pro_disclosed_pct", D0))
 
+        _in_preopen = False
+        if _disc_pct > D0 and self.regular_open_t != self.open_t:
+            import pytz
+            _tz = pytz.timezone(self.market_tz)
+            _now_local = utcnow().astimezone(_tz)
+            _reg_open = _now_local.replace(hour=self.regular_open_t.hour, minute=self.regular_open_t.minute, second=0, microsecond=0)
+            _in_preopen = _now_local < _reg_open
+            if _in_preopen:
+                LOG.info("PRO %s pre-open session: disclosed qty suppressed until %s", sym, self.regular_open_t)
+
         def _disclosed(qty: Decimal) -> int:
-            if _disc_pct <= D0:
+            if _disc_pct <= D0 or _in_preopen:
                 return 0
             return math.ceil(float(qty * _disc_pct))
 
