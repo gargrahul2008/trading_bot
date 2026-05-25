@@ -1582,6 +1582,13 @@ class GenericRunner:
                         self._apply_fill(sym, side, executed, avg_px, cum_q,
                                          reason=f"pro_{side.lower()}_partial_cancel",
                                          order_id=oid, status="CANCELLED", skip_ref_update=True)
+                        if side == "SELL":
+                            # Recovered a SELL partial fill from a stale order (typically on restart).
+                            # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
+                            cooldown_until = (utcnow() + dt.timedelta(seconds=120)).isoformat()
+                            self.state.extras[f"_restart_sell_cooldown_{sym}"] = cooldown_until
+                            LOG.warning("PRO %s: restart SELL partial fill recovered (oid=%s qty=%s) "
+                                        "— sell cooldown active for 120s", sym, oid, executed)
             else:
                 # Fyers: poll until terminal to recover partials
                 filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=10)
@@ -1589,10 +1596,36 @@ class GenericRunner:
                     self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
                                      reason=f"pro_{side.lower()}_partial_cancel",
                                      order_id=oid, status="CANCELLED", skip_ref_update=True)
+                    if side == "SELL":
+                        # Recovered a SELL partial fill from a stale order (typically on restart).
+                        # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
+                        cooldown_until = (utcnow() + dt.timedelta(seconds=120)).isoformat()
+                        self.state.extras[f"_restart_sell_cooldown_{sym}"] = cooldown_until
+                        LOG.warning("PRO %s: restart SELL partial fill recovered (oid=%s qty=%s) "
+                                    "— sell cooldown active for 120s", sym, oid, filled_qty)
         except Exception as e:
             LOG.warning("PRO %s %s smart-cancel partial check failed oid=%s: %s", sym, side, oid, e)
         self._remove_pro_oid(sym, side, oid)
         LOG.info("PRO %s %s smart-cancelled oid=%s (not in new grid)", sym, side, oid)
+
+    def _check_restart_sell_cooldown(self, sym: str) -> bool:
+        """Return True if a restart sell cooldown is active for this symbol (sells should be skipped)."""
+        key = f"_restart_sell_cooldown_{sym}"
+        cooldown_until = self.state.extras.get(key)
+        if not cooldown_until:
+            return False
+        try:
+            if utcnow() < dt.datetime.fromisoformat(cooldown_until):
+                LOG.info("PRO %s SELL: restart sell cooldown active until %s — skipping sell orders",
+                         sym, cooldown_until)
+                return True
+            else:
+                del self.state.extras[key]
+                LOG.info("PRO %s SELL: restart sell cooldown expired", sym)
+                return False
+        except Exception:
+            del self.state.extras[key]
+            return False
 
     def _place_proactive_fixed_step(self, sym: str, strategy, price: Decimal,
                                       n_levels: int, eff_buy_quote: Decimal,
@@ -1707,6 +1740,10 @@ class GenericRunner:
                      sym, remaining_sell_cap, kept_sell_qty)
 
         sell_missing = [(k, p) for k, p in sorted(new_sell_targets.items()) if p not in keep_sell_prices]
+        # Restart sell cooldown: skip placing new sell orders if a partial fill was just
+        # recovered from a stale order (prevents double-selling immediately after restart).
+        if sell_missing and self._check_restart_sell_cooldown(sym):
+            sell_missing = []
         if sell_missing and (effective_sell_cap is None or effective_sell_cap > D0):
             base_qty = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
             available_for_new_sell = max(D0, base_qty - kept_sell_qty)
@@ -1874,6 +1911,7 @@ class GenericRunner:
         _do_place_sell = (
             len(self._get_pro_oid_list(sym, "SELL")) < n_levels
             and (remaining_sell_cap is None or remaining_sell_cap > D0)
+            and not self._check_restart_sell_cooldown(sym)
         )
         if _do_place_sell:
             sell_levels: list = []
