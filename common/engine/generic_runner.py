@@ -1318,7 +1318,7 @@ class GenericRunner:
                             LOG.info("PRO %s %s partial fill recovered: qty=%s @ %s",
                                      sym, side, executed, avg_px)
                 else:
-                    filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=10)
+                    filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=30)
                     if terminal and filled_qty > D0:
                         reason = partial_reason or f"pro_{side.lower()}_partial_cancel"
                         self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
@@ -1326,6 +1326,10 @@ class GenericRunner:
                                          skip_ref_update=True)
                         LOG.info("PRO %s %s partial fill recovered (Fyers): qty=%s @ %s",
                                  sym, side, filled_qty, avg_px)
+                    elif not terminal:
+                        LOG.warning("PRO %s %s partial fill check timed out oid=%s — "
+                                    "fill may be unrecovered; cash may be understated",
+                                    sym, side, oid)
             except Exception as e:
                 LOG.warning("PRO partial fill check after cancel failed %s %s: %s", sym, side, e)
         self._clear_pro_oids(sym, side)
@@ -1635,7 +1639,7 @@ class GenericRunner:
                                         "— sell cooldown active for 120s", sym, oid, executed)
             else:
                 # Fyers: poll until terminal to recover partials
-                filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=10)
+                filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=30)
                 if terminal and filled_qty > D0:
                     self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
                                      reason=f"pro_{side.lower()}_partial_cancel",
@@ -1690,12 +1694,22 @@ class GenericRunner:
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
         step = _dec(cfg.fixed_step)
 
+        # After a gap-fill (pre-open auction executing far from the limit):
+        #   BUY gap-down: sell ref = limit price, buy anchor = fill price
+        #   SELL gap-up:  buy ref = limit price, sell anchor = fill price
+        # This keeps the opposite side anchored at the intended grid level while
+        # placing the same-side next order relative to the actual execution price.
+        _buy_anchor_str = self.state.extras.get(f"_pro_buy_anchor_{sym}")
+        _sell_anchor_str = self.state.extras.get(f"_pro_sell_anchor_{sym}")
+        buy_ref = _dec(_buy_anchor_str) if _buy_anchor_str else ref
+        sell_ref = _dec(_sell_anchor_str) if _sell_anchor_str else ref
+
         # Compute new target prices for all levels on both sides
         new_buy_targets: dict = {}   # k -> price
         new_sell_targets: dict = {}  # k -> price
         for k in range(1, n_levels + 1):
-            bp = self._round_price_to_tick(ref - k * step)
-            sp = self._round_price_to_tick(ref + k * step)
+            bp = self._round_price_to_tick(buy_ref - k * step)
+            sp = self._round_price_to_tick(sell_ref + k * step)
             if bp > D0:
                 new_buy_targets[k] = bp
             if sp > D0:
@@ -2109,6 +2123,35 @@ class GenericRunner:
                     remainder = intended_qty - filled_qty
                     LOG.warning("PRO %s %s partial fill oid=%s: filled=%s of %s (remainder=%s @ intended %.4f) — ref unchanged",
                                 sym, side, oid, filled_qty, intended_qty, remainder, float(fill_px))
+                # Use the order's limit price as the ref anchor for SELL targets.
+                # Gap fills (e.g. pre-open auction) can execute far from the limit;
+                # using fill price would shift the entire grid away from intended levels.
+                # For BUY targets after a gap-fill, anchor to fill price so the next
+                # BUY sits below where we actually bought, not above it.
+                limit_px = self._pro_oid_price.get(oid, D0)
+                if limit_px > D0 and not is_partial:
+                    ss.pending_expected_price = limit_px
+                    if side == "BUY" and fill_px < limit_px:
+                        # Gap-down: BUY filled below its limit (e.g. pre-open auction).
+                        # Sell ref stays at limit; buy anchor at fill so next BUY is below where we bought.
+                        self.state.extras[f"_pro_buy_anchor_{sym}"] = str(fill_px)
+                        self.state.extras.pop(f"_pro_sell_anchor_{sym}", None)
+                        LOG.info("PRO %s BUY gap-fill oid=%s: limit=%.4f fill=%.4f — sell ref=%.4f buy anchor=%.4f",
+                                 sym, oid, float(limit_px), float(fill_px), float(limit_px), float(fill_px))
+                    elif side == "SELL" and fill_px > limit_px:
+                        # Gap-up: SELL filled above its limit (e.g. pre-open auction).
+                        # Buy ref stays at limit; sell anchor at fill so next SELL is above where we sold.
+                        self.state.extras[f"_pro_sell_anchor_{sym}"] = str(fill_px)
+                        self.state.extras.pop(f"_pro_buy_anchor_{sym}", None)
+                        LOG.info("PRO %s SELL gap-fill oid=%s: limit=%.4f fill=%.4f — buy ref=%.4f sell anchor=%.4f",
+                                 sym, oid, float(limit_px), float(fill_px), float(limit_px), float(fill_px))
+                    else:
+                        # Normal fill: clear any stale gap anchors.
+                        self.state.extras.pop(f"_pro_buy_anchor_{sym}", None)
+                        self.state.extras.pop(f"_pro_sell_anchor_{sym}", None)
+                        if fill_px != limit_px:
+                            LOG.info("PRO %s %s fill oid=%s: limit=%.4f fill=%.4f — keeping ref at limit price",
+                                     sym, side, oid, float(limit_px), float(fill_px))
                 self._apply_fill(sym, side, filled_qty, fill_px, cum_q,
                                  reason=reason, order_id=oid, status="FILLED",
                                  skip_ref_update=is_partial)

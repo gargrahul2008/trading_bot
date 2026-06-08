@@ -26,7 +26,8 @@ def is_btst_eligible(symbol: str) -> bool:
     s = symbol.upper().strip()
     if s.startswith("NSE:") and s.endswith("-EQ"):
         return True
-    if s.startswith("BSE:") and s.endswith("-A"):
+    # BSE Group A and Group B stocks are both BTST eligible
+    if s.startswith("BSE:") and (s.endswith("-A") or s.endswith("-B")):
         return True
     return False
 
