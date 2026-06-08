@@ -140,6 +140,9 @@ def main() -> None:
     broker = build_broker(cfg, base_dir)
     strategy = load_strategy(cfg)
 
+    b = cfg.get("broker") or {}
+    is_india = (b.get("type") or "fyers").lower() == "fyers"
+
     ex = cfg.get("execution") or {}
     exec_cfg = ExecutionConfig(
         product_type=str(ex.get("product_type") or "CNC"),
@@ -191,7 +194,8 @@ def main() -> None:
         sync_on_start=bool(ex.get("sync_on_start") or False),
         adopt_broker_inventory=bool(ex.get("adopt_broker_inventory") or False),
         manual_adjustments_path=manual_adjustments_path,
-        regular_market_open=str(ex["regular_market_open"]) if ex.get("regular_market_open") else None,
+        regular_market_open=str(ex.get("regular_market_open") or ("09:15" if is_india else "")) or None,
+        preopen_pause_start=str(ex.get("preopen_pause_start") or ("09:07" if is_india else "")) or None,
     )
 
     state.extras["reconcile_crypto_balances"] = bool(ex.get("reconcile_crypto_balances", False))

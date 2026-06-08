@@ -48,7 +48,8 @@ class GenericRunner:
                  trades_path: str, rejects_path: str, market_tz: str, market_open: str, market_close: str,
                  eod_cancel_time: str, poll_seconds: int, closed_poll_seconds: int, cancel_all_open_orders: bool,
                  sync_on_start: bool, adopt_broker_inventory: bool, manual_adjustments_path: str | None = None,
-                 regular_market_open: str | None = None):
+                 regular_market_open: str | None = None,
+                 preopen_pause_start: str | None = None):
         self.broker = broker
         self.state = state
         self.symbols = symbols
@@ -60,6 +61,7 @@ class GenericRunner:
         self.market_tz = market_tz
         self.open_t = parse_hhmm(market_open)
         self.regular_open_t = parse_hhmm(regular_market_open) if regular_market_open else self.open_t
+        self.preopen_pause_t = parse_hhmm(preopen_pause_start) if preopen_pause_start else self.regular_open_t
         self.close_t = parse_hhmm(market_close)
         self.eod_cancel_t = parse_hhmmss(eod_cancel_time)
         self.poll_seconds = int(poll_seconds)
@@ -292,10 +294,16 @@ class GenericRunner:
             quote_asset = next(iter(quote_assets))
             self.state.extras["quote_asset"] = quote_asset
 
-            q = bals.get(quote_asset) or {}
-            if not self.state.extras.get("strategy_cash_initialized"):
-                self.state.cash = _dec(q.get("free") or "0")
+            isolated = getattr(self.exec_cfg, "isolated_cash", False)
+            if isolated:
+                # Multi-bot on one account: cash tracked from fills only, never sync from broker.
                 self.state.extras["strategy_cash_initialized"] = True
+                LOG.info("Crypto isolated_cash: skipping broker cash sync, state cash=%.4f", float(self.state.cash))
+            else:
+                q = bals.get(quote_asset) or {}
+                if not self.state.extras.get("strategy_cash_initialized"):
+                    self.state.cash = _dec(q.get("free") or "0")
+                    self.state.extras["strategy_cash_initialized"] = True
 
             # if not self.adopt_broker_inventory:
             #     return
@@ -727,7 +735,43 @@ class GenericRunner:
             ss.reference_price = price
             ss.initialized = True
 
+    def _compute_port_val(self, prices: Dict[str, Decimal]):
+        """Returns (port_val, quote_asset, port_details).
+        When isolated_cash is true, derives values from THIS bot's state instead of broker totals,
+        so multi-bot setups on one exchange account don't double-count.
+        """
+        if getattr(self.exec_cfg, "isolated_cash", False):
+            total = _dec(self.state.cash)
+            per_symbol: Dict[str, Any] = {}
+            for sym in self.symbols:
+                ss = self.state.symbol_states.get(sym)
+                if ss is None:
+                    continue
+                px = _dec(prices.get(sym) or 0)
+                qty = _dec(ss.traded_qty)
+                total += qty * px
+                try:
+                    info = self.broker.symbol_info(sym)
+                    base = info.base_asset
+                except Exception:
+                    base = sym[:-4] if sym.endswith(("USDC", "USDT")) else sym
+                per_symbol[sym] = {"base": base, "base_total": str(qty), "px": str(px)}
+            quote_asset = str(self.state.extras.get("quote_asset") or "USDC")
+            details = {"quote_total": str(_dec(self.state.cash)), "per_symbol": per_symbol}
+            return total, quote_asset, details
+        return compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+
     def _update_extras_crypto(self, prices: Dict[str, Decimal]) -> None:
+        isolated = getattr(self.exec_cfg, "isolated_cash", False)
+        if isolated:
+            # Multi-bot on one account: derive portfolio_value from this bot's state, not broker totals.
+            total = _dec(self.state.cash)
+            for sym, px in prices.items():
+                ss = self.state.symbol_states.get(sym)
+                if ss is not None:
+                    total += _dec(ss.traded_qty) * _dec(px)
+            self.state.extras["portfolio_value"] = str(total)
+            return
         # Compute portfolio value if broker provides balances
         try:
             bals = self.broker.balances()
@@ -1003,7 +1047,7 @@ class GenericRunner:
                 pv_str = f" pv={pv}" if pv else ""
                 # --- Stage-1 PnL persistence (hybrid: account + strategy) ---
                 broker_name = infer_broker_name(self.broker)
-                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+                port_val, quote_asset, port_details = self._compute_port_val(prices)
                 start_val = ensure_portfolio_start(self.state, port_val)
                 port_pnl = port_val - start_val
                 port_pnl_pct = (port_pnl / start_val) if start_val > 0 else D0
@@ -2240,6 +2284,16 @@ class GenericRunner:
 
             allow_new = (now >= open_dt) and (now < eod_cancel_dt)
 
+            # Pre-open pause: NSE blocks order entry/cancel between pause_start and regular open.
+            # Only active when market_open < regular_market_open (i.e. pre-open trading is enabled).
+            in_preopen_pause = False
+            if self.open_t < self.regular_open_t:
+                preopen_pause_dt = now.replace(hour=self.preopen_pause_t.hour, minute=self.preopen_pause_t.minute, second=0, microsecond=0)
+                regular_open_dt = now.replace(hour=self.regular_open_t.hour, minute=self.regular_open_t.minute, second=0, microsecond=0)
+                in_preopen_pause = (now >= preopen_pause_dt) and (now < regular_open_dt)
+                if in_preopen_pause:
+                    allow_new = False
+
             try:
                 prices = self.broker.get_ltps(self.symbols)
                 for sym, px in prices.items():
@@ -2252,13 +2306,17 @@ class GenericRunner:
                 for sym in self.symbols:
                     self._init_reference(sym, _dec(prices[sym]))
 
-                for sym in self.symbols:
-                    price = _dec(prices[sym])
-                    # Check fills, handle drift, place fresh orders immediately on fill
-                    self._poll_proactive_symbol(sym, strategy, price, allow_new=allow_new)
-                    # Safety net: place any still-missing orders (drift re-center, startup, etc.)
-                    if allow_new:
-                        self._place_proactive_orders(sym, strategy, price)
+                if in_preopen_pause:
+                    LOG.debug("PRO pre-open pause (%s-%s): skipping poll/place",
+                              self.preopen_pause_t.strftime("%H:%M"), self.regular_open_t.strftime("%H:%M"))
+                else:
+                    for sym in self.symbols:
+                        price = _dec(prices[sym])
+                        # Check fills, handle drift, place fresh orders immediately on fill
+                        self._poll_proactive_symbol(sym, strategy, price, allow_new=allow_new)
+                        # Safety net: place any still-missing orders (drift re-center, startup, etc.)
+                        if allow_new:
+                            self._place_proactive_orders(sym, strategy, price)
 
                 # --- Status log ---
                 parts = []
@@ -2271,7 +2329,7 @@ class GenericRunner:
 
                 # --- PnL persistence (identical to run_reactive) ---
                 broker_name = infer_broker_name(self.broker)
-                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+                port_val, quote_asset, port_details = self._compute_port_val(prices)
                 start_val = ensure_portfolio_start(self.state, port_val)
                 port_pnl = port_val - start_val
                 port_pnl_pct = (port_pnl / start_val) if start_val > 0 else D0
@@ -2688,8 +2746,7 @@ class GenericRunner:
 
                 # --- PnL ---
                 broker_name = infer_broker_name(self.broker)
-                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(
-                    self.broker, self.symbols, prices, self.state)
+                port_val, quote_asset, port_details = self._compute_port_val(prices)
                 start_val      = ensure_portfolio_start(self.state, port_val)
                 port_pnl       = port_val - start_val
                 port_pnl_pct   = (port_pnl / start_val) if start_val > 0 else D0
@@ -2993,7 +3050,7 @@ class GenericRunner:
                     parts.append(f"{s} px={px} ref={ref} traded={ss.traded_qty} avg={ss.traded_avg_price} R={ss.realized_pnl}")
                 # --- Stage-1 PnL persistence (hybrid: account + strategy) ---
                 broker_name = infer_broker_name(self.broker)
-                port_val, quote_asset, port_details = compute_portfolio_value_for_symbols(self.broker, self.symbols, prices, self.state)
+                port_val, quote_asset, port_details = self._compute_port_val(prices)
                 start_val = ensure_portfolio_start(self.state, port_val)
                 port_pnl = port_val - start_val
                 port_pnl_pct = (port_pnl / start_val) if start_val > 0 else D0
