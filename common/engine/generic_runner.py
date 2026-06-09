@@ -1630,6 +1630,14 @@ class GenericRunner:
                         self._apply_fill(sym, side, executed, avg_px, cum_q,
                                          reason=f"pro_{side.lower()}_partial_cancel",
                                          order_id=oid, status="CANCELLED", skip_ref_update=True)
+                        oid_price = self._pro_oid_price.get(oid)
+                        oid_intended = self._pro_oid_qty.get(oid, executed)
+                        remaining = oid_intended - executed
+                        if oid_price is not None and remaining > D0:
+                            key = f"_pro_partial_remaining_{sym}_{side}_{oid_price}"
+                            self.state.extras[key] = str(remaining)
+                            LOG.info("PRO %s %s partial cancel oid=%s: filled=%s remaining=%s @ %s",
+                                     sym, side, oid, executed, remaining, oid_price)
                         if side == "SELL":
                             # Recovered a SELL partial fill from a stale order (typically on restart).
                             # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
@@ -1644,6 +1652,14 @@ class GenericRunner:
                     self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
                                      reason=f"pro_{side.lower()}_partial_cancel",
                                      order_id=oid, status="CANCELLED", skip_ref_update=True)
+                    oid_price = self._pro_oid_price.get(oid)
+                    oid_intended = self._pro_oid_qty.get(oid, filled_qty)
+                    remaining = oid_intended - filled_qty
+                    if oid_price is not None and remaining > D0:
+                        key = f"_pro_partial_remaining_{sym}_{side}_{oid_price}"
+                        self.state.extras[key] = str(remaining)
+                        LOG.info("PRO %s %s partial cancel oid=%s: filled=%s remaining=%s @ %s",
+                                 sym, side, oid, filled_qty, remaining, oid_price)
                     if side == "SELL":
                         # Recovered a SELL partial fill from a stale order (typically on restart).
                         # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
@@ -1774,6 +1790,10 @@ class GenericRunner:
         for k, bp in buy_missing:
             if cfg.sizing_mode == "fixed_qty":
                 qty = _dec(cfg.fixed_qty_buy)
+                partial_key = f"_pro_partial_remaining_{sym}_BUY_{bp}"
+                if partial_key in self.state.extras:
+                    qty = _dec(self.state.extras.pop(partial_key))
+                    LOG.info("PRO %s BUY L%d @ %s: re-placing partial remaining qty=%s", sym, k, bp, qty)
             elif cfg.sizing_mode == "banded_qty":
                 band_mid = (bp // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
                 qty = self._round_qty_pro(eff_buy_quote / (band_mid or Decimal("1")), strategy)
@@ -1809,6 +1829,10 @@ class GenericRunner:
             for k, sp in sell_missing:
                 if cfg.sizing_mode == "fixed_qty":
                     qty = _dec(cfg.fixed_qty_sell)
+                    partial_key = f"_pro_partial_remaining_{sym}_SELL_{sp}"
+                    if partial_key in self.state.extras:
+                        qty = _dec(self.state.extras.pop(partial_key))
+                        LOG.info("PRO %s SELL L%d @ %s: re-placing partial remaining qty=%s", sym, k, sp, qty)
                 elif cfg.sizing_mode == "banded_qty":
                     band_mid = (sp // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
                     qty = self._round_qty_pro(eff_sell_quote / (band_mid or Decimal("1")), strategy)
