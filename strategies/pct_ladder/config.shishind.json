@@ -1,7 +1,7 @@
 {
   "_comment": "SHISHIND sell-first grid — 30,000 shares from existing holdings, zero new capital",
   "_capital_notes": {
-    "symbol": "BSE:SHISHIND-B",
+    "symbol": "BSE:SHISHIND-X",
     "reference_price": 12.78,
     "shares_per_level": 10000,
     "levels": 3,
@@ -23,7 +23,7 @@
     "log_path": ""
   },
   "strategy": {
-    "symbols": ["BSE:SHISHIND-B"],
+    "symbols": ["BSE:SHISHIND-X"],
     "upper_pct": 0.7,
     "lower_pct": 0.7,
     "fixed_step": 0.18,

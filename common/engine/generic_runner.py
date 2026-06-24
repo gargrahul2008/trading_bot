@@ -729,6 +729,67 @@ class GenericRunner:
                 self._apply_fill(symbol, term.side, D0, D0, D0, reason=ss.pending_reason or "terminal",
                                  order_id=term.order_id, status=term.status)
 
+    def _migrate_renamed_symbol_extras(self) -> None:
+        """On startup, detect if the configured symbol was renamed from another symbol.
+        If the new symbol is missing its pro_net_sold key but exactly one orphaned
+        pro_net_sold_* key exists (from the old name), migrate all symbol-keyed extras
+        and symbol_states from old -> new automatically.
+        """
+        _PREFIXES = (
+            "pro_net_sold_", "pro_buy_oids_", "pro_sell_oids_",
+            "_itm_buy_placed_", "_itm_sell_placed_",
+            "_pro_buy_anchor_", "_pro_sell_anchor_", "broker_base_qty_",
+        )
+        for sym in self.symbols:
+            if self.state.extras.get(f"pro_net_sold_{sym}") is not None:
+                continue
+            # Find orphaned pro_net_sold_* keys not belonging to any configured symbol
+            configured = {f"pro_net_sold_{s}" for s in self.symbols}
+            orphans = [
+                k for k in self.state.extras
+                if k.startswith("pro_net_sold_") and k not in configured
+            ]
+            if len(orphans) != 1:
+                continue
+            old_sym = orphans[0][len("pro_net_sold_"):]
+            LOG.warning("Symbol rename detected: migrating state from '%s' -> '%s'", old_sym, sym)
+            # Migrate known prefixed extras keys
+            for prefix in _PREFIXES:
+                old_key = f"{prefix}{old_sym}"
+                new_key = f"{prefix}{sym}"
+                if old_key in self.state.extras and new_key not in self.state.extras:
+                    self.state.extras[new_key] = self.state.extras.pop(old_key)
+                    LOG.warning("  extras migrated: %s -> %s", old_key, new_key)
+            # Migrate any partial-remaining keys: _pro_partial_remaining_{sym}_BUY/SELL_*
+            for key in list(self.state.extras.keys()):
+                if old_sym in key:
+                    new_key = key.replace(old_sym, sym, 1)
+                    if new_key not in self.state.extras:
+                        self.state.extras[new_key] = self.state.extras.pop(key)
+                        LOG.warning("  extras migrated: %s -> %s", key, new_key)
+            # Migrate cycles_all_time.per_symbol
+            cps = (self.state.extras.get("cycles_all_time") or {}).get("per_symbol") or {}
+            if old_sym in cps and sym not in cps:
+                cps[sym] = cps.pop(old_sym)
+                LOG.warning("  cycles_all_time.per_symbol migrated: %s -> %s", old_sym, sym)
+            # Migrate symbol_states entry if old still present and new is uninitialized
+            if old_sym in self.state.symbol_states and sym in self.state.symbol_states:
+                old_ss = self.state.symbol_states[old_sym]
+                new_ss = self.state.symbol_states[sym]
+                if old_ss.reference_price is not None and new_ss.reference_price is None:
+                    self.state.symbol_states[sym] = old_ss
+                    LOG.warning("  symbol_states migrated: %s -> %s", old_sym, sym)
+
+    def _restore_oid_prices_from_state(self) -> None:
+        """Restore _pro_oid_price from persisted state so gap-fill ref anchoring
+        works correctly after a restart (limit prices survive in state.extras)."""
+        for sym in self.symbols:
+            for side in ("BUY", "SELL"):
+                for oid in self._get_pro_oid_list(sym, side):
+                    px_str = self.state.extras.get(f"_pro_oid_limitpx_{oid}")
+                    if px_str:
+                        self._pro_oid_price[oid] = _dec(px_str)
+
     def _init_reference(self, symbol: str, price: Decimal) -> None:
         ss = self.state.symbol_states[symbol]
         if ss.reference_price is None:
@@ -1270,11 +1331,14 @@ class GenericRunner:
             self._pro_oid_qty[oid] = qty
         if price > D0:
             self._pro_oid_price[oid] = price
+            # Persist limit price so it survives restarts (used for gap-fill ref anchoring)
+            self.state.extras[f"_pro_oid_limitpx_{oid}"] = str(price)
 
     def _clear_pro_oids(self, sym: str, side: str) -> None:
         for oid in self._get_pro_oid_list(sym, side):
             self._pro_oid_qty.pop(oid, None)
             self._pro_oid_price.pop(oid, None)
+            self.state.extras.pop(f"_pro_oid_limitpx_{oid}", None)
         self.state.extras[f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"] = []
         self.state.extras.pop(f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}", None)
 
@@ -1287,6 +1351,7 @@ class GenericRunner:
         self.state.extras[key] = lst
         self._pro_oid_qty.pop(oid, None)
         self._pro_oid_price.pop(oid, None)
+        self.state.extras.pop(f"_pro_oid_limitpx_{oid}", None)
 
     # Legacy single-oid shims used by status logging and snapshot
     def _get_pro_oids(self, sym: str):
@@ -1803,8 +1868,17 @@ class GenericRunner:
                 continue
             order_cost = qty * bp
             if placed_cash + order_cost > available_cash:
-                LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining", sym, k, bp)
-                break
+                # Try placing a reduced qty with whatever cash remains
+                affordable_qty = self._round_qty_pro((available_cash - placed_cash) / bp, strategy)
+                affordable_cost = affordable_qty * bp
+                if affordable_qty > D0 and affordable_cost >= Decimal("30000"):
+                    LOG.warning("PRO %s BUY L%d @ %s: insufficient cash for full qty=%s, placing reduced qty=%s",
+                                sym, k, bp, qty, affordable_qty)
+                    qty = affordable_qty
+                    order_cost = affordable_cost
+                else:
+                    LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining", sym, k, bp)
+                    break
             orders_to_place.append(("BUY", k, bp, qty, f"pro_buy_L{k}|ref-{k}x{step}"))
             placed_cash += order_cost
 
@@ -2314,6 +2388,8 @@ class GenericRunner:
         Works for both India (Fyers, fixed_qty) and crypto (MEXC, fixed_quote).
         """
         self.state.ensure_symbols(self.symbols)
+        self._migrate_renamed_symbol_extras()
+        self._restore_oid_prices_from_state()
 
         if self.sync_on_start:
             try:
