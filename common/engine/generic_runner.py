@@ -1339,6 +1339,7 @@ class GenericRunner:
             self._pro_oid_qty.pop(oid, None)
             self._pro_oid_price.pop(oid, None)
             self.state.extras.pop(f"_pro_oid_limitpx_{oid}", None)
+            self.state.extras.pop(f"_pro_oid_applied_{oid}", None)
         self.state.extras[f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"] = []
         self.state.extras.pop(f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}", None)
 
@@ -1352,6 +1353,7 @@ class GenericRunner:
         self._pro_oid_qty.pop(oid, None)
         self._pro_oid_price.pop(oid, None)
         self.state.extras.pop(f"_pro_oid_limitpx_{oid}", None)
+        self.state.extras.pop(f"_pro_oid_applied_{oid}", None)
 
     # Legacy single-oid shims used by status logging and snapshot
     def _get_pro_oids(self, sym: str):
@@ -1714,24 +1716,29 @@ class GenericRunner:
                 # Fyers: poll until terminal to recover partials
                 filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=30)
                 if terminal and filled_qty > D0:
-                    self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
-                                     reason=f"pro_{side.lower()}_partial_cancel",
-                                     order_id=oid, status="CANCELLED", skip_ref_update=True)
+                    # Subtract any fill already applied via _poll_live_fills to avoid double-counting.
+                    already_applied = _dec(self.state.extras.get(f"_pro_oid_applied_{oid}", "0"))
+                    delta_fill = max(D0, filled_qty - already_applied)
+                    if delta_fill > D0:
+                        delta_cum_q = avg_px * delta_fill if avg_px > 0 else D0
+                        self._apply_fill(sym, side, delta_fill, avg_px, delta_cum_q,
+                                         reason=f"pro_{side.lower()}_partial_cancel",
+                                         order_id=oid, status="CANCELLED", skip_ref_update=True)
                     oid_price = self._pro_oid_price.get(oid)
                     oid_intended = self._pro_oid_qty.get(oid, filled_qty)
                     remaining = oid_intended - filled_qty
                     if oid_price is not None and remaining > D0:
                         key = f"_pro_partial_remaining_{sym}_{side}_{oid_price}"
                         self.state.extras[key] = str(remaining)
-                        LOG.info("PRO %s %s partial cancel oid=%s: filled=%s remaining=%s @ %s",
-                                 sym, side, oid, filled_qty, remaining, oid_price)
-                    if side == "SELL":
+                        LOG.info("PRO %s %s partial cancel oid=%s: filled=%s already_applied=%s delta=%s remaining=%s @ %s",
+                                 sym, side, oid, filled_qty, already_applied, delta_fill, remaining, oid_price)
+                    if side == "SELL" and delta_fill > D0:
                         # Recovered a SELL partial fill from a stale order (typically on restart).
                         # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
                         cooldown_until = (utcnow() + dt.timedelta(seconds=120)).isoformat()
                         self.state.extras[f"_restart_sell_cooldown_{sym}"] = cooldown_until
                         LOG.warning("PRO %s: restart SELL partial fill recovered (oid=%s qty=%s) "
-                                    "— sell cooldown active for 120s", sym, oid, filled_qty)
+                                    "— sell cooldown active for 120s", sym, oid, delta_fill)
         except Exception as e:
             LOG.warning("PRO %s %s smart-cancel partial check failed oid=%s: %s", sym, side, oid, e)
         self._remove_pro_oid(sym, side, oid)
@@ -1755,6 +1762,49 @@ class GenericRunner:
         except Exception:
             del self.state.extras[key]
             return False
+
+    def _poll_live_fills(self, sym: str) -> None:
+        """Detect and apply partial fills on live (kept) grid orders without cancelling them.
+        Called once per tick before classifying oids as keep/cancel so that kept_sell_qty
+        and available_cash reflect the true remaining unfilled qty.
+
+        _pro_oid_qty[oid] stays as the ORIGINAL intended qty throughout (so _smart_cancel_oid
+        can still compute remaining = intended - total_filled correctly).
+        _pro_oid_applied_{oid} tracks how much has already been credited via this path so that
+        _smart_cancel_oid only credits the delta that hasn't been applied yet.
+        Only active for brokers that expose get_live_fills (currently Fyers)."""
+        if not hasattr(self.broker, "get_live_fills"):
+            return
+        all_buy_oids = self._get_pro_oid_list(sym, "BUY")
+        all_sell_oids = self._get_pro_oid_list(sym, "SELL")
+        all_oids = all_buy_oids + all_sell_oids
+        if not all_oids:
+            return
+        oid_side = {o: "BUY" for o in all_buy_oids}
+        oid_side.update({o: "SELL" for o in all_sell_oids})
+        try:
+            live_fills = self.broker.get_live_fills(all_oids)
+        except Exception as e:
+            LOG.debug("PRO %s live fill poll error: %s", sym, e)
+            return
+        for oid, (broker_filled, avg_px) in live_fills.items():
+            side = oid_side.get(oid)
+            if not side:
+                continue
+            applied_key = f"_pro_oid_applied_{oid}"
+            already_applied = _dec(self.state.extras.get(applied_key, "0"))
+            delta = broker_filled - already_applied
+            if delta <= D0:
+                continue
+            cum_q = avg_px * delta
+            LOG.info("PRO %s %s live partial fill oid=%s: broker_filled=%s already_applied=%s delta=%s @ %s",
+                     sym, side, oid, broker_filled, already_applied, delta, avg_px)
+            self._apply_fill(sym, side, delta, avg_px, cum_q,
+                             reason=f"pro_{side.lower()}_live_partial",
+                             order_id=oid, status="PARTIALLY_FILLED", skip_ref_update=True)
+            self.state.extras[applied_key] = str(broker_filled)
+            # NOTE: _pro_oid_qty[oid] intentionally left as original intended qty.
+            # The classification loop reads already_applied to get effective remaining qty.
 
     def _place_proactive_fixed_step(self, sym: str, strategy, price: Decimal,
                                       n_levels: int, eff_buy_quote: Decimal,
@@ -1799,6 +1849,10 @@ class GenericRunner:
         buy_target_prices = set(new_buy_targets.values())
         sell_target_prices = set(new_sell_targets.values())
 
+        # Detect and apply any live partial fills on kept orders before classifying.
+        # This ensures kept_sell_qty and available_cash reflect actual remaining unfilled qty.
+        self._poll_live_fills(sym)
+
         # Compute sell cap before classifying (needed to limit kept sell orders)
         max_pro_sell = getattr(self.exec_cfg, "max_pro_sell_qty", None)
         remaining_sell_cap: "Decimal | None" = None
@@ -1823,17 +1877,20 @@ class GenericRunner:
         # ---- SELL side: classify existing orders (also enforce cap on kept orders) ----
         # kept_sell_qty is subtracted from both base_qty and remaining_sell_cap below
         # so that new orders are only placed against truly unallocated inventory/cap.
+        # Use effective remaining qty (original - already live-applied) for sizing decisions.
         keep_sell_prices: set = set()
         cancel_sell_oids: list = []
         kept_sell_qty = D0
         for oid in list(self._get_pro_oid_list(sym, "SELL")):
             oid_price = self._pro_oid_price.get(oid)
             oid_qty = self._pro_oid_qty.get(oid, _dec(cfg.fixed_qty_sell))
+            already_applied = _dec(self.state.extras.get(f"_pro_oid_applied_{oid}", "0"))
+            effective_remaining = max(D0, oid_qty - already_applied)
             matches_grid = oid_price is not None and oid_price in sell_target_prices
-            within_cap = remaining_sell_cap is None or kept_sell_qty + oid_qty <= remaining_sell_cap
+            within_cap = remaining_sell_cap is None or kept_sell_qty + effective_remaining <= remaining_sell_cap
             if matches_grid and within_cap:
                 keep_sell_prices.add(oid_price)
-                kept_sell_qty += oid_qty
+                kept_sell_qty += effective_remaining
             else:
                 cancel_sell_oids.append(oid)
 
