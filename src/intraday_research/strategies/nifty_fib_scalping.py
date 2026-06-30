@@ -77,6 +77,12 @@ class NiftyBOSFibScalpStrategy(Strategy):
     min_confirmation_rr: float = 0.0   # skip zone_touch_confirmation entries where reward/risk < this
                                        # (guards against confirmation bar consuming most of the move)
 
+    # Target extension (Fibonacci extension beyond the BOS level)
+    #   1.000 → target at BOS level only (original impulse endpoint)  RR ≈ 1.48:1
+    #   1.272 → 127.2% extension  RR ≈ 2.33:1
+    #   1.618 → 161.8% extension  RR ≈ 3.23:1
+    target_extension_ratio: float = 1.0
+
     # Optional indicator filters (disabled by default — base strategy is pure price action)
     use_vwap_filter: bool = False
     use_ema_filter: bool = False
@@ -90,13 +96,13 @@ class NiftyBOSFibScalpStrategy(Strategy):
             self._warn_non_1min(group)
             signal_rows.extend(self._generate_group_signals(group))
         if not signal_rows:
-            return pd.DataFrame(columns=SIGNAL_COLUMNS + ["entry_price"])
+            return pd.DataFrame(columns=SIGNAL_COLUMNS + ["entry_price", "trail_milestones"])
         df = pd.DataFrame(signal_rows)
         # Ensure all standard columns exist (entry_price is optional per-row)
         for col in SIGNAL_COLUMNS:
             if col not in df.columns:
                 df[col] = None
-        return df[SIGNAL_COLUMNS + ["entry_price"]]
+        return df[SIGNAL_COLUMNS + ["entry_price", "trail_milestones"]]
 
     # ── Per-day signal generation ─────────────────────────────────────────────
 
@@ -319,6 +325,8 @@ class NiftyBOSFibScalpStrategy(Strategy):
         # Retracement levels: price bouncing UP from impulse_low toward impulse_high
         fib_50 = impulse_low + 0.50 * size
         fib_618 = impulse_low + float(self.fib_zone_high) * size
+        # Target extends below impulse_low by (extension_ratio - 1) × size
+        target = impulse_low - (float(self.target_extension_ratio) - 1.0) * size
         return _BOSSetup(
             direction="SHORT",
             impulse_high=impulse_high,
@@ -327,7 +335,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             fib_50=fib_50,
             fib_618=fib_618,
             stop_loss=impulse_high + float(self.stop_buffer_points),
-            target=impulse_low,
+            target=target,
             confirmed_at=confirmed_at,
         )
 
@@ -343,6 +351,8 @@ class NiftyBOSFibScalpStrategy(Strategy):
         # Retracement levels: price pulling DOWN from impulse_high toward impulse_low
         fib_50 = impulse_high - 0.50 * size
         fib_618 = impulse_high - float(self.fib_zone_high) * size
+        # Target extends above impulse_high by (extension_ratio - 1) × size
+        target = impulse_high + (float(self.target_extension_ratio) - 1.0) * size
         return _BOSSetup(
             direction="LONG",
             impulse_high=impulse_high,
@@ -351,7 +361,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             fib_50=fib_50,
             fib_618=fib_618,
             stop_loss=impulse_low - float(self.stop_buffer_points),
-            target=impulse_high,
+            target=target,
             confirmed_at=confirmed_at,
         )
 
@@ -414,14 +424,17 @@ class NiftyBOSFibScalpStrategy(Strategy):
     ) -> dict[str, object] | None:
         if setup.direction == "LONG":
             if not setup.zone_touched:
-                # Zone entered when price pulls back into [fib_618, fib_50]
-                if float(row["low"]) <= setup.fib_50:
+                # Zone is [fib_50, fib_618]. Price pulls back DOWN into it, so it
+                # enters from the TOP — hitting fib_618 first, then fib_50 if deeper.
+                # Trigger zone_touched at fib_618 (the zone entry), not fib_50 (the far side).
+                # Using fib_50 made ZONE_CONFIRM harder to trigger than LIMIT618.
+                if float(row["low"]) <= setup.fib_618:
                     setup.zone_touched = True
                     setup.zone_touched_at = idx
                     LOG.debug(
-                        "%s zone_touched LONG symbol=%s ts=%s low=%.2f fib50=%.2f fib618=%.2f",
+                        "%s zone_touched LONG symbol=%s ts=%s low=%.2f fib618=%.2f fib50=%.2f",
                         self.name, row["symbol"], row["timestamp"],
-                        row["low"], setup.fib_50, setup.fib_618,
+                        row["low"], setup.fib_618, setup.fib_50,
                     )
             elif idx == setup.zone_touched_at + 1:
                 # Confirmation bar: must be bullish, close above stop_loss, close below target,
@@ -458,14 +471,16 @@ class NiftyBOSFibScalpStrategy(Strategy):
 
         else:  # SHORT
             if not setup.zone_touched:
-                # Zone entered when price bounces up into [fib_50, fib_618]
-                if float(row["high"]) >= setup.fib_50:
+                # Zone is [fib_618, fib_50]. Price bounces UP into it, so it
+                # enters from the BOTTOM — hitting fib_618 first, then fib_50 if higher.
+                # Trigger zone_touched at fib_618 (the zone entry), not fib_50 (the far side).
+                if float(row["high"]) >= setup.fib_618:
                     setup.zone_touched = True
                     setup.zone_touched_at = idx
                     LOG.debug(
-                        "%s zone_touched SHORT symbol=%s ts=%s high=%.2f fib50=%.2f fib618=%.2f",
+                        "%s zone_touched SHORT symbol=%s ts=%s high=%.2f fib618=%.2f fib50=%.2f",
                         self.name, row["symbol"], row["timestamp"],
-                        row["high"], setup.fib_50, setup.fib_618,
+                        row["high"], setup.fib_618, setup.fib_50,
                     )
             elif idx == setup.zone_touched_at + 1:
                 # Confirmation bar: must be bearish, close above target, and RR >= min_confirmation_rr.
@@ -527,11 +542,27 @@ class NiftyBOSFibScalpStrategy(Strategy):
         setup: _BOSSetup,
         trigger: str,
     ) -> dict[str, object]:
-        # For limit_618 the intended fill is at fib_618 (a limit order placed at that level).
-        # The backtester default is to use the signal bar's close, which for limit_618 can be
-        # far from fib_618 (e.g., close=22800 with fib_618=22823 gives RR of 0.09 instead of
-        # 1.45). Supply entry_price so the backtester fills at the correct limit price.
         entry_price = float(setup.fib_618) if trigger == "limit_618" else float(row["close"])
+
+        # Step-up trail milestones: ordered Fib price levels from nearest to farthest.
+        # The backtester steps the stop up to each confirmed level (one-bar delay).
+        # The LAST milestone is always the configured target and triggers the 50% partial exit.
+        ext = float(self.target_extension_ratio)
+        if setup.direction == "LONG":
+            milestones: list[float] = []
+            if ext > 1.0:
+                milestones.append(float(setup.impulse_high))
+            if ext > 1.272:
+                milestones.append(float(setup.impulse_high) + 0.272 * float(setup.impulse_size))
+            milestones.append(float(setup.target))
+        else:
+            milestones = []
+            if ext > 1.0:
+                milestones.append(float(setup.impulse_low))
+            if ext > 1.272:
+                milestones.append(float(setup.impulse_low) - 0.272 * float(setup.impulse_size))
+            milestones.append(float(setup.target))
+
         return {
             "timestamp": row["timestamp"],
             "symbol": row["symbol"],
@@ -546,6 +577,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             "stop_loss": float(setup.stop_loss),
             "target": float(setup.target),
             "entry_price": entry_price,
+            "trail_milestones": milestones,
             "strategy_name": self.name,
         }
 

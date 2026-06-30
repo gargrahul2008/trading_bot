@@ -63,6 +63,7 @@ def trades_to_frame(trades: Iterable[Trade]) -> pd.DataFrame:
                 "strategy_name": trade.strategy_name,
                 "strategy_reason": trade.strategy_reason,
                 "exit_reason": trade.exit_reason,
+                "is_partial": trade.is_partial,
             }
             for trade in trades
         ]

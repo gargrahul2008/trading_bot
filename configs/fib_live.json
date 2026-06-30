@@ -1,0 +1,27 @@
+{
+  "symbols": ["ETHUSDT", "SOLUSDT"],
+  "trade_value_usd": 5000,
+
+  "strategy": {
+    "variant": "EMA",
+    "min_impulse_pct": 0.25,
+    "target_ext": 1.618,
+    "stop_buffer_pct": 0.009,
+    "use_trailing_stop": true
+  },
+
+  "mexc": {
+    "secrets_file": "mexc_secrets.json"
+  },
+
+  "output_dir": "artifacts/fib_live",
+
+  "_notes": [
+    "Paper mode (default): run without --live flag",
+    "Live mode: python scripts/live_fib_bot.py --config configs/fib_live.json --live",
+    "mexc_secrets.json must be in the same folder as this config and contain {api_key, api_secret}",
+    "trade_value_usd: $5000 per trade → qty = 5000 / price (float, e.g. 2.34 ETH)",
+    "variant: EMA  →  use_ema=True, use_vwap=False  (best config from sweep)",
+    "target_ext 1.618 → time_exit = 90 bars (minutes)"
+  ]
+}

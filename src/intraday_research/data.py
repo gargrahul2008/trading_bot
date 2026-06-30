@@ -32,7 +32,7 @@ class MarketDataLoader:
             raise ValueError(f"Unsupported file format: {source.suffix}")
         return self.prepare(frame)
 
-    def prepare(self, frame: pd.DataFrame) -> pd.DataFrame:
+    def prepare(self, frame: pd.DataFrame, filter_session: bool = True) -> pd.DataFrame:
         missing_columns = REQUIRED_COLUMNS.difference(frame.columns)
         if missing_columns:
             raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
@@ -46,10 +46,13 @@ class MarketDataLoader:
         prepared = prepared.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
         prepared["trade_date"] = prepared["timestamp"].dt.date
 
-        session_mask = prepared["timestamp"].dt.time.between(SESSION_START, SESSION_END)
-        prepared = prepared.loc[session_mask].reset_index(drop=True)
+        if filter_session:
+            session_mask = prepared["timestamp"].dt.time.between(SESSION_START, SESSION_END)
+            prepared = prepared.loc[session_mask].reset_index(drop=True)
+
         self._validate_duplicates(prepared)
-        self._validate_missing_candles(prepared)
+        if filter_session:
+            self._validate_missing_candles(prepared)
         self._validate_ohlcv(prepared)
         return prepared
 

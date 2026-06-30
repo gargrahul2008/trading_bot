@@ -288,8 +288,8 @@ def test_cost_calculation_breakdown(tmp_path) -> None:
     assert trade["gst"] > 0.0
     assert trade["sebi_charges"] > 0.0
     assert trade["stamp_duty"] > 0.0
-    assert trade["entry_slippage"] > 0.0
-    assert trade["exit_slippage"] > 0.0
+    assert trade["entry_slippage"] == 0.0   # limit entry — no slippage
+    assert trade["exit_slippage"] > 0.0    # time_exit is a market order
     assert trade["buy_turnover"] > 0.0
     assert trade["sell_turnover"] > 0.0
     assert trade["total_cost"] > 0.0

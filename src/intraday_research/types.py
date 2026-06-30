@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, Optional
 
@@ -31,6 +31,7 @@ class CombinedSignal:
     target_price: Optional[float]
     explanation: str
     strategy_name: str
+    trail_milestones: tuple[float, ...] = ()
 
     @property
     def side(self) -> SignalSide:
@@ -49,8 +50,8 @@ class CombinedSignal:
 class Position:
     symbol: str
     side: SignalSide
-    quantity: int
-    effective_quantity: int
+    quantity: float
+    effective_quantity: float
     lot_size: int
     entry_time: pd.Timestamp
     entry_price: float
@@ -58,14 +59,18 @@ class Position:
     target_price: Optional[float]
     entry_reason: str
     strategy_name: str
+    trail_milestones: list[float] = field(default_factory=list)
+    trail_milestone_idx: int = 0         # index of next milestone to watch
+    stop_pending: Optional[float] = None # stop to apply on the NEXT bar (one-bar delay)
+    partial_exit_done: bool = False      # True once 50% has been booked at the target
 
 
 @dataclass(frozen=True)
 class Trade:
     symbol: str
     side: SignalSide
-    quantity: int
-    effective_quantity: int
+    quantity: float
+    effective_quantity: float
     lot_size: int
     entry_time: pd.Timestamp
     exit_time: pd.Timestamp
@@ -86,6 +91,7 @@ class Trade:
     strategy_name: str
     strategy_reason: str
     exit_reason: str
+    is_partial: bool = False
 
     @property
     def pnl(self) -> float:
