@@ -729,6 +729,67 @@ class GenericRunner:
                 self._apply_fill(symbol, term.side, D0, D0, D0, reason=ss.pending_reason or "terminal",
                                  order_id=term.order_id, status=term.status)
 
+    def _migrate_renamed_symbol_extras(self) -> None:
+        """On startup, detect if the configured symbol was renamed from another symbol.
+        If the new symbol is missing its pro_net_sold key but exactly one orphaned
+        pro_net_sold_* key exists (from the old name), migrate all symbol-keyed extras
+        and symbol_states from old -> new automatically.
+        """
+        _PREFIXES = (
+            "pro_net_sold_", "pro_buy_oids_", "pro_sell_oids_",
+            "_itm_buy_placed_", "_itm_sell_placed_",
+            "_pro_buy_anchor_", "_pro_sell_anchor_", "broker_base_qty_",
+        )
+        for sym in self.symbols:
+            if self.state.extras.get(f"pro_net_sold_{sym}") is not None:
+                continue
+            # Find orphaned pro_net_sold_* keys not belonging to any configured symbol
+            configured = {f"pro_net_sold_{s}" for s in self.symbols}
+            orphans = [
+                k for k in self.state.extras
+                if k.startswith("pro_net_sold_") and k not in configured
+            ]
+            if len(orphans) != 1:
+                continue
+            old_sym = orphans[0][len("pro_net_sold_"):]
+            LOG.warning("Symbol rename detected: migrating state from '%s' -> '%s'", old_sym, sym)
+            # Migrate known prefixed extras keys
+            for prefix in _PREFIXES:
+                old_key = f"{prefix}{old_sym}"
+                new_key = f"{prefix}{sym}"
+                if old_key in self.state.extras and new_key not in self.state.extras:
+                    self.state.extras[new_key] = self.state.extras.pop(old_key)
+                    LOG.warning("  extras migrated: %s -> %s", old_key, new_key)
+            # Migrate any partial-remaining keys: _pro_partial_remaining_{sym}_BUY/SELL_*
+            for key in list(self.state.extras.keys()):
+                if old_sym in key:
+                    new_key = key.replace(old_sym, sym, 1)
+                    if new_key not in self.state.extras:
+                        self.state.extras[new_key] = self.state.extras.pop(key)
+                        LOG.warning("  extras migrated: %s -> %s", key, new_key)
+            # Migrate cycles_all_time.per_symbol
+            cps = (self.state.extras.get("cycles_all_time") or {}).get("per_symbol") or {}
+            if old_sym in cps and sym not in cps:
+                cps[sym] = cps.pop(old_sym)
+                LOG.warning("  cycles_all_time.per_symbol migrated: %s -> %s", old_sym, sym)
+            # Migrate symbol_states entry if old still present and new is uninitialized
+            if old_sym in self.state.symbol_states and sym in self.state.symbol_states:
+                old_ss = self.state.symbol_states[old_sym]
+                new_ss = self.state.symbol_states[sym]
+                if old_ss.reference_price is not None and new_ss.reference_price is None:
+                    self.state.symbol_states[sym] = old_ss
+                    LOG.warning("  symbol_states migrated: %s -> %s", old_sym, sym)
+
+    def _restore_oid_prices_from_state(self) -> None:
+        """Restore _pro_oid_price from persisted state so gap-fill ref anchoring
+        works correctly after a restart (limit prices survive in state.extras)."""
+        for sym in self.symbols:
+            for side in ("BUY", "SELL"):
+                for oid in self._get_pro_oid_list(sym, side):
+                    px_str = self.state.extras.get(f"_pro_oid_limitpx_{oid}")
+                    if px_str:
+                        self._pro_oid_price[oid] = _dec(px_str)
+
     def _init_reference(self, symbol: str, price: Decimal) -> None:
         ss = self.state.symbol_states[symbol]
         if ss.reference_price is None:
@@ -1270,11 +1331,15 @@ class GenericRunner:
             self._pro_oid_qty[oid] = qty
         if price > D0:
             self._pro_oid_price[oid] = price
+            # Persist limit price so it survives restarts (used for gap-fill ref anchoring)
+            self.state.extras[f"_pro_oid_limitpx_{oid}"] = str(price)
 
     def _clear_pro_oids(self, sym: str, side: str) -> None:
         for oid in self._get_pro_oid_list(sym, side):
             self._pro_oid_qty.pop(oid, None)
             self._pro_oid_price.pop(oid, None)
+            self.state.extras.pop(f"_pro_oid_limitpx_{oid}", None)
+            self.state.extras.pop(f"_pro_oid_applied_{oid}", None)
         self.state.extras[f"pro_buy_oids_{sym}" if side == "BUY" else f"pro_sell_oids_{sym}"] = []
         self.state.extras.pop(f"pro_buy_oid_{sym}" if side == "BUY" else f"pro_sell_oid_{sym}", None)
 
@@ -1287,6 +1352,8 @@ class GenericRunner:
         self.state.extras[key] = lst
         self._pro_oid_qty.pop(oid, None)
         self._pro_oid_price.pop(oid, None)
+        self.state.extras.pop(f"_pro_oid_limitpx_{oid}", None)
+        self.state.extras.pop(f"_pro_oid_applied_{oid}", None)
 
     # Legacy single-oid shims used by status logging and snapshot
     def _get_pro_oids(self, sym: str):
@@ -1630,6 +1697,14 @@ class GenericRunner:
                         self._apply_fill(sym, side, executed, avg_px, cum_q,
                                          reason=f"pro_{side.lower()}_partial_cancel",
                                          order_id=oid, status="CANCELLED", skip_ref_update=True)
+                        oid_price = self._pro_oid_price.get(oid)
+                        oid_intended = self._pro_oid_qty.get(oid, executed)
+                        remaining = oid_intended - executed
+                        if oid_price is not None and remaining > D0:
+                            key = f"_pro_partial_remaining_{sym}_{side}_{oid_price}"
+                            self.state.extras[key] = str(remaining)
+                            LOG.info("PRO %s %s partial cancel oid=%s: filled=%s remaining=%s @ %s",
+                                     sym, side, oid, executed, remaining, oid_price)
                         if side == "SELL":
                             # Recovered a SELL partial fill from a stale order (typically on restart).
                             # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
@@ -1641,16 +1716,29 @@ class GenericRunner:
                 # Fyers: poll until terminal to recover partials
                 filled_qty, avg_px, cum_q, terminal = self._wait_fill_blocking(sym, oid, timeout_s=30)
                 if terminal and filled_qty > D0:
-                    self._apply_fill(sym, side, filled_qty, avg_px, cum_q,
-                                     reason=f"pro_{side.lower()}_partial_cancel",
-                                     order_id=oid, status="CANCELLED", skip_ref_update=True)
-                    if side == "SELL":
+                    # Subtract any fill already applied via _poll_live_fills to avoid double-counting.
+                    already_applied = _dec(self.state.extras.get(f"_pro_oid_applied_{oid}", "0"))
+                    delta_fill = max(D0, filled_qty - already_applied)
+                    if delta_fill > D0:
+                        delta_cum_q = avg_px * delta_fill if avg_px > 0 else D0
+                        self._apply_fill(sym, side, delta_fill, avg_px, delta_cum_q,
+                                         reason=f"pro_{side.lower()}_partial_cancel",
+                                         order_id=oid, status="CANCELLED", skip_ref_update=True)
+                    oid_price = self._pro_oid_price.get(oid)
+                    oid_intended = self._pro_oid_qty.get(oid, filled_qty)
+                    remaining = oid_intended - filled_qty
+                    if oid_price is not None and remaining > D0:
+                        key = f"_pro_partial_remaining_{sym}_{side}_{oid_price}"
+                        self.state.extras[key] = str(remaining)
+                        LOG.info("PRO %s %s partial cancel oid=%s: filled=%s already_applied=%s delta=%s remaining=%s @ %s",
+                                 sym, side, oid, filled_qty, already_applied, delta_fill, remaining, oid_price)
+                    if side == "SELL" and delta_fill > D0:
                         # Recovered a SELL partial fill from a stale order (typically on restart).
                         # Apply a 120s sell cooldown to prevent double-selling in the same cycle.
                         cooldown_until = (utcnow() + dt.timedelta(seconds=120)).isoformat()
                         self.state.extras[f"_restart_sell_cooldown_{sym}"] = cooldown_until
                         LOG.warning("PRO %s: restart SELL partial fill recovered (oid=%s qty=%s) "
-                                    "— sell cooldown active for 120s", sym, oid, filled_qty)
+                                    "— sell cooldown active for 120s", sym, oid, delta_fill)
         except Exception as e:
             LOG.warning("PRO %s %s smart-cancel partial check failed oid=%s: %s", sym, side, oid, e)
         self._remove_pro_oid(sym, side, oid)
@@ -1674,6 +1762,49 @@ class GenericRunner:
         except Exception:
             del self.state.extras[key]
             return False
+
+    def _poll_live_fills(self, sym: str) -> None:
+        """Detect and apply partial fills on live (kept) grid orders without cancelling them.
+        Called once per tick before classifying oids as keep/cancel so that kept_sell_qty
+        and available_cash reflect the true remaining unfilled qty.
+
+        _pro_oid_qty[oid] stays as the ORIGINAL intended qty throughout (so _smart_cancel_oid
+        can still compute remaining = intended - total_filled correctly).
+        _pro_oid_applied_{oid} tracks how much has already been credited via this path so that
+        _smart_cancel_oid only credits the delta that hasn't been applied yet.
+        Only active for brokers that expose get_live_fills (currently Fyers)."""
+        if not hasattr(self.broker, "get_live_fills"):
+            return
+        all_buy_oids = self._get_pro_oid_list(sym, "BUY")
+        all_sell_oids = self._get_pro_oid_list(sym, "SELL")
+        all_oids = all_buy_oids + all_sell_oids
+        if not all_oids:
+            return
+        oid_side = {o: "BUY" for o in all_buy_oids}
+        oid_side.update({o: "SELL" for o in all_sell_oids})
+        try:
+            live_fills = self.broker.get_live_fills(all_oids)
+        except Exception as e:
+            LOG.debug("PRO %s live fill poll error: %s", sym, e)
+            return
+        for oid, (broker_filled, avg_px) in live_fills.items():
+            side = oid_side.get(oid)
+            if not side:
+                continue
+            applied_key = f"_pro_oid_applied_{oid}"
+            already_applied = _dec(self.state.extras.get(applied_key, "0"))
+            delta = broker_filled - already_applied
+            if delta <= D0:
+                continue
+            cum_q = avg_px * delta
+            LOG.info("PRO %s %s live partial fill oid=%s: broker_filled=%s already_applied=%s delta=%s @ %s",
+                     sym, side, oid, broker_filled, already_applied, delta, avg_px)
+            self._apply_fill(sym, side, delta, avg_px, cum_q,
+                             reason=f"pro_{side.lower()}_live_partial",
+                             order_id=oid, status="PARTIALLY_FILLED", skip_ref_update=True)
+            self.state.extras[applied_key] = str(broker_filled)
+            # NOTE: _pro_oid_qty[oid] intentionally left as original intended qty.
+            # The classification loop reads already_applied to get effective remaining qty.
 
     def _place_proactive_fixed_step(self, sym: str, strategy, price: Decimal,
                                       n_levels: int, eff_buy_quote: Decimal,
@@ -1718,6 +1849,10 @@ class GenericRunner:
         buy_target_prices = set(new_buy_targets.values())
         sell_target_prices = set(new_sell_targets.values())
 
+        # Detect and apply any live partial fills on kept orders before classifying.
+        # This ensures kept_sell_qty and available_cash reflect actual remaining unfilled qty.
+        self._poll_live_fills(sym)
+
         # Compute sell cap before classifying (needed to limit kept sell orders)
         max_pro_sell = getattr(self.exec_cfg, "max_pro_sell_qty", None)
         remaining_sell_cap: "Decimal | None" = None
@@ -1742,17 +1877,20 @@ class GenericRunner:
         # ---- SELL side: classify existing orders (also enforce cap on kept orders) ----
         # kept_sell_qty is subtracted from both base_qty and remaining_sell_cap below
         # so that new orders are only placed against truly unallocated inventory/cap.
+        # Use effective remaining qty (original - already live-applied) for sizing decisions.
         keep_sell_prices: set = set()
         cancel_sell_oids: list = []
         kept_sell_qty = D0
         for oid in list(self._get_pro_oid_list(sym, "SELL")):
             oid_price = self._pro_oid_price.get(oid)
             oid_qty = self._pro_oid_qty.get(oid, _dec(cfg.fixed_qty_sell))
+            already_applied = _dec(self.state.extras.get(f"_pro_oid_applied_{oid}", "0"))
+            effective_remaining = max(D0, oid_qty - already_applied)
             matches_grid = oid_price is not None and oid_price in sell_target_prices
-            within_cap = remaining_sell_cap is None or kept_sell_qty + oid_qty <= remaining_sell_cap
+            within_cap = remaining_sell_cap is None or kept_sell_qty + effective_remaining <= remaining_sell_cap
             if matches_grid and within_cap:
                 keep_sell_prices.add(oid_price)
-                kept_sell_qty += oid_qty
+                kept_sell_qty += effective_remaining
             else:
                 cancel_sell_oids.append(oid)
 
@@ -1771,9 +1909,20 @@ class GenericRunner:
         buy_missing = [(k, p) for k, p in sorted(new_buy_targets.items()) if p not in keep_buy_prices]
         available_cash = max(self.state.cash - quote_reserve - kept_buy_cost, D0)
         placed_cash = D0
+        # MEXC and most exchanges reject limit BUYs placed too far above market (price band).
+        # Skip BUY levels that are above the current price — they'd fire as marketable orders anyway,
+        # which is not the grid's intent. The bot will retry placing them once price catches up.
         for k, bp in buy_missing:
+            if price > D0 and bp > price:
+                LOG.debug("PRO %s BUY L%d @ %s: above current price %s, skipping (will place when price catches up)",
+                         sym, k, bp, price)
+                continue
             if cfg.sizing_mode == "fixed_qty":
                 qty = _dec(cfg.fixed_qty_buy)
+                partial_key = f"_pro_partial_remaining_{sym}_BUY_{bp}"
+                if partial_key in self.state.extras:
+                    qty = _dec(self.state.extras.pop(partial_key))
+                    LOG.info("PRO %s BUY L%d @ %s: re-placing partial remaining qty=%s", sym, k, bp, qty)
             elif cfg.sizing_mode == "banded_qty":
                 band_mid = (bp // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
                 qty = self._round_qty_pro(eff_buy_quote / (band_mid or Decimal("1")), strategy)
@@ -1783,8 +1932,17 @@ class GenericRunner:
                 continue
             order_cost = qty * bp
             if placed_cash + order_cost > available_cash:
-                LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining", sym, k, bp)
-                break
+                # Try placing a reduced qty with whatever cash remains
+                affordable_qty = self._round_qty_pro((available_cash - placed_cash) / bp, strategy)
+                affordable_cost = affordable_qty * bp
+                if affordable_qty > D0 and affordable_cost >= Decimal("30000"):
+                    LOG.warning("PRO %s BUY L%d @ %s: insufficient cash for full qty=%s, placing reduced qty=%s",
+                                sym, k, bp, qty, affordable_qty)
+                    qty = affordable_qty
+                    order_cost = affordable_cost
+                else:
+                    LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining", sym, k, bp)
+                    break
             orders_to_place.append(("BUY", k, bp, qty, f"pro_buy_L{k}|ref-{k}x{step}"))
             placed_cash += order_cost
 
@@ -1809,6 +1967,10 @@ class GenericRunner:
             for k, sp in sell_missing:
                 if cfg.sizing_mode == "fixed_qty":
                     qty = _dec(cfg.fixed_qty_sell)
+                    partial_key = f"_pro_partial_remaining_{sym}_SELL_{sp}"
+                    if partial_key in self.state.extras:
+                        qty = _dec(self.state.extras.pop(partial_key))
+                        LOG.info("PRO %s SELL L%d @ %s: re-placing partial remaining qty=%s", sym, k, sp, qty)
                 elif cfg.sizing_mode == "banded_qty":
                     band_mid = (sp // cfg.band_width) * cfg.band_width + cfg.band_width / Decimal("2")
                     qty = self._round_qty_pro(eff_sell_quote / (band_mid or Decimal("1")), strategy)
@@ -1938,6 +2100,13 @@ class GenericRunner:
             for k, lvl_price, qty in buy_levels:
                 if qty <= D0:
                     continue
+                # Skip BUY levels above current market — they'd fire as marketable orders
+                # (or get rejected by exchange price-band protection like MEXC's 30087).
+                # The bot will retry placing them once price catches up.
+                if price > D0 and lvl_price > price:
+                    LOG.debug("PRO %s BUY L%d @ %s: above market %s, skipping",
+                              sym, k, lvl_price, price)
+                    continue
                 order_cost = qty * lvl_price
                 if placed_cash + order_cost > available_cash:
                     LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining levels",
@@ -2021,6 +2190,12 @@ class GenericRunner:
                 placed_qty = D0
                 for k, lvl_price, qty in sell_levels:
                     if qty <= D0:
+                        continue
+                    # Skip SELL levels below current market — they'd fire as marketable orders
+                    # (or get rejected by exchange price-band protection).
+                    if price > D0 and lvl_price < price:
+                        LOG.debug("PRO %s SELL L%d @ %s: below market %s, skipping",
+                                  sym, k, lvl_price, price)
                         continue
                     if placed_qty + qty > base_qty:
                         LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
@@ -2290,6 +2465,8 @@ class GenericRunner:
         Works for both India (Fyers, fixed_qty) and crypto (MEXC, fixed_quote).
         """
         self.state.ensure_symbols(self.symbols)
+        self._migrate_renamed_symbol_extras()
+        self._restore_oid_prices_from_state()
 
         if self.sync_on_start:
             try:

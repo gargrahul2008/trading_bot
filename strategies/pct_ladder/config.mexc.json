@@ -18,8 +18,8 @@
     "sell_quote": 5024,
     "qty_step": 1e-06,
     "min_qty": 1e-06,
-    "rebalance_threshold_steps": 1,
-    "rebalance_target_steps": 1
+    "rebalance_threshold_steps": 0,
+    "rebalance_target_steps": 0
   },
   "execution": {
     "poll_seconds": 1,

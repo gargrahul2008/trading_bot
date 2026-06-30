@@ -1,0 +1,19 @@
+{
+  "start_date": "2026-04-07",
+  "end_date": "2026-05-26",
+  "trading_days": 34,
+  "total_capital": 5000000,
+  "capital_per_slot": 1000000,
+  "max_slots": 5,
+  "total_campaigns": 18,
+  "total_cycles": 225,
+  "gross_pnl": 324465.44,
+  "total_cost": 221596.44,
+  "net_pnl": 102869.0,
+  "return_pct": 2.0574,
+  "annualized_return_pct": 15.25,
+  "max_drawdown": 193628.15,
+  "max_drawdown_pct": 3.87,
+  "avg_slots_used": 4.7,
+  "avg_cycles_per_day": 6.6
+}

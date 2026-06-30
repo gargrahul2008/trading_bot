@@ -364,7 +364,8 @@ def _fmt_short(dt: datetime.datetime) -> str:
 
 def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetime,
                   hours: int, state_path: str | None, symbol: str,
-                  last_report_path: str | None = None) -> tuple[str, dict | None]:
+                  last_report_path: str | None = None,
+                  extra_eth: float = 0.0) -> tuple[str, dict | None]:
     """
     Returns (message_text, pv_snapshot_to_save).
     pv_snapshot_to_save is None if state could not be read.
@@ -434,7 +435,10 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
             except Exception:
                 pass
 
-            pv = cash + broker_eth * price
+            # Include untracked HODL ETH in the displayed PV so the bucket's total holdings show up,
+            # even if the bot itself only tracks the trading slice.
+            extra_eth_dec = _dec(str(extra_eth)) if extra_eth else D0
+            pv = cash + (broker_eth + extra_eth_dec) * price
             pv_snapshot = {"ts": now.isoformat(), "pv": float(pv), "price": float(price)}
 
             cbq = _dec(state.get("extras", {}).get("compound_buy_quote") or "0")
@@ -487,7 +491,12 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
         parts4.append(f"PV{int(float(pv))}")
     line4 = ", ".join(parts4)
 
-    return f"{line1}\n{line2}\n{line3}\n{line4}", pv_snapshot
+    # Optional line5: show HODL/extra-ETH breakdown so the message reflects total bucket holdings.
+    msg = f"{line1}\n{line2}\n{line3}\n{line4}"
+    if extra_eth > 0:
+        bot_eth = float(broker_eth)
+        msg += f"\nETH bot {bot_eth:.2f} + HODL {extra_eth:.2f} = {bot_eth + extra_eth:.2f} @ ${float(price):,.0f}"
+    return msg, pv_snapshot
 
 
 def send_telegram(token: str, chat_id: str, text: str) -> None:
@@ -513,6 +522,9 @@ def main() -> None:
                     help="Initial ETH holding before first trade (to seed FIFO queue)")
     ap.add_argument("--initial-cost", type=float, default=0,
                     help="Average cost of initial ETH holding")
+    ap.add_argument("--extra-eth",    type=float, default=0,
+                    help="Untracked ETH held outside the bot's view (e.g., HODL stack). "
+                         "Added to bot ETH for PV display so the message reflects total bucket holdings.")
     ap.add_argument("--secrets",      default=None,
                     help="Telegram secrets JSON (default: <config_dir>/secrets/telegram.json)")
     ap.add_argument("--dry-run",      action="store_true", help="Print message, don't send")
@@ -544,7 +556,8 @@ def main() -> None:
     fills   = load_trades(args.trades)
     metrics = compute_metrics(fills, since, strategy)
     msg, pv_snapshot = build_message(metrics, since, now, args.hours, state_path, symbol,
-                                     last_report_path=last_report_path)
+                                     last_report_path=last_report_path,
+                                     extra_eth=args.extra_eth)
 
     if args.verify:
         # build_message now returns a tuple; re-invoke cleanly for verify path

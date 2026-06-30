@@ -116,6 +116,35 @@ class FyersClient(Broker):
             return orders
         return []
 
+    def get_live_fills(self, order_ids: list) -> Dict[str, tuple]:
+        """Return {oid: (filled_qty, avg_price)} for open (non-terminal) orders.
+        Only includes orders that have at least one unit filled but are not yet in terminal state.
+        Uses a single orderbook call for all oids."""
+        if not order_ids:
+            return {}
+        try:
+            ob = self.orderbook()
+            result: Dict[str, tuple] = {}
+            for o in self._iter_orders(ob):
+                if not isinstance(o, dict):
+                    continue
+                oid = str(o.get("id") or o.get("order_id") or "")
+                if oid not in order_ids:
+                    continue
+                status_int = o.get("status") or o.get("orderStatus") or o.get("order_status")
+                # Only process open/pending orders (status=6 in Fyers)
+                if isinstance(status_int, int) and status_int not in (6,):
+                    continue
+                if isinstance(status_int, str) and str(status_int).upper() not in {"PENDING", "OPEN", "6"}:
+                    continue
+                filled = int(o.get("filledQty") or o.get("tradedQty") or o.get("filled_qty") or 0)
+                avg_px = to_decimal(o.get("avgPrice") or o.get("averagePrice") or o.get("tradedPrice") or 0)
+                if filled > 0 and avg_px > 0:
+                    result[oid] = (to_decimal(filled), avg_px)
+            return result
+        except Exception:
+            return {}
+
     def get_order_terminal(self, order_id: str) -> Optional[OrderTerminal]:
         ob = self.orderbook()
         found = None

@@ -1,71 +1,69 @@
 #!/bin/bash
-# mexc_watchdog.sh — Cron watchdog: ensures MEXC bot is always running.
+# mexc_watchdog.sh — Cron watchdog: ensures both MEXC bucket bots are always running.
 #
-# Runs every minute via cron. If neither the bot nor the runner script is
-# alive, it restarts the runner as a background process and sends a Telegram alert.
-# Runner output is appended to logs/mexc_runner.log.
+# Runs every minute via cron. Checks Bucket 1 and Bucket 2 independently.
+# If either is down, restarts only the missing one and sends a Telegram alert.
 #
-# Crontab entry (add with: crontab -e):
+# Crontab entry:
 #   * * * * * /root/trading_bot/scripts/mexc_watchdog.sh >> /root/trading_bot/logs/mexc_watchdog.log 2>&1
 
 cd /root/trading_bot
 
-RUNNER="scripts/mexc_bot_runner.sh"
 SECRETS="strategies/pct_ladder/secrets/telegram.json"
 PYTHON="env/bin/python"
 LOCKFILE="/tmp/mexc_watchdog.lock"
-RUNNER_LOG="logs/mexc_runner.log"
 
-# ── Prevent concurrent watchdog runs ──────────────────────────────────────
 exec 9>"$LOCKFILE"
 flock -n 9 || exit 0
 
-# ── Check if bot or runner is alive ───────────────────────────────────────
-BOT_ALIVE=0
-pgrep -f "run_strategy.py.*config.mexc.json" > /dev/null 2>&1 && BOT_ALIVE=1
-pgrep -f "mexc_bot_runner.sh" > /dev/null 2>&1 && BOT_ALIVE=1
-
-if [ "$BOT_ALIVE" -eq 1 ]; then
-    exit 0
-fi
-
-# ── Bot is down — alert and restart ───────────────────────────────────────
-NOW=$(date '+%Y-%m-%d %H:%M:%S')
-echo "[$NOW] MEXC bot not running — restarting in background"
-
-# Send Telegram alert
-"$PYTHON" - "$SECRETS" "🔴 *Bot DOWN* — watchdog restarting\n${NOW}" <<'PYEOF' || true
+send_telegram() {
+    local message="$1"
+    if [ ! -f "$SECRETS" ]; then return; fi
+    "$PYTHON" - "$SECRETS" "$message" <<'PYEOF' || true
 import sys, json, urllib.request, urllib.parse
-
 secrets_path = sys.argv[1]
-text         = sys.argv[2]
-
+text = sys.argv[2]
 with open(secrets_path) as f:
     s = json.load(f)
-
-token    = s["bot_token"]
+token = s["bot_token"]
 chat_ids = s["chat_id"]
 if isinstance(chat_ids, str):
     chat_ids = [chat_ids]
-
 for chat_id in chat_ids:
-    data = urllib.parse.urlencode({
-        "chat_id":    chat_id,
-        "text":       text,
-        "parse_mode": "Markdown",
-    }).encode()
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data=data, method="POST"
-    )
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             pass
     except Exception as e:
         print(f"telegram failed: {e}", file=sys.stderr)
 PYEOF
+}
 
-# Restart as background process
-nohup /root/trading_bot/scripts/mexc_bot_runner.sh >> "/root/trading_bot/$RUNNER_LOG" 2>&1 &
+check_and_restart() {
+    local bucket="$1"
+    local config="$2"
+    local runner="$3"
+    local log="$4"
 
-echo "[$NOW] Runner started in background (PID $!), logging to $RUNNER_LOG"
+    local alive=0
+    pgrep -f "run_strategy.py.*${config}" > /dev/null 2>&1 && alive=1
+    pgrep -f "$(basename "$runner")" > /dev/null 2>&1 && alive=1
+
+    if [ "$alive" -eq 1 ]; then
+        return 0
+    fi
+
+    local now
+    now=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$now] $bucket down — restarting in background"
+    send_telegram "🔴 *${bucket} DOWN* — watchdog restarting\n${now}"
+    nohup "$runner" >> "/root/trading_bot/$log" 2>&1 &
+    echo "[$now] $bucket runner started in background (PID $!), logging to $log"
+}
+
+check_and_restart "Bucket1" "config.mexc.bucket1.json" \
+    "/root/trading_bot/scripts/mexc_bucket1_runner.sh" "logs/mexc_bucket1_runner.log"
+
+check_and_restart "Bucket2" "config.mexc.bucket2.json" \
+    "/root/trading_bot/scripts/mexc_bucket2_runner.sh" "logs/mexc_bucket2_runner.log"

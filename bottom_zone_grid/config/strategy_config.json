@@ -1,0 +1,161 @@
+{
+  "strategy_name": "capital_fixed_rotating_bottom_zone_grid",
+  "mode": "scanner",
+  "total_strategy_capital": 5000000,
+
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "json",
+    "auth_file": "../../fyers_auth.json",
+    "user_key": "user1"
+  },
+
+  "portfolio": {
+    "base_active_stocks": 5,
+    "capital_per_slot": 1000000,
+    "min_capital_per_slot": 500000,
+    "max_active_stocks": 10,
+    "max_single_symbol_allocation_pct": 20,
+    "max_sector_allocation_pct": 40,
+    "allow_idle_cash": true
+  },
+
+  "universe": {
+    "source": "nifty500",
+    "review_frequency_days": 15,
+    "allow_stocks": true,
+    "allow_etf": true,
+    "allow_penny_stocks": false,
+    "min_avg_daily_turnover": 50000000,
+    "min_avg_daily_volume": 500000,
+    "max_bid_ask_spread_pct": 0.10,
+    "min_price": 50,
+    "max_price": 10000
+  },
+
+  "range": {
+    "lookback_days": 60,
+    "alternative_lookback_days": 120,
+    "range_method": "percentile",
+    "percentile_low": 5,
+    "percentile_high": 95,
+    "lower_zone_pct": 0.10,
+    "min_range_width_pct": 1.0,
+    "max_range_width_pct": 20.0,
+    "range_watch_max_width_pct": 25.0,
+    "min_support_touches": 2,
+    "min_resistance_touches": 2,
+    "min_price_containment_pct": 80
+  },
+
+  "bar_range": {
+    "intraday_lookback_days": 10,
+    "timeframes": ["15", "5"],
+    "primary_timeframe": "15",
+    "gap_multiplier": 1.5
+  },
+
+  "grid": {
+    "use_fixed_point_grid": true,
+    "round_to_tick_size": true,
+    "min_order_value": 100000,
+    "advance_buy_orders": 2,
+    "advance_sell_orders": 2,
+    "min_expected_net_profit_per_cycle": 50,
+    "almost_viable_pct": 80,
+    "reserve_charges_buffer_pct": 0.10,
+    "exit_buffer_pct": 0
+  },
+
+  "costs": {
+    "brokerage_per_order": 20,
+    "stt_buy_pct": 0.1,
+    "stt_sell_pct": 0.025,
+    "exchange_txn_pct": 0.00345,
+    "gst_pct": 18.0,
+    "sebi_per_crore": 10,
+    "stamp_duty_buy_pct": 0.015,
+    "slippage_pct": 0.05
+  },
+
+  "entry": {
+    "require_lower_10pct_zone": true,
+    "reject_if_below_range_low": true,
+    "reject_if_breakdown_confirmed": true,
+    "max_gap_down_pct_at_entry": 3.0,
+    "breakout_confirm_days": 2
+  },
+
+  "exit": {
+    "exit_when_inventory_sold_out": true,
+    "allow_reentry_after_profit_exit": true,
+    "profit_exit_cooldown_days": 1,
+    "breakdown_cooldown_days": 20,
+    "min_profit_to_exit_at_bottom_pct": 0.20,
+    "breakdown_buffer_pct": 2.0,
+    "breakdown_confirm_days": 2,
+    "breakdown_from_entry_pct": 0,
+    "breakdown_from_entry_days": 1,
+    "max_campaign_drawdown_pct": 8.0,
+    "max_portfolio_drawdown_pct": 5.0,
+    "no_trade_timeout_days": 10
+  },
+
+  "stock_filter": {
+    "enabled": false,
+    "filters": {
+      "above_200dma": { "enabled": false },
+      "above_50dma": { "enabled": false },
+      "rsi_above": { "enabled": false, "threshold": 30 },
+      "relative_strength_vs_nifty": { "enabled": false, "lookback_days": 20, "threshold": -5, "_comment": "stock return minus Nifty return over N days" },
+      "volume_above_avg": { "enabled": false, "multiplier": 0.8, "lookback_days": 20, "_comment": "recent 5-day avg vol > multiplier * 20-day avg" }
+    },
+    "mode": "all",
+    "_mode_options": "all = every enabled filter must pass, any = at least one enabled filter must pass",
+    "watchlist": {
+      "enabled": false,
+      "max_age_days": 30,
+      "scan_frequency_days": 5,
+      "remove_on_breakdown": false,
+      "_comment": "Stocks stay on watchlist until they recover (pass filter + back in range) or age out. scan_frequency_days controls how often we look for new bottom-zone stocks."
+    },
+    "candidate_filter": {
+      "max_score": 1.0,
+      "min_watchlist_days": 0,
+      "max_watchlist_days": 999,
+      "min_range_position_pct": 0,
+      "min_entry_vs_dma50_pct": 0,
+      "_comment": "Filter candidates before entry. score = 1 - range_position (lower = more recovered). Best backtest: max_score 0.5, min_wl 5, max_wl 15-20."
+    }
+  },
+
+  "regime_filter": {
+    "enabled": false,
+    "nifty_symbol": "NSE:NIFTY50-INDEX",
+    "vix_symbol": "NSE:INDIAVIX-INDEX",
+    "filters": {
+      "nifty_above_200dma": { "enabled": false },
+      "nifty_above_50dma": { "enabled": false },
+      "nifty_20_50_crossover": { "enabled": false, "_comment": "20 DMA > 50 DMA" },
+      "nifty_rsi_above": { "enabled": false, "threshold": 40 },
+      "vix_below": { "enabled": false, "threshold": 20 },
+      "breadth_above": { "enabled": false, "threshold": 40, "breadth_ma_days": 50, "_comment": "% of universe above their 50 DMA" }
+    },
+    "mode": "all",
+    "_mode_options": "all = every enabled filter must pass, any = at least one enabled filter must pass"
+  },
+
+  "mtf": {
+    "enabled": false,
+    "max_leverage": 1.0,
+    "include_interest_cost": true,
+    "min_margin_buffer_pct": 25,
+    "force_reduce_if_margin_buffer_below_pct": 15
+  },
+
+  "storage": {
+    "type": "json_files",
+    "atomic_writes": true,
+    "backup_before_overwrite": true
+  }
+}

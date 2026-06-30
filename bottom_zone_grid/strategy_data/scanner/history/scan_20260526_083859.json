@@ -1,0 +1,10 @@
+{
+  "scan_date": "2026-05-26",
+  "scan_time": "08:38:59",
+  "lookback_days": 60,
+  "universe_size": 341,
+  "eligible_count": 0,
+  "rejected_count": 341,
+  "capital_per_slot": 200000,
+  "candidates": []
+}
