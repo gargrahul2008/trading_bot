@@ -286,6 +286,7 @@ class FibLiveBot:
         self.trade_value_usd: float = float(cfg.get("trade_value_usd", 5000))
         self.use_trail: bool    = bool(self.strat_cfg.get("use_trailing_stop", True))
         self.time_exit_bars: int = 90  # 90 min for ext > 1.0
+        self.max_bars_wait: int = int(cfg.get("max_bars_wait", 3))  # limit-entry expiry
 
         # ── Threshold/qty scaling basis ──────────────────────────────────────
         # "window"  : legacy — median of the trailing fetch window (re-rolls each bar)
@@ -600,7 +601,7 @@ class FibLiveBot:
             signal_bar_ts=signal["timestamp"],
             signal_time_utc=ts,
             trail_milestones=signal["trail_milestones"],
-            max_bars_wait=3,
+            max_bars_wait=self.max_bars_wait,
         )
         self.pending[sym] = pe
         LOG.info(

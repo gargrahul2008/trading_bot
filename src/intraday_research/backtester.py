@@ -40,6 +40,14 @@ class BacktestConfig:
     last_entry_time: time = time(hour=15, minute=0)
     session_end: time = SESSION_END
     fresh_entry_cutoff_time: time | None = None
+    # 24h/continuous mode (e.g. crypto): skip the daily carry-over flatten and the
+    # end-of-session force square-off so positions exit only on stop/target/trail/
+    # time-exit and may cross day boundaries. Default False = equity session behaviour.
+    continuous_session: bool = False
+    # Pending-limit entry model: when set, a signal places a resting limit at the
+    # signal price and fills only on a touch within the next N bars, else it expires
+    # (mirrors the live bot's PendingEntry). None = fill immediately on the signal bar.
+    entry_max_bars_wait: int | None = None
     max_trades_per_symbol_per_day: int | None = None
     cooldown_minutes_after_exit: int = 0
     no_reentry_same_side_until_new_signal: bool = False
@@ -133,6 +141,7 @@ class IntradayBacktester:
         consecutive_losses_by_day_book: dict[tuple[object, str, str], int] = {}
         last_exit_by_book: dict[tuple[str, str], pd.Timestamp] = {}
         blocked_reentry_side_by_book: dict[tuple[str, str], SignalSide] = {}
+        pending_entries: dict[tuple[str, str], dict] = {}
         square_off_cutoff = timedelta(minutes=config.force_square_off_minutes_before_close)
 
         for row in featured.sort_values(["timestamp", "symbol"]).itertuples():
@@ -145,7 +154,7 @@ class IntradayBacktester:
                 if position.symbol == row.symbol
             ]
             for position_key, position in open_position_items:
-                exit_decision = self._resolve_exit(position, row, config.time_exit_minutes, square_off_cutoff, config.session_end, config.use_trailing_stop)
+                exit_decision = self._resolve_exit(position, row, config.time_exit_minutes, square_off_cutoff, config.session_end, config.use_trailing_stop, config.continuous_session)
                 if exit_decision is None:
                     continue
                 exit_price, exit_reason = exit_decision
@@ -204,6 +213,35 @@ class IntradayBacktester:
                     blocked_reentry_side_by_book[position_key] = trade.side
                 exited_books_this_bar.add(position_key)
 
+            # ── Pending limit entries: fill on a LATER touch, else expire ───────
+            # Models a resting limit placed AFTER the signal bar closes (the signal
+            # bar itself is excluded), matching the live bot's PendingEntry.
+            if config.entry_max_bars_wait is not None:
+                for pk in [k for k, pe in pending_entries.items() if pe["symbol"] == row.symbol]:
+                    pe = pending_entries[pk]
+                    pe["bars_waited"] += 1
+                    is_long = pe["side"] is SignalSide.LONG
+                    hit = ((is_long and float(row.low) <= pe["limit"])
+                           or ((not is_long) and float(row.high) >= pe["limit"]))
+                    if hit:
+                        spec = pe["spec"]
+                        open_positions[pk] = Position(
+                            symbol=row.symbol, side=pe["side"], quantity=pe["quantity"],
+                            effective_quantity=self._effective_quantity(pe["quantity"], spec),
+                            lot_size=spec.lot_size, entry_time=row.timestamp,
+                            entry_price=pe["limit"], stop_price=pe["stop"],
+                            target_price=pe["target"], entry_reason=pe["reason"],
+                            strategy_name=pe["strategy_name"],
+                            trail_milestones=list(pe["milestones"]),
+                        )
+                        symbol_trade_counts_by_day[(trade_date, row.symbol)] = (
+                            symbol_trade_counts_by_day.get((trade_date, row.symbol), 0) + 1)
+                        strategy_trade_counts_by_day[(trade_date, row.symbol, pe["strategy_name"])] = (
+                            strategy_trade_counts_by_day.get((trade_date, row.symbol, pe["strategy_name"]), 0) + 1)
+                        del pending_entries[pk]
+                    elif pe["bars_waited"] >= config.entry_max_bars_wait:
+                        del pending_entries[pk]  # expired unfilled
+
             bar_signals = signal_lookup.get((row.timestamp, row.symbol), [])
             for signal in bar_signals:
                 position_key = (signal.symbol, signal.strategy_name)
@@ -213,6 +251,11 @@ class IntradayBacktester:
                         blocked_reentry_side_by_book.pop(position_key, None)
 
                 if position_key in exited_books_this_bar:
+                    continue
+
+                # While a pending limit is outstanding for this book, ignore new
+                # signals (the live bot is "busy" and does not re-signal).
+                if config.entry_max_bars_wait is not None and position_key in pending_entries:
                     continue
 
                 allow_entry, rejection_reason = self._can_enter_new_position(
@@ -258,6 +301,17 @@ class IntradayBacktester:
                         )
                         continue
                     instrument_spec = self._get_instrument_spec(row.symbol, config)
+                    if config.entry_max_bars_wait is not None:
+                        # Place a resting limit; fills on a touch within the next N bars.
+                        pending_entries[position_key] = {
+                            "symbol": row.symbol, "side": signal.side,
+                            "limit": float(signal.price), "stop": signal.stop_price,
+                            "target": signal.target_price,
+                            "milestones": list(signal.trail_milestones),
+                            "reason": signal.reason, "strategy_name": signal.strategy_name,
+                            "quantity": quantity, "spec": instrument_spec, "bars_waited": 0,
+                        }
+                        continue
                     open_positions[position_key] = Position(
                         symbol=row.symbol,
                         side=signal.side,
@@ -511,12 +565,14 @@ class IntradayBacktester:
         square_off_cutoff: timedelta,
         session_end: time,
         use_trailing_stop: bool = False,
+        continuous_session: bool = False,
     ) -> tuple[float, str] | None:
         # Carry-over guard: if the position's entry date != the current bar's trade_date, the
         # position was not squared off before the previous session ended (e.g. data gap or the
         # partial exit fired on the very last bar).  Force-close immediately on the first bar
         # of the new session without applying any pending stop logic.
-        if hasattr(row, "trade_date"):
+        # Skipped in continuous (24h) mode — positions may cross day boundaries.
+        if not continuous_session and hasattr(row, "trade_date"):
             row_date = pd.Timestamp(row.trade_date).date()
             pos_date = pd.Timestamp(position.entry_time).tz_convert("Asia/Kolkata").date()
             if row_date != pos_date:
@@ -570,13 +626,14 @@ class IntradayBacktester:
             if holding_minutes >= int(time_exit_minutes):
                 return float(row.close), "time_exit"
 
-        # Step 6: Force square off.
-        session_close = row.timestamp.normalize() + pd.Timedelta(
-            hours=session_end.hour,
-            minutes=session_end.minute,
-        )
-        if row.timestamp >= session_close - square_off_cutoff:
-            return float(row.close), "force_square_off"
+        # Step 6: Force square off (skipped in continuous 24h mode).
+        if not continuous_session:
+            session_close = row.timestamp.normalize() + pd.Timedelta(
+                hours=session_end.hour,
+                minutes=session_end.minute,
+            )
+            if row.timestamp >= session_close - square_off_cutoff:
+                return float(row.close), "force_square_off"
         return None
 
     def _close_position(
@@ -655,7 +712,10 @@ class IntradayBacktester:
             close_deadline = entry_time.normalize() + session_close_cutoff
             # force_square_off exits are exempt: the carry-over guard may fire them at the
             # first bar of the following session when the prior session's data ended early.
-            if exit_time > close_deadline and getattr(trade, "exit_reason", "") != "force_square_off":
+            # Continuous (24h) mode has no close deadline — positions cross day boundaries.
+            if (not config.continuous_session
+                    and exit_time > close_deadline
+                    and getattr(trade, "exit_reason", "") != "force_square_off"):
                 raise ValueError(f"Trade not squared off before close cutoff: {trade.symbol} {exit_time.isoformat()}")
             if exit_time < entry_time:
                 raise ValueError(f"Trade exit before entry detected: {trade.symbol}")
