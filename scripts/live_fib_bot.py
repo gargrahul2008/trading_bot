@@ -175,15 +175,20 @@ def _make_strategy(cfg: dict, med_price: float) -> NiftyBOSFibScalpStrategy:
 _FE = FeatureEngine()
 
 
-def get_signal_for_last_bar(df: pd.DataFrame, strat_cfg: dict) -> Optional[dict]:
+def get_signal_for_last_bar(df: pd.DataFrame, strat_cfg: dict,
+                            ref_median: Optional[float] = None) -> Optional[dict]:
     """
     Run strategy on `df` and return the signal row for the LAST closed bar,
     or None if no signal.
+
+    `ref_median` scales min_impulse/stop thresholds. When None (legacy path),
+    the trailing-window median is used. Live + the live-faithful backtester pass
+    the daily-frozen lookback median so both compute identical thresholds.
     """
     if df.empty or len(df) < 20:
         return None
 
-    med = float(df["close"].median())
+    med = float(ref_median) if ref_median is not None else float(df["close"].median())
     strategy = _make_strategy(strat_cfg, med)
 
     featured = _FE.transform(df)
@@ -282,6 +287,14 @@ class FibLiveBot:
         self.use_trail: bool    = bool(self.strat_cfg.get("use_trailing_stop", True))
         self.time_exit_bars: int = 90  # 90 min for ext > 1.0
 
+        # ── Threshold/qty scaling basis ──────────────────────────────────────
+        # "window"  : legacy — median of the trailing fetch window (re-rolls each bar)
+        # "lookback": median over trailing `lookback_days`, FROZEN per UTC day.
+        #             Lookahead-free and identical in live + backtest.
+        self.scaling_cfg: dict = cfg.get("scaling", {}) or {}
+        self.scaling_mode: str = self.scaling_cfg.get("mode", "window")
+        self.lookback_days: int = int(self.scaling_cfg.get("lookback_days", 7))
+
         out = Path(cfg.get("output_dir", "artifacts/fib_live"))
         out.mkdir(parents=True, exist_ok=True)
         self.state_path  = out / "bot_state.json"
@@ -293,14 +306,37 @@ class FibLiveBot:
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         LOG.addHandler(fh)
 
+        # ── Telegram alerts (entry/exit only) — purely informational ──────────
+        self.tg_token: Optional[str] = None
+        self.tg_chat_id: Optional[str] = None
+        tg_cfg = cfg.get("telegram", {})
+        if tg_cfg.get("enabled"):
+            try:
+                sec_file = tg_cfg["secrets_file"]
+                sec_path = Path(sec_file)
+                if not sec_path.is_absolute():
+                    sec_path = _ROOT / sec_path
+                with open(sec_path) as f:
+                    self.tg_token = json.load(f)["bot_token"]
+                self.tg_chat_id = str(tg_cfg["chat_id"])  # single id — alerts go only here
+                LOG.info("Telegram alerts enabled → chat_id %s", self.tg_chat_id)
+            except Exception as e:
+                LOG.warning("Telegram disabled (config load failed: %s)", e)
+                self.tg_token = self.tg_chat_id = None
+
         # Per-symbol state
         self.positions: Dict[str, Optional[OpenPosition]] = {s: None for s in self.symbols}
         self.pending:   Dict[str, Optional[PendingEntry]]  = {s: None for s in self.symbols}
-        self._load_state()
 
-        # Paper P&L tracker
+        # Paper P&L tracker (initialised before load so _load_state can restore it)
         self.paper_pnl: Dict[str, float] = {s: 0.0 for s in self.symbols}
         self.paper_trades: Dict[str, List[dict]] = {s: [] for s in self.symbols}
+
+        # Daily-frozen lookback reference median per symbol (scaling_mode=lookback)
+        self.ref_median: Dict[str, Optional[float]] = {s: None for s in self.symbols}
+        self.ref_median_day: Dict[str, Optional[str]] = {s: None for s in self.symbols}
+
+        self._load_state()
 
     # ── state persistence ─────────────────────────────────────────────────────
 
@@ -310,12 +346,20 @@ class FibLiveBot:
         try:
             with open(self.state_path) as f:
                 st = json.load(f)
+            saved_pnl = st.get("paper_pnl", {})
+            saved_med = st.get("ref_median", {})
+            saved_med_day = st.get("ref_median_day", {})
             for sym in self.symbols:
                 p = st.get("positions", {}).get(sym)
                 pe = st.get("pending", {}).get(sym)
                 self.positions[sym] = OpenPosition.from_dict(p) if p else None
                 self.pending[sym]   = PendingEntry.from_dict(pe) if pe else None
-            LOG.info("State loaded from %s", self.state_path)
+                self.paper_pnl[sym] = float(saved_pnl.get(sym, 0.0))
+                self.ref_median[sym] = saved_med.get(sym)
+                self.ref_median_day[sym] = saved_med_day.get(sym)
+            LOG.info("State loaded from %s (cum PnL: %s)",
+                     self.state_path,
+                     {s: round(v, 2) for s, v in self.paper_pnl.items()})
         except Exception as e:
             LOG.warning("State load failed (%s) — starting fresh", e)
 
@@ -323,6 +367,9 @@ class FibLiveBot:
         st = {
             "positions": {s: (p.to_dict() if p else None) for s, p in self.positions.items()},
             "pending":   {s: (pe.to_dict() if pe else None) for s, pe in self.pending.items()},
+            "paper_pnl": {s: round(v, 6) for s, v in self.paper_pnl.items()},
+            "ref_median": {s: v for s, v in self.ref_median.items()},
+            "ref_median_day": {s: v for s, v in self.ref_median_day.items()},
             "saved_at":  datetime.now(timezone.utc).isoformat(),
         }
         with open(self.state_path, "w") as f:
@@ -332,10 +379,75 @@ class FibLiveBot:
         with open(self.trades_path, "a") as f:
             f.write(json.dumps(rec, default=str) + "\n")
 
+    def _send_telegram(self, text: str) -> None:
+        """Best-effort send to the single configured chat. Never raises."""
+        if not (self.tg_token and self.tg_chat_id):
+            return
+        try:
+            _requests.post(
+                f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                data={"chat_id": self.tg_chat_id, "text": text,
+                      "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=10,
+            )
+        except Exception as e:
+            LOG.warning("Telegram send failed: %s", e)
+
+    # ── reference median (daily-frozen lookback) ─────────────────────────────
+
+    @staticmethod
+    def _fetch_klines_range(symbol: str, start_ms: int, end_ms: int) -> list:
+        """Fetch [start_ms, end_ms) 1-min klines from MEXC in <=500-bar chunks."""
+        rows, cur = [], start_ms
+        for _ in range(400):  # safety cap
+            if cur >= end_ms:
+                break
+            r = _requests.get("https://api.mexc.com/api/v3/klines", params={
+                "symbol": symbol, "interval": "1m",
+                "startTime": cur, "endTime": end_ms, "limit": 500}, timeout=20)
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            rows.extend(batch)
+            nxt = int(batch[-1][0]) + 60_000
+            if nxt <= cur:
+                break
+            cur = nxt
+            time.sleep(0.15)
+        return rows
+
+    def _compute_ref_median(self, symbol: str, day_start: pd.Timestamp) -> Optional[float]:
+        """Median close over [day_start - lookback_days, day_start) — lookahead-free."""
+        end_ms = int(day_start.timestamp() * 1000)
+        start_ms = end_ms - self.lookback_days * 86_400_000
+        rows = self._fetch_klines_range(symbol, start_ms, end_ms)
+        if not rows:
+            return None
+        return float(pd.Series([float(b[4]) for b in rows]).median())
+
+    def _ensure_ref_median(self, sym: str, now_utc: pd.Timestamp) -> None:
+        """Freeze the reference median for the current UTC day (recompute on rollover)."""
+        if self.scaling_mode != "lookback":
+            return
+        day = str(now_utc.date())
+        if self.ref_median_day.get(sym) == day and self.ref_median.get(sym) is not None:
+            return
+        med = self._compute_ref_median(sym, now_utc.normalize())
+        if med is None:
+            LOG.warning("[%s] ref-median fetch failed — keeping previous (%s)",
+                        sym, self.ref_median.get(sym))
+            return
+        self.ref_median[sym] = med
+        self.ref_median_day[sym] = day
+        min_imp = round(med * self.strat_cfg["min_impulse_pct"] / 100, 4)
+        LOG.info("[%s] ref median (%dd lookback, frozen %s UTC) = %.4f  → min_impulse=%.4f",
+                 sym, self.lookback_days, day, med, min_imp)
+
     # ── quantity resolver ─────────────────────────────────────────────────────
 
-    def _resolve_qty(self, df: pd.DataFrame) -> float:
-        med = float(df["close"].median())
+    def _resolve_qty(self, df: pd.DataFrame, ref_median: Optional[float] = None) -> float:
+        med = float(ref_median) if ref_median is not None else float(df["close"].median())
         return round(self.trade_value_usd / med, 6)
 
     # ── paper simulation helpers ──────────────────────────────────────────────
@@ -360,6 +472,13 @@ class FibLiveBot:
             tag, sym, pe.side, pe.qty, fill_price, pe.stop_price, pe.target_price,
             [f"{m:.4f}" for m in pe.trail_milestones],
         )
+        emoji = "🟢" if pe.side == "LONG" else "🔻"
+        self._send_telegram(
+            f"{emoji} <b>ENTRY</b> [{tag}]  <b>{sym[0]} {pe.side}</b>\n"
+            f"qty: {pe.qty:.6g}  @ {fill_price:.4f}\n"
+            f"stop: {pe.stop_price:.4f}   target: {pe.target_price:.4f}\n"
+            f"notional: ${fill_price * pe.qty:,.0f}"
+        )
 
     def _paper_close(self, sym: str, pos: OpenPosition, exit_price: float,
                      reason: str, is_partial: bool, ts: str) -> None:
@@ -368,12 +487,23 @@ class FibLiveBot:
         gross = (exit_price - pos.entry_price) * qty * (1 if is_long else -1)
         self.paper_pnl[sym] = self.paper_pnl.get(sym, 0.0) + gross
 
+        pct_return = round(
+            (exit_price / pos.entry_price - 1) * 100 * (1 if is_long else -1), 4
+        ) if pos.entry_price else 0.0
         rec = {
             "ts": ts, "symbol": sym, "side": pos.side,
             "qty": qty, "entry": pos.entry_price, "exit": exit_price,
             "reason": reason, "gross_pnl": round(gross, 4),
             "cumulative_pnl": round(self.paper_pnl[sym], 4),
             "is_partial": is_partial,
+            # ── context (logging only — for understanding each trade) ──
+            "entry_time": pos.entry_time_utc,
+            "entry_bar": pos.entry_bar_ts,
+            "bars_held": pos.bars_held,
+            "stop": pos.stop_price,
+            "target": pos.target_price,
+            "pct_return": pct_return,
+            "notional_usd": round(pos.entry_price * qty, 2),
         }
         self.paper_trades[sym].append(rec)
         self._log_trade(sym, rec)
@@ -385,6 +515,17 @@ class FibLiveBot:
             tag, "PARTIAL" if is_partial else "CLOSE",
             sym, pos.side, qty, pos.entry_price, exit_price, gross,
             self.paper_pnl[sym], reason,
+        )
+        total_pnl = sum(self.paper_pnl.values())
+        emoji = "✅" if gross >= 0 else "❌"
+        kind = "PARTIAL EXIT" if is_partial else "EXIT"
+        self._send_telegram(
+            f"{emoji} <b>{kind}</b> [{tag}]  <b>{sym[0]} {pos.side}</b>  ({reason})\n"
+            f"entry {pos.entry_price:.4f} → exit {exit_price:.4f}\n"
+            f"held: {pos.bars_held} bars\n"
+            f"trade PnL: <b>${gross:+,.2f}</b> ({pct_return:+.2f}%)\n"
+            f"{sym[0]} cum: ${self.paper_pnl[sym]:+,.2f}\n"
+            f"total PnL: <b>${total_pnl:+,.2f}</b>"
         )
 
         if not is_partial:
@@ -400,7 +541,12 @@ class FibLiveBot:
         if df.empty:
             return
         last_row = df.iloc[-1]
-        ts = str(datetime.now(timezone.utc).isoformat())
+        # Time is derived from the bar (not wall-clock) so behaviour is identical
+        # in live and in the backtest replay.
+        bar_ts = pd.Timestamp(last_row["timestamp"])
+        ts = str(bar_ts.isoformat())
+        self._ensure_ref_median(sym, bar_ts)
+        ref_med = self.ref_median.get(sym)
 
         # ── A. Manage open position ───────────────────────────────────────
         pos = self.positions[sym]
@@ -437,11 +583,11 @@ class FibLiveBot:
             t_exit = 90
         self.time_exit_bars = t_exit
 
-        signal = get_signal_for_last_bar(df, self.strat_cfg)
+        signal = get_signal_for_last_bar(df, self.strat_cfg, ref_median=ref_med)
         if signal is None:
             return
 
-        qty = self._resolve_qty(df)
+        qty = self._resolve_qty(df, ref_med)
         side = "LONG" if signal["direction"] == "LONG" else "SHORT"
 
         pe = PendingEntry(

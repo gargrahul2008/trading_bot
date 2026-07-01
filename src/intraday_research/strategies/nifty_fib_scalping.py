@@ -72,6 +72,13 @@ class NiftyBOSFibScalpStrategy(Strategy):
     max_consecutive_losses_per_day: int | None = None
     one_trade_at_a_time: bool = True
 
+    # Optional per-trade_date threshold overrides (daily-frozen lookback scaling).
+    # When supplied, these replace the scalar thresholds for each trade_date — used
+    # by the research backtest to remove whole-period lookahead. Live/default passes
+    # neither, so the scalar path below is used unchanged.
+    min_impulse_by_date: dict | None = None
+    stop_buffer_by_date: dict | None = None
+
     # Quality filters
     min_impulse_points: float = 0.0    # skip setups whose initial BOS impulse is smaller than this
     min_confirmation_rr: float = 0.0   # skip zone_touch_confirmation entries where reward/risk < this
@@ -116,6 +123,15 @@ class NiftyBOSFibScalpStrategy(Strategy):
         active_short: _BOSSetup | None = None
         trades_today = 0
         prev_row: pd.Series | None = None
+
+        # Resolve this day's thresholds (daily-frozen lookback override, else scalar)
+        date = str(group["trade_date"].iloc[0]) if len(group) else None
+        self._cur_min_imp = float(self.min_impulse_points)
+        self._cur_stop_buf = float(self.stop_buffer_points)
+        if self.min_impulse_by_date and date in self.min_impulse_by_date:
+            self._cur_min_imp = float(self.min_impulse_by_date[date])
+        if self.stop_buffer_by_date and date in self.stop_buffer_by_date:
+            self._cur_stop_buf = float(self.stop_buffer_by_date[date])
 
         for idx in range(len(group)):
             row = group.iloc[idx]
@@ -320,7 +336,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
         confirmed_at: int,
     ) -> _BOSSetup | None:
         size = impulse_high - impulse_low
-        if size <= float(self.min_impulse_points):
+        if size <= getattr(self, "_cur_min_imp", float(self.min_impulse_points)):
             return None
         # Retracement levels: price bouncing UP from impulse_low toward impulse_high
         fib_50 = impulse_low + 0.50 * size
@@ -334,7 +350,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             impulse_size=size,
             fib_50=fib_50,
             fib_618=fib_618,
-            stop_loss=impulse_high + float(self.stop_buffer_points),
+            stop_loss=impulse_high + getattr(self, "_cur_stop_buf", float(self.stop_buffer_points)),
             target=target,
             confirmed_at=confirmed_at,
         )
@@ -346,7 +362,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
         confirmed_at: int,
     ) -> _BOSSetup | None:
         size = impulse_high - impulse_low
-        if size <= float(self.min_impulse_points):
+        if size <= getattr(self, "_cur_min_imp", float(self.min_impulse_points)):
             return None
         # Retracement levels: price pulling DOWN from impulse_high toward impulse_low
         fib_50 = impulse_high - 0.50 * size
@@ -360,7 +376,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             impulse_size=size,
             fib_50=fib_50,
             fib_618=fib_618,
-            stop_loss=impulse_low - float(self.stop_buffer_points),
+            stop_loss=impulse_low - getattr(self, "_cur_stop_buf", float(self.stop_buffer_points)),
             target=target,
             confirmed_at=confirmed_at,
         )

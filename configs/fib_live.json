@@ -14,6 +14,18 @@
     "secrets_file": "mexc_secrets.json"
   },
 
+  "telegram": {
+    "enabled": true,
+    "secrets_file": "strategies/pct_ladder/secrets/telegram.json",
+    "chat_id": "1042052650"
+  },
+
+  "scaling": {
+    "mode": "lookback",
+    "lookback_days": 7,
+    "refresh": "daily_utc"
+  },
+
   "output_dir": "artifacts/fib_live",
 
   "_notes": [
