@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from itertools import groupby as _groupby
+
 import pandas as pd
 
 from .strategy import SIGNAL_COLUMNS
@@ -13,32 +15,41 @@ class SignalCombiner:
         if signals.empty:
             return []
 
+        # Convert to plain dicts once (vectorized) instead of calling itertuples() per group
+        # bucket.itertuples() creates a new namedtuple class per call — very slow at scale.
+        records: list[dict] = signals[SIGNAL_COLUMNS].to_dict("records")
+        records.sort(key=lambda r: (r["timestamp"], r["symbol"]))
+
         combined: list[CombinedSignal] = []
-        grouped = signals[SIGNAL_COLUMNS].groupby(["timestamp", "symbol"], sort=True, dropna=False)
-        for (timestamp, symbol), bucket in grouped:
+        long_val = SignalSide.LONG.value
+        for (timestamp, symbol), bucket_iter in _groupby(
+            records, key=lambda r: (r["timestamp"], r["symbol"])
+        ):
             signed_strength = 0.0
             explanations: list[str] = []
             stop_prices: list[float] = []
             target_prices: list[float] = []
             strategy_names: list[str] = []
-            price = None
             long_count = 0
             short_count = 0
-            for signal in bucket.itertuples():
-                direction = 1.0 if signal.direction == SignalSide.LONG.value else -1.0
-                signed_strength += direction * abs(float(signal.strength))
-                strategy_names.append(str(signal.strategy_name))
+            for sig in bucket_iter:
+                direction = 1.0 if sig["direction"] == long_val else -1.0
+                signed_strength += direction * abs(float(sig["strength"]))
+                strategy_names.append(str(sig["strategy_name"]))
                 if direction > 0:
                     long_count += 1
                 else:
                     short_count += 1
                 explanations.append(
-                    f"{signal.strategy_name} {signal.direction} score={float(signal.strength):.3f} reason={signal.reason}"
+                    f"{sig['strategy_name']} {sig['direction']} "
+                    f"score={float(sig['strength']):.3f} reason={sig['reason']}"
                 )
-                if pd.notna(signal.stop_loss):
-                    stop_prices.append(float(signal.stop_loss))
-                if pd.notna(signal.target):
-                    target_prices.append(float(signal.target))
+                sl = sig["stop_loss"]
+                if sl is not None and sl == sl:  # notna without pandas overhead
+                    stop_prices.append(float(sl))
+                tgt = sig["target"]
+                if tgt is not None and tgt == tgt:
+                    target_prices.append(float(tgt))
 
             if signed_strength > 0:
                 side = SignalSide.LONG
@@ -54,7 +65,7 @@ class SignalCombiner:
                 target_price = None
 
             explanation = (
-                f"netted {len(bucket)} signals "
+                f"netted {len(explanations)} signals "
                 f"(long={long_count}, short={short_count}) "
                 f"to {side.value} with final_score={signed_strength:.3f}; "
                 + " | ".join(explanations)
@@ -65,7 +76,7 @@ class SignalCombiner:
                     symbol=symbol,
                     final_decision=side,
                     final_score=signed_strength,
-                    price=float(price if price is not None else 0.0),
+                    price=0.0,
                     stop_price=stop_price,
                     target_price=target_price,
                     explanation=explanation,

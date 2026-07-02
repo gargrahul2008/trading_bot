@@ -48,6 +48,12 @@ class BacktestConfig:
     # signal price and fills only on a touch within the next N bars, else it expires
     # (mirrors the live bot's PendingEntry). None = fill immediately on the signal bar.
     entry_max_bars_wait: int | None = None
+    # Next-bar-open entry: fill at bar N+1's open instead of waiting for a limit touch.
+    # Captures breakout momentum immediately. Requires entry_max_bars_wait >= 1.
+    entry_next_bar_open: bool = False
+    # Max bars to wait for a broken-structure retest+rejection entry (use_bos_strength_filter).
+    # Independent of entry_max_bars_wait (which controls the strong-BOS breakout path).
+    bos_retest_max_bars_wait: int = 20
     max_trades_per_symbol_per_day: int | None = None
     cooldown_minutes_after_exit: int = 0
     no_reentry_same_side_until_new_signal: bool = False
@@ -118,6 +124,18 @@ class IntradayBacktester:
             else pd.DataFrame(columns=["timestamp", "symbol", "direction", "strength", "reason", "stop_loss", "target", "strategy_name"])
         )
         combined_signals = self.combiner.combine(all_signals)
+
+        # Per-signal fill mode lookup: keyed by (timestamp, symbol, strategy_name).
+        # "next_bar_open"         → fill at N+1 open (strong BOS breakout)
+        # "fill_at_limit_first_bar" → fill at limit price on first bar (retest close)
+        # "config"                → use BacktestConfig.entry_next_bar_open (default)
+        fill_mode_lookup: dict[tuple, str] = {}
+        if "pending_fill_mode" in all_signals.columns:
+            for _sig in all_signals.itertuples(index=False):
+                _mode = getattr(_sig, "pending_fill_mode", "config")
+                if _mode and str(_mode) != "nan":
+                    fill_mode_lookup[(_sig.timestamp, _sig.symbol, _sig.strategy_name)] = str(_mode)
+
         raw_executable_signals = self._build_executable_signals(all_signals, price_lookup)
         executable_signals, rejected_signal_rows = self._filter_signals(raw_executable_signals, config)
         if self.signal_filter is not None:
@@ -216,20 +234,34 @@ class IntradayBacktester:
             # ── Pending limit entries: fill on a LATER touch, else expire ───────
             # Models a resting limit placed AFTER the signal bar closes (the signal
             # bar itself is excluded), matching the live bot's PendingEntry.
+            # fill_mode per entry:
+            #   "next_bar_open"           → fill at open of bar 1 after signal (breakout)
+            #   "fill_at_limit_first_bar" → fill at pe["limit"] on bar 1 after signal (retest close)
+            #   "config"                  → use config.entry_next_bar_open (default path)
             if config.entry_max_bars_wait is not None:
                 for pk in [k for k, pe in pending_entries.items() if pe["symbol"] == row.symbol]:
                     pe = pending_entries[pk]
                     pe["bars_waited"] += 1
-                    is_long = pe["side"] is SignalSide.LONG
-                    hit = ((is_long and float(row.low) <= pe["limit"])
-                           or ((not is_long) and float(row.high) >= pe["limit"]))
+                    fill_mode = pe.get("fill_mode", "config")
+                    if fill_mode == "next_bar_open" or (fill_mode == "config" and config.entry_next_bar_open):
+                        hit = pe["bars_waited"] == 1
+                        fill_price = float(row.open)
+                    elif fill_mode == "fill_at_limit_first_bar":
+                        # Fill at the retest bar's close (stored as pe["limit"]) on first bar
+                        hit = pe["bars_waited"] == 1
+                        fill_price = pe["limit"]
+                    else:
+                        is_long = pe["side"] is SignalSide.LONG
+                        hit = ((is_long and float(row.low) <= pe["limit"])
+                               or ((not is_long) and float(row.high) >= pe["limit"]))
+                        fill_price = pe["limit"]
                     if hit:
                         spec = pe["spec"]
                         open_positions[pk] = Position(
                             symbol=row.symbol, side=pe["side"], quantity=pe["quantity"],
                             effective_quantity=self._effective_quantity(pe["quantity"], spec),
                             lot_size=spec.lot_size, entry_time=row.timestamp,
-                            entry_price=pe["limit"], stop_price=pe["stop"],
+                            entry_price=fill_price, stop_price=pe["stop"],
                             target_price=pe["target"], entry_reason=pe["reason"],
                             strategy_name=pe["strategy_name"],
                             trail_milestones=list(pe["milestones"]),
@@ -239,8 +271,12 @@ class IntradayBacktester:
                         strategy_trade_counts_by_day[(trade_date, row.symbol, pe["strategy_name"])] = (
                             strategy_trade_counts_by_day.get((trade_date, row.symbol, pe["strategy_name"]), 0) + 1)
                         del pending_entries[pk]
-                    elif pe["bars_waited"] >= config.entry_max_bars_wait:
-                        del pending_entries[pk]  # expired unfilled
+                    else:
+                        max_wait = (config.bos_retest_max_bars_wait
+                                    if fill_mode == "fill_at_limit_first_bar"
+                                    else config.entry_max_bars_wait)
+                        if pe["bars_waited"] >= max_wait:
+                            del pending_entries[pk]  # expired unfilled
 
             bar_signals = signal_lookup.get((row.timestamp, row.symbol), [])
             for signal in bar_signals:
@@ -303,6 +339,15 @@ class IntradayBacktester:
                     instrument_spec = self._get_instrument_spec(row.symbol, config)
                     if config.entry_max_bars_wait is not None:
                         # Place a resting limit; fills on a touch within the next N bars.
+                        _fill_mode = fill_mode_lookup.get(
+                            (row.timestamp, row.symbol, signal.strategy_name), "config"
+                        )
+                        if _fill_mode == "next_bar_open":
+                            _max_wait = 1
+                        elif _fill_mode == "fill_at_limit_first_bar":
+                            _max_wait = config.bos_retest_max_bars_wait
+                        else:
+                            _max_wait = config.entry_max_bars_wait
                         pending_entries[position_key] = {
                             "symbol": row.symbol, "side": signal.side,
                             "limit": float(signal.price), "stop": signal.stop_price,
@@ -310,6 +355,8 @@ class IntradayBacktester:
                             "milestones": list(signal.trail_milestones),
                             "reason": signal.reason, "strategy_name": signal.strategy_name,
                             "quantity": quantity, "spec": instrument_spec, "bars_waited": 0,
+                            "fill_mode": _fill_mode,
+                            "max_bars_wait": _max_wait,
                         }
                         continue
                     open_positions[position_key] = Position(

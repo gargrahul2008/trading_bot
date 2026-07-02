@@ -287,6 +287,9 @@ class FibLiveBot:
         self.use_trail: bool    = bool(self.strat_cfg.get("use_trailing_stop", True))
         self.time_exit_bars: int = 90  # 90 min for ext > 1.0
         self.max_bars_wait: int = int(cfg.get("max_bars_wait", 3))  # limit-entry expiry
+        # When True: fill at bar N+1 open (matches ENTRY_NEXT_BAR_OPEN=True backtest).
+        # When False: wait for price to touch the fib-618 limit within max_bars_wait bars.
+        self.entry_next_bar_open: bool = bool(cfg.get("entry_next_bar_open", False))
 
         # ── Threshold/qty scaling basis ──────────────────────────────────────
         # "window"  : legacy — median of the trailing fetch window (re-rolls each bar)
@@ -565,17 +568,27 @@ class FibLiveBot:
         if pe is not None:
             pe.bars_waiting += 1
             hi, lo = float(last_row["high"]), float(last_row["low"])
-            filled = (
-                (pe.side == "LONG"  and lo  <= pe.entry_limit) or
-                (pe.side == "SHORT" and hi >= pe.entry_limit)
-            )
-            if filled:
-                self._paper_open(sym, pe, pe.entry_limit, ts)
-            elif pe.bars_waiting >= pe.max_bars_wait:
-                LOG.info("[PAPER CANCEL] %s %s entry order expired (%d bars, not filled)",
-                         sym, pe.side, pe.bars_waiting)
-                self.pending[sym] = None
-            return  # either just filled, or still waiting
+            if self.entry_next_bar_open:
+                # Fill at this bar's open (first bar after signal) — matches
+                # ENTRY_NEXT_BAR_OPEN=True backtest behavior.
+                if pe.bars_waiting == 1:
+                    fill_price = float(last_row["open"])
+                    self._paper_open(sym, pe, fill_price, ts)
+                else:
+                    # Should not happen (max_bars_wait=1 implied), but guard anyway
+                    self.pending[sym] = None
+            else:
+                filled = (
+                    (pe.side == "LONG"  and lo  <= pe.entry_limit) or
+                    (pe.side == "SHORT" and hi >= pe.entry_limit)
+                )
+                if filled:
+                    self._paper_open(sym, pe, pe.entry_limit, ts)
+                elif pe.bars_waiting >= pe.max_bars_wait:
+                    LOG.info("[PAPER CANCEL] %s %s entry order expired (%d bars, not filled)",
+                             sym, pe.side, pe.bars_waiting)
+                    self.pending[sym] = None
+            return  # either just filled/cancelled, or still waiting
 
         # ── C. Look for new signal (no position, no pending) ─────────────
         if self.strat_cfg.get("target_ext", 1.618) <= 1.0:

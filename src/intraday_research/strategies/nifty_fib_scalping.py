@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 import logging
 
+import numpy as np
 import pandas as pd
 
 from ..strategy import SIGNAL_COLUMNS, Strategy
@@ -34,6 +35,9 @@ class _BOSSetup:
     zone_touched: bool = False
     zone_touched_at: int = -1
     used: bool = False  # True after a signal has been emitted for this setup
+    # BOS bar quality (populated when use_bos_strength_filter=True)
+    bos_bar_strong: bool = False  # True if BOS bar closed in the strong direction
+    bos_level: float = 0.0        # the price level that was broken (support/resistance)
 
 
 @dataclass
@@ -94,6 +98,13 @@ class NiftyBOSFibScalpStrategy(Strategy):
     use_vwap_filter: bool = False
     use_ema_filter: bool = False
 
+    # BOS bar strength filter: route strong BOS bars to immediate N+1 open entry,
+    # weak BOS bars to a broken-structure retest + rejection-wick entry.
+    # Requires entry_max_bars_wait >= 1 in BacktestConfig.
+    use_bos_strength_filter: bool = False
+    bos_strength_threshold: float = 0.6   # (close-low)/(high-low) >= threshold → strong
+    bos_retest_max_bars_wait: int = 20    # max bars to wait for a retest of the BOS level
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     def generate_signals(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -103,29 +114,45 @@ class NiftyBOSFibScalpStrategy(Strategy):
             self._warn_non_1min(group)
             signal_rows.extend(self._generate_group_signals(group))
         if not signal_rows:
-            return pd.DataFrame(columns=SIGNAL_COLUMNS + ["entry_price", "trail_milestones"])
+            return pd.DataFrame(columns=SIGNAL_COLUMNS + ["entry_price", "trail_milestones", "pending_fill_mode"])
         df = pd.DataFrame(signal_rows)
         # Ensure all standard columns exist (entry_price is optional per-row)
         for col in SIGNAL_COLUMNS:
             if col not in df.columns:
                 df[col] = None
-        return df[SIGNAL_COLUMNS + ["entry_price", "trail_milestones"]]
+        if "pending_fill_mode" not in df.columns:
+            df["pending_fill_mode"] = "config"
+        return df[SIGNAL_COLUMNS + ["entry_price", "trail_milestones", "pending_fill_mode"]]
 
     # ── Per-day signal generation ─────────────────────────────────────────────
 
     def _generate_group_signals(self, group: pd.DataFrame) -> list[dict[str, object]]:
         signal_rows: list[dict[str, object]] = []
         lookback = max(int(self.pivot_lookback), 1)
+        n = len(group)
+
+        # Pre-extract columns into numpy arrays — avoids creating a pandas Series per bar
+        # (group.iloc[int] takes ~0.65ms; numpy scalar access is ~1000x faster).
+        arr_high  = group["high"].to_numpy(dtype=float)
+        arr_low   = group["low"].to_numpy(dtype=float)
+        arr_close = group["close"].to_numpy(dtype=float)
+        arr_open  = group["open"].to_numpy(dtype=float)
+        arr_ts    = group["timestamp"].to_numpy()
+        arr_sym   = group["symbol"].to_numpy()
+        arr_td    = group["trade_date"].to_numpy()
+        arr_vwap  = group["vwap"].to_numpy(dtype=float)    if "vwap"     in group.columns else None
+        arr_ef    = group["ema_fast"].to_numpy(dtype=float) if "ema_fast" in group.columns else None
 
         confirmed_highs: list[_Pivot] = []
         confirmed_lows: list[_Pivot] = []
         active_long: _BOSSetup | None = None
         active_short: _BOSSetup | None = None
         trades_today = 0
-        prev_row: pd.Series | None = None
+        prev_row: dict | None = None
+        micro_trend: str | None = None  # cached; updated only when a pivot is confirmed
 
         # Resolve this day's thresholds (daily-frozen lookback override, else scalar)
-        date = str(group["trade_date"].iloc[0]) if len(group) else None
+        date = str(arr_td[0]) if n else None
         self._cur_min_imp = float(self.min_impulse_points)
         self._cur_stop_buf = float(self.stop_buffer_points)
         if self.min_impulse_by_date and date in self.min_impulse_by_date:
@@ -133,13 +160,22 @@ class NiftyBOSFibScalpStrategy(Strategy):
         if self.stop_buffer_by_date and date in self.stop_buffer_by_date:
             self._cur_stop_buf = float(self.stop_buffer_by_date[date])
 
-        for idx in range(len(group)):
-            row = group.iloc[idx]
+        for idx in range(n):
+            row: dict = {
+                "high": arr_high[idx], "low": arr_low[idx],
+                "close": arr_close[idx], "open": arr_open[idx],
+                "timestamp": arr_ts[idx], "symbol": arr_sym[idx],
+                "trade_date": arr_td[idx],
+            }
+            if arr_vwap is not None:
+                row["vwap"] = arr_vwap[idx]
+            if arr_ef is not None:
+                row["ema_fast"] = arr_ef[idx]
 
             # ── Step 1: Confirm pivot at idx - lookback ───────────────────────
             cand = idx - lookback
             if cand >= lookback:
-                pivot = self._try_confirm_pivot(group, cand, lookback, idx)
+                pivot = self._try_confirm_pivot(arr_high, arr_low, arr_ts, cand, lookback, idx)
                 if pivot is not None:
                     if pivot.kind == "HIGH":
                         confirmed_highs.append(pivot)
@@ -150,11 +186,10 @@ class NiftyBOSFibScalpStrategy(Strategy):
                         self.name, row["symbol"], pivot.kind, pivot.bar_index,
                         pivot.price, pivot.timestamp,
                     )
+                    # ── Step 2: Recompute micro-trend only when pivot set changes ─
+                    micro_trend = self._micro_trend(confirmed_highs, confirmed_lows)
 
-            # ── Step 2: Determine micro-trend ────────────────────────────────
-            micro_trend = self._micro_trend(confirmed_highs, confirmed_lows)
-
-            # ── Step 3: Detect BOS → build active setup ──────────────────────
+            # ── Step 3: Detect BOS → build active setup (uses cached micro_trend) ──
             # EXT always runs for active setups — independent of micro_trend.
             # Gating EXT on micro_trend causes it to silently stop when a tiny
             # "higher high" or "lower low" momentarily flips micro_trend to None,
@@ -211,7 +246,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
                 if float(row["low"]) < ref_low.price and confirmed_highs:
                     if active_short is None or active_short.used:
                         setup = self._build_short_setup(
-                            confirmed_highs[-1].price, float(row["low"]), idx
+                            confirmed_highs[-1].price, float(row["low"]), idx, bos_bar=row
                         )
                         if setup is not None:
                             active_short = setup
@@ -219,19 +254,27 @@ class NiftyBOSFibScalpStrategy(Strategy):
                             LOG.debug(
                                 "%s BEARISH_BOS symbol=%s bar=%d "
                                 "impulse_high=%.2f impulse_low=%.2f "
-                                "fib50=%.2f fib618=%.2f stop=%.2f target=%.2f",
+                                "fib50=%.2f fib618=%.2f stop=%.2f target=%.2f strong=%s",
                                 self.name, row["symbol"], idx,
                                 setup.impulse_high, setup.impulse_low,
                                 setup.fib_50, setup.fib_618,
-                                setup.stop_loss, setup.target,
+                                setup.stop_loss, setup.target, setup.bos_bar_strong,
                             )
+                            # Strong BOS: emit breakout signal immediately (fills at N+1 open)
+                            if (self.use_bos_strength_filter and setup.bos_bar_strong
+                                    and not self._max_trades_reached(trades_today)
+                                    and self._passes_filters(row, "SHORT")):
+                                signal = self._signal_row(row, setup, "bos_breakout")
+                                signal_rows.append(signal)
+                                trades_today += 1
+                                setup.used = True
 
             elif micro_trend == "BULLISH" and confirmed_highs:
                 ref_high = confirmed_highs[-1]
                 if float(row["high"]) > ref_high.price and confirmed_lows:
                     if active_long is None or active_long.used:
                         setup = self._build_long_setup(
-                            confirmed_lows[-1].price, float(row["high"]), idx
+                            confirmed_lows[-1].price, float(row["high"]), idx, bos_bar=row
                         )
                         if setup is not None:
                             active_long = setup
@@ -239,12 +282,20 @@ class NiftyBOSFibScalpStrategy(Strategy):
                             LOG.debug(
                                 "%s BULLISH_BOS symbol=%s bar=%d "
                                 "impulse_low=%.2f impulse_high=%.2f "
-                                "fib50=%.2f fib618=%.2f stop=%.2f target=%.2f",
+                                "fib50=%.2f fib618=%.2f stop=%.2f target=%.2f strong=%s",
                                 self.name, row["symbol"], idx,
                                 setup.impulse_low, setup.impulse_high,
                                 setup.fib_50, setup.fib_618,
-                                setup.stop_loss, setup.target,
+                                setup.stop_loss, setup.target, setup.bos_bar_strong,
                             )
+                            # Strong BOS: emit breakout signal immediately (fills at N+1 open)
+                            if (self.use_bos_strength_filter and setup.bos_bar_strong
+                                    and not self._max_trades_reached(trades_today)
+                                    and self._passes_filters(row, "LONG")):
+                                signal = self._signal_row(row, setup, "bos_breakout")
+                                signal_rows.append(signal)
+                                trades_today += 1
+                                setup.used = True
 
             # ── Step 4: Check entry on active setups ──────────────────────────
             if not self._max_trades_reached(trades_today):
@@ -293,23 +344,40 @@ class NiftyBOSFibScalpStrategy(Strategy):
 
     def _try_confirm_pivot(
         self,
-        group: pd.DataFrame,
+        arr_high: np.ndarray,
+        arr_low: np.ndarray,
+        arr_ts: np.ndarray,
         cand: int,
         lookback: int,
         confirmed_at: int,
     ) -> _Pivot | None:
-        before = group.iloc[cand - lookback : cand]
-        after = group.iloc[cand + 1 : cand + lookback + 1]
-        if len(before) < lookback or len(after) < lookback:
-            return None
-        row = group.iloc[cand]
-        low = float(row["low"])
-        high = float(row["high"])
-        if low < float(before["low"].min()) and low < float(after["low"].min()):
-            return _Pivot("LOW", cand, confirmed_at, low, pd.Timestamp(row["timestamp"]))
-        if high > float(before["high"].max()) and high > float(after["high"].max()):
-            return _Pivot("HIGH", cand, confirmed_at, high, pd.Timestamp(row["timestamp"]))
-        return None
+        # Python loops with early-exit beat numpy .min()/.max() for small lookback windows
+        # (numpy ufunc dispatch overhead is ~23μs; a 4-comparison Python loop is ~0.5μs).
+        lo_start = cand - lookback
+        hi_end   = cand + lookback + 1
+        low  = float(arr_low[cand])
+        high = float(arr_high[cand])
+
+        is_low = True
+        for k in range(lo_start, cand):
+            if float(arr_low[k]) <= low:
+                is_low = False
+                break
+        if is_low:
+            for k in range(cand + 1, hi_end):
+                if float(arr_low[k]) <= low:
+                    is_low = False
+                    break
+        if is_low:
+            return _Pivot("LOW", cand, confirmed_at, low, pd.Timestamp(arr_ts[cand]))
+
+        for k in range(lo_start, cand):
+            if float(arr_high[k]) >= high:
+                return None
+        for k in range(cand + 1, hi_end):
+            if float(arr_high[k]) >= high:
+                return None
+        return _Pivot("HIGH", cand, confirmed_at, high, pd.Timestamp(arr_ts[cand]))
 
     # ── Trend detection ───────────────────────────────────────────────────────
 
@@ -334,6 +402,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
         impulse_high: float,
         impulse_low: float,
         confirmed_at: int,
+        bos_bar=None,
     ) -> _BOSSetup | None:
         size = impulse_high - impulse_low
         if size <= getattr(self, "_cur_min_imp", float(self.min_impulse_points)):
@@ -343,6 +412,12 @@ class NiftyBOSFibScalpStrategy(Strategy):
         fib_618 = impulse_low + float(self.fib_zone_high) * size
         # Target extends below impulse_low by (extension_ratio - 1) × size
         target = impulse_low - (float(self.target_extension_ratio) - 1.0) * size
+        bos_bar_strong = False
+        if bos_bar is not None and self.use_bos_strength_filter:
+            bar_range = float(bos_bar["high"]) - float(bos_bar["low"])
+            if bar_range > 0:
+                # Strong SHORT bar: close in the bottom portion of the range
+                bos_bar_strong = (float(bos_bar["high"]) - float(bos_bar["close"])) / bar_range >= self.bos_strength_threshold
         return _BOSSetup(
             direction="SHORT",
             impulse_high=impulse_high,
@@ -353,6 +428,8 @@ class NiftyBOSFibScalpStrategy(Strategy):
             stop_loss=impulse_high + getattr(self, "_cur_stop_buf", float(self.stop_buffer_points)),
             target=target,
             confirmed_at=confirmed_at,
+            bos_bar_strong=bos_bar_strong,
+            bos_level=impulse_low,  # broken support level; acts as resistance on retest
         )
 
     def _build_long_setup(
@@ -360,6 +437,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
         impulse_low: float,
         impulse_high: float,
         confirmed_at: int,
+        bos_bar=None,
     ) -> _BOSSetup | None:
         size = impulse_high - impulse_low
         if size <= getattr(self, "_cur_min_imp", float(self.min_impulse_points)):
@@ -369,6 +447,12 @@ class NiftyBOSFibScalpStrategy(Strategy):
         fib_618 = impulse_high - float(self.fib_zone_high) * size
         # Target extends above impulse_high by (extension_ratio - 1) × size
         target = impulse_high + (float(self.target_extension_ratio) - 1.0) * size
+        bos_bar_strong = False
+        if bos_bar is not None and self.use_bos_strength_filter:
+            bar_range = float(bos_bar["high"]) - float(bos_bar["low"])
+            if bar_range > 0:
+                # Strong LONG bar: close in the top portion of the range
+                bos_bar_strong = (float(bos_bar["close"]) - float(bos_bar["low"])) / bar_range >= self.bos_strength_threshold
         return _BOSSetup(
             direction="LONG",
             impulse_high=impulse_high,
@@ -379,6 +463,8 @@ class NiftyBOSFibScalpStrategy(Strategy):
             stop_loss=impulse_low - getattr(self, "_cur_stop_buf", float(self.stop_buffer_points)),
             target=target,
             confirmed_at=confirmed_at,
+            bos_bar_strong=bos_bar_strong,
+            bos_level=impulse_high,  # broken resistance level; acts as support on retest
         )
 
     # ── Entry logic ───────────────────────────────────────────────────────────
@@ -389,6 +475,10 @@ class NiftyBOSFibScalpStrategy(Strategy):
         row: pd.Series,
         setup: _BOSSetup,
     ) -> dict[str, object] | None:
+        if self.use_bos_strength_filter:
+            # Strong BOS setups are emitted at the BOS bar (setup.used=True);
+            # only weak setups reach here — wait for broken-structure retest.
+            return self._try_retest_rejection(row, setup)
         if self.entry_mode == "limit_618":
             return self._try_limit_618(row, setup)
         return self._try_zone_confirmation(idx, row, setup)
@@ -527,26 +617,67 @@ class NiftyBOSFibScalpStrategy(Strategy):
 
         return None
 
+    def _try_retest_rejection(
+        self,
+        row: pd.Series,
+        setup: _BOSSetup,
+    ) -> dict[str, object] | None:
+        """Weak BOS entry: price must retest the broken structure level and show a
+        rejection wick — touching the level on the bar's wick but closing above/below
+        it (in the direction of the trade) with the close in the top/bottom 50% of range."""
+        bar_range = float(row["high"]) - float(row["low"])
+        if bar_range <= 0:
+            return None
+        if setup.direction == "LONG":
+            bos_level = setup.bos_level  # impulse_high: broken resistance → now support
+            if (float(row["low"]) <= bos_level
+                    and float(row["close"]) > bos_level
+                    and float(row["close"]) > float(row["open"])  # bullish bar
+                    and float(row["close"]) > setup.stop_loss):
+                # Rejection wick: close in upper half of bar range
+                if (float(row["close"]) - float(row["low"])) / bar_range >= 0.5:
+                    LOG.debug(
+                        "%s retest_rejection LONG symbol=%s ts=%s low=%.2f bos=%.2f close=%.2f",
+                        self.name, row["symbol"], row["timestamp"],
+                        row["low"], bos_level, row["close"],
+                    )
+                    return self._signal_row(row, setup, "bos_retest")
+        else:
+            bos_level = setup.bos_level  # impulse_low: broken support → now resistance
+            if (float(row["high"]) >= bos_level
+                    and float(row["close"]) < bos_level
+                    and float(row["close"]) < float(row["open"])  # bearish bar
+                    and float(row["close"]) < setup.stop_loss
+                    and float(row["close"]) > setup.target):
+                # Rejection wick: close in lower half of bar range
+                if (float(row["high"]) - float(row["close"])) / bar_range >= 0.5:
+                    LOG.debug(
+                        "%s retest_rejection SHORT symbol=%s ts=%s high=%.2f bos=%.2f close=%.2f",
+                        self.name, row["symbol"], row["timestamp"],
+                        row["high"], bos_level, row["close"],
+                    )
+                    return self._signal_row(row, setup, "bos_retest")
+        return None
+
     # ── Optional indicator filters (no-ops when disabled) ─────────────────────
 
-    def _passes_filters(self, row: pd.Series, direction: str) -> bool:
+    def _passes_filters(self, row: dict, direction: str) -> bool:
+        close = row["close"]
         if self.use_vwap_filter:
-            vwap = row.get("vwap") if hasattr(row, "get") else row["vwap"] if "vwap" in row.index else None
-            if vwap is None or pd.isna(vwap):
+            vwap = row.get("vwap")
+            if vwap is None or vwap != vwap:  # None or NaN
                 return False
-            close = float(row["close"])
-            if direction == "LONG" and close <= float(vwap):
+            if direction == "LONG" and close <= vwap:
                 return False
-            if direction == "SHORT" and close >= float(vwap):
+            if direction == "SHORT" and close >= vwap:
                 return False
         if self.use_ema_filter:
-            ema = row.get("ema_fast") if hasattr(row, "get") else row["ema_fast"] if "ema_fast" in row.index else None
-            if ema is None or pd.isna(ema):
+            ema = row.get("ema_fast")
+            if ema is None or ema != ema:
                 return False
-            close = float(row["close"])
-            if direction == "LONG" and close <= float(ema):
+            if direction == "LONG" and close <= ema:
                 return False
-            if direction == "SHORT" and close >= float(ema):
+            if direction == "SHORT" and close >= ema:
                 return False
         return True
 
@@ -558,7 +689,20 @@ class NiftyBOSFibScalpStrategy(Strategy):
         setup: _BOSSetup,
         trigger: str,
     ) -> dict[str, object]:
-        entry_price = float(setup.fib_618) if trigger == "limit_618" else float(row["close"])
+        if trigger == "limit_618":
+            entry_price = float(setup.fib_618)
+        else:
+            # bos_breakout: entry_price ignored (fill at N+1 open via pending_fill_mode)
+            # bos_retest: fill at this bar's close (the rejection wick bar close)
+            # zone_touch_confirmation: fill at bar close
+            entry_price = float(row["close"])
+
+        if trigger == "bos_breakout":
+            pending_fill_mode = "next_bar_open"
+        elif trigger == "bos_retest":
+            pending_fill_mode = "fill_at_limit_first_bar"
+        else:
+            pending_fill_mode = "config"
 
         # Step-up trail milestones: ordered Fib price levels from nearest to farthest.
         # The backtester steps the stop up to each confirmed level (one-bar delay).
@@ -594,6 +738,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             "target": float(setup.target),
             "entry_price": entry_price,
             "trail_milestones": milestones,
+            "pending_fill_mode": pending_fill_mode,
             "strategy_name": self.name,
         }
 
