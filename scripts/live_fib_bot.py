@@ -169,6 +169,8 @@ def _make_strategy(cfg: dict, med_price: float) -> NiftyBOSFibScalpStrategy:
         entry_mode="limit_618", min_confirmation_rr=0.0,
         use_vwap_filter=use_vwap, use_ema_filter=use_ema,
         target_extension_ratio=float(cfg.get("target_ext", 1.618)),
+        same_bar_entry_needs_open_near_extreme=bool(cfg.get("same_bar_entry_needs_open_near_extreme", False)),
+        same_bar_open_pos_threshold=float(cfg.get("same_bar_open_pos_threshold", 0.5)),
     )
 
 

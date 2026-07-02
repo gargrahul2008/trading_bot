@@ -32,6 +32,7 @@ class _BOSSetup:
     stop_loss: float    # fib 1.0 level ± stop_buffer_points
     target: float       # structure-breaking extreme (impulse endpoint)
     confirmed_at: int   # BOS bar index; entries only allowed for bar_index > confirmed_at
+    impulse_extreme_bar: int = -1  # bar index that set the current impulse extreme (high/low)
     zone_touched: bool = False
     zone_touched_at: int = -1
     used: bool = False  # True after a signal has been emitted for this setup
@@ -104,6 +105,14 @@ class NiftyBOSFibScalpStrategy(Strategy):
     use_bos_strength_filter: bool = False
     bos_strength_threshold: float = 0.6   # (close-low)/(high-low) >= threshold → strong
     bos_retest_max_bars_wait: int = 20    # max bars to wait for a retest of the BOS level
+
+    # Same-bar entry guard: when one candle BOTH sets the impulse extreme AND triggers
+    # the limit_618 pullback (degenerate case — no real pullback, the fib "touch" is the
+    # pre-impulse open), require it to have OPENED near that extreme. Open-near-extreme ⇒
+    # the extreme was made early, so the dip to fib_618 afterwards is a genuine intrabar
+    # pullback (a hammer/pin), not a momentum marubozu opening on the far side.
+    same_bar_entry_needs_open_near_extreme: bool = False
+    same_bar_open_pos_threshold: float = 0.5   # open must be within top/bottom (1-thr) of range
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -210,7 +219,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
                             and float(prev_row["high"]) < active_short.impulse_high):
                         new_imp_h = float(prev_row["high"])
                     updated = self._build_short_setup(
-                        new_imp_h, cur_low, active_short.confirmed_at
+                        new_imp_h, cur_low, active_short.confirmed_at, extreme_bar=idx
                     )
                     if updated is not None:
                         active_short = updated
@@ -231,7 +240,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
                             and float(prev_row["low"]) > active_long.impulse_low):
                         new_imp_l = float(prev_row["low"])
                     updated = self._build_long_setup(
-                        new_imp_l, cur_high, active_long.confirmed_at
+                        new_imp_l, cur_high, active_long.confirmed_at, extreme_bar=idx
                     )
                     if updated is not None:
                         active_long = updated
@@ -246,7 +255,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
                 if float(row["low"]) < ref_low.price and confirmed_highs:
                     if active_short is None or active_short.used:
                         setup = self._build_short_setup(
-                            confirmed_highs[-1].price, float(row["low"]), idx, bos_bar=row
+                            confirmed_highs[-1].price, float(row["low"]), idx, bos_bar=row, extreme_bar=idx
                         )
                         if setup is not None:
                             active_short = setup
@@ -274,7 +283,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
                 if float(row["high"]) > ref_high.price and confirmed_lows:
                     if active_long is None or active_long.used:
                         setup = self._build_long_setup(
-                            confirmed_lows[-1].price, float(row["high"]), idx, bos_bar=row
+                            confirmed_lows[-1].price, float(row["high"]), idx, bos_bar=row, extreme_bar=idx
                         )
                         if setup is not None:
                             active_long = setup
@@ -403,6 +412,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
         impulse_low: float,
         confirmed_at: int,
         bos_bar=None,
+        extreme_bar: int = -1,
     ) -> _BOSSetup | None:
         size = impulse_high - impulse_low
         if size <= getattr(self, "_cur_min_imp", float(self.min_impulse_points)):
@@ -428,6 +438,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             stop_loss=impulse_high + getattr(self, "_cur_stop_buf", float(self.stop_buffer_points)),
             target=target,
             confirmed_at=confirmed_at,
+            impulse_extreme_bar=extreme_bar,
             bos_bar_strong=bos_bar_strong,
             bos_level=impulse_low,  # broken support level; acts as resistance on retest
         )
@@ -438,6 +449,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
         impulse_high: float,
         confirmed_at: int,
         bos_bar=None,
+        extreme_bar: int = -1,
     ) -> _BOSSetup | None:
         size = impulse_high - impulse_low
         if size <= getattr(self, "_cur_min_imp", float(self.min_impulse_points)):
@@ -463,6 +475,7 @@ class NiftyBOSFibScalpStrategy(Strategy):
             stop_loss=impulse_low - getattr(self, "_cur_stop_buf", float(self.stop_buffer_points)),
             target=target,
             confirmed_at=confirmed_at,
+            impulse_extreme_bar=extreme_bar,
             bos_bar_strong=bos_bar_strong,
             bos_level=impulse_high,  # broken resistance level; acts as support on retest
         )
@@ -480,11 +493,29 @@ class NiftyBOSFibScalpStrategy(Strategy):
             # only weak setups reach here — wait for broken-structure retest.
             return self._try_retest_rejection(row, setup)
         if self.entry_mode == "limit_618":
-            return self._try_limit_618(row, setup)
+            return self._try_limit_618(idx, row, setup)
         return self._try_zone_confirmation(idx, row, setup)
+
+    def _same_bar_open_guard_ok(self, idx: int, row: pd.Series, setup: _BOSSetup) -> bool:
+        """For a same-bar setup (impulse extreme set on THIS bar), require the candle to
+        have OPENED near that extreme — so the extreme came first and the dip to fib_618
+        is a genuine intrabar pullback (hammer/pin), not an open-on-the-far-side momentum
+        bar. Multi-bar setups (extreme on an earlier bar) always pass."""
+        if not self.same_bar_entry_needs_open_near_extreme:
+            return True
+        if idx != setup.impulse_extreme_bar:
+            return True  # extreme was a prior bar → ordering already guaranteed
+        hi, lo, op = float(row["high"]), float(row["low"]), float(row["open"])
+        rng = hi - lo
+        if rng <= 0:
+            return False
+        # open_pos = 1.0 when the candle opened exactly at its impulse extreme
+        open_pos = (op - lo) / rng if setup.direction == "LONG" else (hi - op) / rng
+        return open_pos >= float(self.same_bar_open_pos_threshold)
 
     def _try_limit_618(
         self,
+        idx: int,
         row: pd.Series,
         setup: _BOSSetup,
     ) -> dict[str, object] | None:
@@ -499,6 +530,8 @@ class NiftyBOSFibScalpStrategy(Strategy):
                     and close >= setup.fib_618
                     and close > float(row["open"])
                     and close > setup.stop_loss):
+                if not self._same_bar_open_guard_ok(idx, row, setup):
+                    return None
                 LOG.debug(
                     "%s limit_618 LONG trigger symbol=%s ts=%s low=%.2f fib618=%.2f close=%.2f open=%.2f stop=%.2f",
                     self.name, row["symbol"], row["timestamp"],
@@ -514,6 +547,8 @@ class NiftyBOSFibScalpStrategy(Strategy):
                     and close < float(row["open"])
                     and close < setup.stop_loss
                     and close > setup.target):
+                if not self._same_bar_open_guard_ok(idx, row, setup):
+                    return None
                 LOG.debug(
                     "%s limit_618 SHORT trigger symbol=%s ts=%s high=%.2f fib618=%.2f close=%.2f stop=%.2f target=%.2f",
                     self.name, row["symbol"], row["timestamp"],
