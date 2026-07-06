@@ -69,6 +69,7 @@ class OpenPosition:
     trail_milestone_idx: int = 0
     stop_pending: Optional[float] = None  # trail stop to apply next bar
     partial_done: bool = False
+    entry_binance: Optional[float] = None  # dual-feed: signal-feed level at entry (for basis)
     # live-mode order ids
     entry_order_id: Optional[str] = None
     exit_order_id: Optional[str] = None
@@ -82,6 +83,7 @@ class OpenPosition:
         d.setdefault("bars_held", 0)
         d.setdefault("stop_pending", None)
         d.setdefault("partial_done", False)
+        d.setdefault("entry_binance", None)
         d.setdefault("entry_order_id", None)
         d.setdefault("exit_order_id", None)
         return cls(**d)
@@ -149,13 +151,38 @@ def _fetch_ltp_mexc(symbol: str) -> float:
     return float(r.json()["price"])
 
 
+def _fetch_bars_binance(symbol: str, n: int = 350) -> pd.DataFrame:
+    """Fetch last N *closed* 1-min bars from Binance public klines (clean/deep feed)."""
+    url = "https://api.binance.com/api/v3/klines"
+    r = _requests.get(url, params={"symbol": symbol, "interval": "1m", "limit": n + 1}, timeout=15)
+    r.raise_for_status()
+    rows = r.json()[:-1]  # last bar still open — drop it
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame({
+        "timestamp": [pd.Timestamp(int(b[0]), unit="ms", tz="UTC") for b in rows],
+        "symbol":    f"BINANCE:{symbol}",
+        "open":      [float(b[1]) for b in rows],
+        "high":      [float(b[2]) for b in rows],
+        "low":       [float(b[3]) for b in rows],
+        "close":     [float(b[4]) for b in rows],
+        "volume":    [float(b[5]) for b in rows],
+    })
+    df["trade_date"] = df["timestamp"].dt.date.astype(str)
+    return df.reset_index(drop=True)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_strategy(cfg: dict, med_price: float) -> NiftyBOSFibScalpStrategy:
     min_imp = round(med_price * cfg["min_impulse_pct"] / 100, 4)
-    stop_buf = round(max(med_price * cfg.get("stop_buffer_pct", 0.009) / 100, 0.05), 4)
+    # stop_buffer_floor: minimum cushion beyond the impulse extreme. The old fixed 0.05
+    # dominates for low-priced coins (SOL ~$73 → 0.009% = 0.0066 « 0.05), inflating risk
+    # and halving RR. Configurable; default 0.05 for backward-compat.
+    _floor = float(cfg.get("stop_buffer_floor", 0.05))
+    stop_buf = round(max(med_price * cfg.get("stop_buffer_pct", 0.009) / 100, _floor), 4)
     variant = cfg.get("variant", "EMA").upper()
     use_vwap = "VWAP" in variant
     use_ema  = "EMA"  in variant
@@ -293,6 +320,19 @@ class FibLiveBot:
         # When False: wait for price to touch the fib-618 limit within max_bars_wait bars.
         self.entry_next_bar_open: bool = bool(cfg.get("entry_next_bar_open", False))
 
+        # ── Dual-feed: signals on one exchange, fills captured from another ────
+        # Generate signals + exit triggers on `signals` feed (Binance — clean/deep),
+        # but capture the ACTUAL marketable fill price from `fills` feed (MEXC — where
+        # the order executes). Every fill (entry, stop, target, trail, time) is treated
+        # as marketable: Binance detects the trigger, MEXC gives the fill price. Measures
+        # the real basis/slippage. Default off = single feed (unchanged behaviour).
+        _df_cfg = cfg.get("dual_feed", {}) or {}
+        self.dual_feed: bool = bool(_df_cfg.get("enabled", False))
+        self.signal_feed: str = str(_df_cfg.get("signals", "mexc")).lower()
+        self.fill_feed: str = str(_df_cfg.get("fills", "mexc")).lower()
+        if self.dual_feed:
+            LOG.info("Dual-feed ON: signals=%s  fills=%s", self.signal_feed, self.fill_feed)
+
         # ── Threshold/qty scaling basis ──────────────────────────────────────
         # "window"  : legacy — median of the trailing fetch window (re-rolls each bar)
         # "lookback": median over trailing `lookback_days`, FROZEN per UTC day.
@@ -423,11 +463,67 @@ class FibLiveBot:
             time.sleep(0.15)
         return rows
 
+    @staticmethod
+    def _fetch_binance_klines_range(symbol: str, start_ms: int, end_ms: int) -> list:
+        """Fetch [start_ms, end_ms) 1-min klines from Binance in <=1000-bar chunks."""
+        rows, cur = [], start_ms
+        for _ in range(400):
+            if cur >= end_ms:
+                break
+            r = _requests.get("https://api.binance.com/api/v3/klines", params={
+                "symbol": symbol, "interval": "1m",
+                "startTime": cur, "endTime": end_ms, "limit": 1000}, timeout=20)
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            rows.extend(batch)
+            nxt = int(batch[-1][0]) + 60_000
+            if nxt <= cur:
+                break
+            cur = nxt
+            time.sleep(0.1)
+        return rows
+
+    def _signal_klines_range(self, symbol: str, start_ms: int, end_ms: int) -> list:
+        """Range fetch from the SIGNAL feed (Binance in dual-feed, else MEXC)."""
+        if self.dual_feed and self.signal_feed == "binance":
+            return self._fetch_binance_klines_range(symbol, start_ms, end_ms)
+        return self._fetch_klines_range(symbol, start_ms, end_ms)
+
+    def _fetch_signal_bars(self, symbol: str, n: int = 350) -> pd.DataFrame:
+        """Fetch the trailing signal-feed bars (Binance in dual-feed, else MEXC)."""
+        if self.dual_feed and self.signal_feed == "binance":
+            return _fetch_bars_binance(symbol, n)
+        return _fetch_bars_mexc(symbol, n)
+
+    def _mexc_marketable_price(self, symbol: str, is_buy: bool) -> Optional[float]:
+        """MEXC marketable fill price: ask for a buy, bid for a sell — the price you
+        actually cross. Returns None on failure (caller falls back to the signal level)."""
+        try:
+            r = _requests.get("https://api.mexc.com/api/v3/ticker/bookTicker",
+                              params={"symbol": symbol}, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            return float(d["askPrice"]) if is_buy else float(d["bidPrice"])
+        except Exception as e:
+            LOG.warning("[%s] MEXC bookTicker fetch failed: %s", symbol, e)
+            return None
+
+    def _capture_fill(self, symbol: str, signal_price: float, is_buy: bool):
+        """Return (fill_price, signal_level). In dual-feed the fill is the MEXC marketable
+        price and signal_level is the signal-feed price (for basis). Else identity."""
+        if not self.dual_feed:
+            return signal_price, None
+        mx = self._mexc_marketable_price(symbol, is_buy)
+        return (mx if mx is not None else signal_price), signal_price
+
     def _compute_ref_median(self, symbol: str, day_start: pd.Timestamp) -> Optional[float]:
-        """Median close over [day_start - lookback_days, day_start) — lookahead-free."""
+        """Median close over [day_start - lookback_days, day_start) — lookahead-free.
+        Uses the SIGNAL feed so scaling is consistent with signal generation."""
         end_ms = int(day_start.timestamp() * 1000)
         start_ms = end_ms - self.lookback_days * 86_400_000
-        rows = self._fetch_klines_range(symbol, start_ms, end_ms)
+        rows = self._signal_klines_range(symbol, start_ms, end_ms)
         if not rows:
             return None
         return float(pd.Series([float(b[4]) for b in rows]).median())
@@ -458,7 +554,8 @@ class FibLiveBot:
 
     # ── paper simulation helpers ──────────────────────────────────────────────
 
-    def _paper_open(self, sym: str, pe: PendingEntry, fill_price: float, ts: str) -> None:
+    def _paper_open(self, sym: str, pe: PendingEntry, fill_price: float, ts: str,
+                    binance_level: Optional[float] = None) -> None:
         pos = OpenPosition(
             symbol=sym,
             side=pe.side,
@@ -469,6 +566,7 @@ class FibLiveBot:
             entry_time_utc=ts,
             entry_bar_ts=pe.signal_bar_ts,
             trail_milestones=list(pe.trail_milestones),
+            entry_binance=binance_level,
         )
         self.positions[sym] = pos
         self.pending[sym]   = None
@@ -478,16 +576,20 @@ class FibLiveBot:
             tag, sym, pe.side, pe.qty, fill_price, pe.stop_price, pe.target_price,
             [f"{m:.4f}" for m in pe.trail_milestones],
         )
+        basis_line = ""
+        if binance_level is not None:
+            basis_line = f"\nsignal {binance_level:.4f} → MEXC fill {fill_price:.4f}  (basis {fill_price-binance_level:+.4f})"
         emoji = "🟢" if pe.side == "LONG" else "🔻"
         self._send_telegram(
             f"{emoji} <b>ENTRY</b> [{tag}]  <b>{sym[0]} {pe.side}</b>\n"
             f"qty: {pe.qty:.6g}  @ {fill_price:.4f}\n"
             f"stop: {pe.stop_price:.4f}   target: {pe.target_price:.4f}\n"
-            f"notional: ${fill_price * pe.qty:,.0f}"
+            f"notional: ${fill_price * pe.qty:,.0f}{basis_line}"
         )
 
     def _paper_close(self, sym: str, pos: OpenPosition, exit_price: float,
-                     reason: str, is_partial: bool, ts: str) -> None:
+                     reason: str, is_partial: bool, ts: str,
+                     binance_level: Optional[float] = None) -> None:
         is_long = pos.side == "LONG"
         qty = pos.qty / 2 if is_partial else pos.qty
         gross = (exit_price - pos.entry_price) * qty * (1 if is_long else -1)
@@ -511,6 +613,14 @@ class FibLiveBot:
             "pct_return": pct_return,
             "notional_usd": round(pos.entry_price * qty, 2),
         }
+        if self.dual_feed:
+            # signal-feed levels vs the actual MEXC fills → the real basis/slippage
+            rec["entry_binance"] = pos.entry_binance
+            rec["exit_binance"] = binance_level
+            rec["entry_basis"] = (round(pos.entry_price - pos.entry_binance, 4)
+                                  if pos.entry_binance is not None else None)
+            rec["exit_basis"] = (round(exit_price - binance_level, 4)
+                                 if binance_level is not None else None)
         self.paper_trades[sym].append(rec)
         self._log_trade(sym, rec)
 
@@ -562,7 +672,9 @@ class FibLiveBot:
             if result is not None:
                 exit_price, reason = result
                 is_partial = (reason == "partial_target")
-                self._paper_close(sym, pos, exit_price, reason, is_partial, ts)
+                # exiting a SHORT = buy back (ask); exiting a LONG = sell (bid)
+                fill, blevel = self._capture_fill(sym, exit_price, is_buy=(pos.side == "SHORT"))
+                self._paper_close(sym, pos, fill, reason, is_partial, ts, binance_level=blevel)
             return  # don't look for new entries while in position
 
         # ── B. Check pending entry ────────────────────────────────────────
@@ -574,8 +686,9 @@ class FibLiveBot:
                 # Fill at this bar's open (first bar after signal) — matches
                 # ENTRY_NEXT_BAR_OPEN=True backtest behavior.
                 if pe.bars_waiting == 1:
-                    fill_price = float(last_row["open"])
-                    self._paper_open(sym, pe, fill_price, ts)
+                    fill, blevel = self._capture_fill(sym, float(last_row["open"]),
+                                                      is_buy=(pe.side == "LONG"))
+                    self._paper_open(sym, pe, fill, ts, binance_level=blevel)
                 else:
                     # Should not happen (max_bars_wait=1 implied), but guard anyway
                     self.pending[sym] = None
@@ -585,7 +698,9 @@ class FibLiveBot:
                     (pe.side == "SHORT" and hi >= pe.entry_limit)
                 )
                 if filled:
-                    self._paper_open(sym, pe, pe.entry_limit, ts)
+                    fill, blevel = self._capture_fill(sym, pe.entry_limit,
+                                                      is_buy=(pe.side == "LONG"))
+                    self._paper_open(sym, pe, fill, ts, binance_level=blevel)
                 elif pe.bars_waiting >= pe.max_bars_wait:
                     LOG.info("[PAPER CANCEL] %s %s entry order expired (%d bars, not filled)",
                              sym, pe.side, pe.bars_waiting)
@@ -677,7 +792,7 @@ class FibLiveBot:
 
                 for sym in self.symbols:
                     try:
-                        df = _fetch_bars_mexc(sym, n=350)
+                        df = self._fetch_signal_bars(sym, 350)
                         self.on_bar(sym, df)
                     except Exception as e:
                         LOG.error("[%s] Bar processing error: %s", sym, e)
