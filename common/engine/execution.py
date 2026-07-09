@@ -168,11 +168,15 @@ class OrderExecutor:
         for attempt in range(int(self.cfg.max_place_retries)):
             try:
                 oid = self.broker.place_order(req)
+                self.state.extras.pop(f"_last_reject_kind_{symbol}", None)
                 return oid
             except BrokerError as e:
                 last_err = e.resp or str(e)
                 act = parse_reject(last_err)
                 self._note_reject(symbol=symbol, order_id="PLACE_FAIL", resp=last_err, reason=reason)
+                # Record the reject kind so the runner can pick a smart cooldown (e.g. capital-bound
+                # margin rejects retry only after a sell frees capital, not on a blind timer).
+                self.state.extras[f"_last_reject_kind_{symbol}"] = act.kind
 
                 if act.kind == "AUTH_REQUIRED":
                     LOG.error("AUTH_REQUIRED for %s: %s", symbol, act.raw_message)

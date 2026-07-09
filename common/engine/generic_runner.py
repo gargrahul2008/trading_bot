@@ -580,6 +580,15 @@ class GenericRunner:
             elif reason.startswith("pro_buy"):
                 self.state.extras[_key] = str(max(D0, _cur - qty))
 
+        # Clear reject cooldowns that the fill may have unblocked: a SELL frees capital (retry
+        # buys), a BUY adds inventory (retry sells). Lets a capital/qty-bound level retry
+        # immediately instead of waiting out its long fallback cooldown.
+        if qty > 0:
+            _unblock = "BUY" if side == "SELL" else "SELL"
+            _prefix = f"_pro_reject_cooldown_{symbol}_{_unblock}_"
+            for _k in [k for k in self.state.extras if k.startswith(_prefix)]:
+                self.state.extras.pop(_k, None)
+
         expected = _dec(ss.pending_expected_price) if ss.pending_expected_price is not None else D0
         expected_src = ss.pending_expected_source or None
 
@@ -1693,10 +1702,15 @@ class GenericRunner:
                                      sym, side, k, oid, qty, lvl_price, _disclosed(qty))
                             self.state.extras.pop(f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}", None)
                         else:
-                            _rej_until = (utcnow() + dt.timedelta(seconds=300)).isoformat()
+                            # Margin/funds rejects are capital-bound: a timer won't fix them, only a
+                            # sell freeing capital will (which clears the cooldown in _apply_fill).
+                            # Use a long fallback so we don't re-probe the broker every few minutes.
+                            _kind = self.state.extras.get(f"_last_reject_kind_{sym}")
+                            _secs = 3600 if _kind == "MARGIN_SHORTFALL" else 300
+                            _rej_until = (utcnow() + dt.timedelta(seconds=_secs)).isoformat()
                             self.state.extras[f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}"] = _rej_until
-                            LOG.warning("PRO %s %s L%d @ %s: placement failed, cooldown 5min until %s",
-                                        sym, side, k, lvl_price, _rej_until)
+                            LOG.warning("PRO %s %s L%d @ %s: placement failed (%s), cooldown %dmin until %s",
+                                        sym, side, k, lvl_price, _kind or "reject", _secs // 60, _rej_until)
                     except Exception as e:
                         LOG.warning("PRO %s parallel place error: %s", sym, e)
         except Exception as e:

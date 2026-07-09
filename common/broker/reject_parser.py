@@ -5,10 +5,15 @@ from typing import Any, Optional
 
 @dataclass
 class RejectAction:
-    kind: str  # 'REDUCE_QTY' | 'AUTH_REQUIRED' | 'NOT_RETRYABLE'
+    kind: str  # 'REDUCE_QTY' | 'AUTH_REQUIRED' | 'MARGIN_SHORTFALL' | 'NOT_RETRYABLE'
     max_qty: Optional[int] = None
     reason: str = ""
     raw_message: str = ""
+
+_MARGIN_PATTERNS = [
+    r"margin\s+shortfall", r"insufficient\s+margin", r"insufficient\s+funds",
+    r"insufficient\s+balance", r"available\s+margin",
+]
 
 _AUTH_PATTERNS = [
     r"tpin", r"e-?dis", r"authori[sz]e", r"cdsl", r"ddpi", r"poa", r"authorization required",
@@ -44,6 +49,10 @@ def parse_reject(resp_or_msg: Any) -> RejectAction:
 
     if any(re.search(p, low) for p in _AUTH_PATTERNS):
         return RejectAction(kind="AUTH_REQUIRED", reason="Authorization/TPIN/eDIS required", raw_message=msg)
+
+    if any(re.search(p, low) for p in _MARGIN_PATTERNS):
+        # Capital-bound: only worth retrying after freed capital (a sell fill), not on a blind timer.
+        return RejectAction(kind="MARGIN_SHORTFALL", reason="Insufficient margin/funds", raw_message=msg)
 
     if any(re.search(p, low) for p in _QTY_PATTERNS):
         # try to infer a max qty from message numbers
