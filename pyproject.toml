@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intraday-research"
+version = "0.1.0"
+description = "Intraday multi-strategy research engine for Indian markets"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26.0",
+  "pandas>=2.0.0",
+  "pyarrow>=15.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

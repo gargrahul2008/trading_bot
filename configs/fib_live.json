@@ -1,0 +1,40 @@
+{
+  "symbols": ["ETHUSDT", "SOLUSDT"],
+  "trade_value_usd": 5000,
+  "entry_next_bar_open": true,
+
+  "strategy": {
+    "variant": "BASE",
+    "min_impulse_pct": 0.25,
+    "target_ext": 1.618,
+    "stop_buffer_pct": 0.009,
+    "use_trailing_stop": true
+  },
+
+  "mexc": {
+    "secrets_file": "mexc_secrets.json"
+  },
+
+  "telegram": {
+    "enabled": true,
+    "secrets_file": "strategies/pct_ladder/secrets/telegram.json",
+    "chat_id": "1042052650"
+  },
+
+  "scaling": {
+    "mode": "lookback",
+    "lookback_days": 7,
+    "refresh": "daily_utc"
+  },
+
+  "output_dir": "artifacts/fib_live",
+
+  "_notes": [
+    "Paper mode (default): run without --live flag",
+    "Live mode: python scripts/live_fib_bot.py --config configs/fib_live.json --live",
+    "mexc_secrets.json must be in the same folder as this config and contain {api_key, api_secret}",
+    "trade_value_usd: $5000 per trade → qty = 5000 / price (float, e.g. 2.34 ETH)",
+    "variant: BASE  →  no filters (best config from 6-month sweep: SOL $5.5k, ETH $5.2k gross)",
+    "target_ext 1.618 → time_exit = 90 bars (minutes)"
+  ]
+}

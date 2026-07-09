@@ -16,6 +16,24 @@ REPO_ROOT = os.getenv("TRADING_BOT_ROOT", os.path.abspath(os.path.join(os.path.d
 STATE_DIR = os.path.join(REPO_ROOT, "strategies", "pct_ladder", "state")
 SUMMARY_FILE = os.path.join(STATE_DIR, "pnl_summary.json")
 
+# Bucket-aware paths (2-bucket design deployed 2026-05-28)
+BUCKETS = {
+    "Bucket 1 (tight 0.4%)": {
+        "state_dir": os.path.join(STATE_DIR, "bucket1"),
+        "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket1.json"),
+        "label": "Bucket 1 — Tight 0.4% grid, $50k pool",
+    },
+    "Bucket 2 (wide 10%)": {
+        "state_dir": os.path.join(STATE_DIR, "bucket2"),
+        "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket2.json"),
+        "label": "Bucket 2 — Wide 10% upside grid, $47k pool",
+    },
+}
+# Off-bot ETH allocated to Bucket 2's HODL stack (untouched by either bot)
+# Computed as: total broker ETH - bucket1 traded_qty - bucket2 traded_qty
+# Stays constant because each bot's fills move broker ETH 1:1 with state.traded_qty
+OFF_BOT_HODL_ETH = 17.709
+
 
 def _jload(path: str) -> Optional[dict]:
     try:
@@ -145,6 +163,79 @@ def _lifo_realized(trades_seq) -> float:
     return realized
 
 
+def _render_aggregate_view() -> None:
+    """High-level summary across both buckets + off-bot HODL."""
+    st.subheader("Aggregate — Both Buckets")
+    st.caption("Combined view across Bucket 1 + Bucket 2 + off-bot HODL stack. Switch to a specific bucket in the sidebar for trade-level detail.")
+
+    rows = []
+    total_pv = 0.0
+    total_realized = 0.0
+    total_cash = 0.0
+    total_eth = 0.0
+    eth_price = None
+    for label, paths in BUCKETS.items():
+        sumf = os.path.join(paths["state_dir"], "pnl_summary.json")
+        s = _jload(sumf) or {}
+        statef = _newest(os.path.join(paths["state_dir"], "state_*_v1.json"))
+        st_data = _jload(statef) or {}
+        ss = (st_data.get("symbol_states") or {}).get("ETHUSDC") or {}
+        cash = _sf(st_data.get("cash")) or 0.0
+        eth = _sf(ss.get("traded_qty")) or 0.0
+        last_px = _sf(ss.get("last_mark_price")) or _sf((st_data.get("last_prices") or {}).get("ETHUSDC")) or 0.0
+        if last_px > 0 and eth_price is None:
+            eth_price = last_px
+        bot = s.get("bot") or {}
+        realized = _sf(bot.get("realized_all_time")) or 0.0
+        pv = cash + eth * (last_px or 0.0)
+        rows.append({
+            "Bucket": label,
+            "Cash (USDC)": cash,
+            "ETH": eth,
+            "@ Px": last_px,
+            "Value": pv,
+            "Realized (all-time)": realized,
+        })
+        total_pv += pv
+        total_realized += realized
+        total_cash += cash
+        total_eth += eth
+
+    hodl_value = OFF_BOT_HODL_ETH * (eth_price or 0.0)
+    rows.append({
+        "Bucket": "Off-bot HODL",
+        "Cash (USDC)": 0.0,
+        "ETH": OFF_BOT_HODL_ETH,
+        "@ Px": eth_price or 0.0,
+        "Value": hodl_value,
+        "Realized (all-time)": 0.0,
+    })
+    total_pv += hodl_value
+    total_eth += OFF_BOT_HODL_ETH
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Value", _fmt(total_pv))
+    c2.metric("Total Cash", _fmt(total_cash))
+    c3.metric(f"Total ETH ({total_eth:.4f})", _fmt(total_eth * (eth_price or 0.0)),
+              delta=f"@ ${eth_price:,.2f}" if eth_price else None, delta_color="off")
+    c4.metric("Total Realized", _fmt(total_realized))
+
+    st.markdown("**Per-bucket breakdown**")
+    df = pd.DataFrame(rows)
+    df_disp = df.copy()
+    for col in ["Cash (USDC)", "Value", "Realized (all-time)"]:
+        df_disp[col] = df_disp[col].apply(lambda v: _fmt(v))
+    df_disp["@ Px"] = df_disp["@ Px"].apply(lambda v: f"${v:,.2f}" if v else "—")
+    df_disp["ETH"] = df_disp["ETH"].apply(lambda v: f"{v:.6f}")
+    st.dataframe(df_disp, use_container_width=True, hide_index=True)
+
+    st.info(
+        "Off-bot HODL = 17.7 ETH allocated to Bucket 2 but kept outside bot tracking. "
+        "It rides full upside trends without being sold by the wide grid. "
+        "Bucket totals show only what each bot tracks in its state file."
+    )
+
+
 def render_page() -> None:
     st.title("MEXC ETH/USDC Bot Dashboard")
 
@@ -154,17 +245,28 @@ def render_page() -> None:
             st.rerun()
         st.caption("Data is not refreshed automatically. Click Refresh to reload.")
         st.divider()
+        view_options = ["Aggregate"] + list(BUCKETS.keys())
+        view = st.radio("View", options=view_options, index=0)
+        st.divider()
         max_trades = int(st.number_input("Max trades to load", min_value=100, value=10000, step=1000))
         show_raw = st.checkbox("Show raw JSON (debug)", value=False)
 
-    summary = _jload(SUMMARY_FILE) or {}
-    state_path = _newest(os.path.join(STATE_DIR, "mexc_state_*_v1.json"))
+    if view == "Aggregate":
+        _render_aggregate_view()
+        return
+
+    bucket_paths = BUCKETS[view]
+    bucket_state_dir = bucket_paths["state_dir"]
+    st.caption(bucket_paths["label"])
+
+    summary = _jload(os.path.join(bucket_state_dir, "pnl_summary.json")) or {}
+    state_path = _newest(os.path.join(bucket_state_dir, "state_*_v1.json"))
     state = _jload(state_path) or {}
     extras = state.get("extras") or {}
-    config = _jload(os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.json")) or {}
-    trades_path = _newest(os.path.join(STATE_DIR, "mexc_trades_*_v1.jsonl"))
+    config = _jload(bucket_paths["config"]) or {}
+    trades_path = _newest(os.path.join(bucket_state_dir, "trades_*_v1.jsonl"))
     raw_trades = _load_trades(trades_path, max_lines=max_trades)
-    snapshot_path = os.path.join(STATE_DIR, "positions_snapshot.json")
+    snapshot_path = os.path.join(bucket_state_dir, "positions_snapshot.json")
     snapshot = _jload(snapshot_path) or {}
 
     df_all = pd.DataFrame(raw_trades) if raw_trades else pd.DataFrame()
@@ -805,8 +907,9 @@ def render_page() -> None:
                 {
                     "state_path": state_path,
                     "trades_path": trades_path,
-                    "summary_path": SUMMARY_FILE,
+                    "summary_path": os.path.join(bucket_state_dir, "pnl_summary.json"),
                     "snapshot_path": snapshot_path,
+                    "config_path": bucket_paths["config"],
                 }
             )
 

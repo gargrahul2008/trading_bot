@@ -1,0 +1,23 @@
+{
+  "scan_date": "2026-05-26",
+  "scan_time": "15:01:58",
+  "lookback_days": 60,
+  "total_analyzed": 343,
+  "status_breakdown": {
+    "TRADE_READY": 2,
+    "RANGE_WATCH": 56,
+    "NOT_IN_BOTTOM_ZONE": 59,
+    "BREAKOUT_FAIL": 3,
+    "ABOVE_RANGE": 1,
+    "INVALID_RANGE_SUPPORT_TOUCHES": 5,
+    "RANGE_TOO_WIDE": 208,
+    "INVALID_RANGE_RESISTANCE_TOUCHES": 9
+  },
+  "capital_per_slot": 1000000,
+  "files_generated": [
+    "trade_ready_20260526",
+    "near_ready_20260526",
+    "range_watch_20260526",
+    "rejected_20260526"
+  ]
+}

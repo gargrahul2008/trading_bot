@@ -52,6 +52,7 @@
     "closed_poll_seconds": 30,
     "market_tz": "Asia/Kolkata",
     "market_open": "09:00",
+    "preopen_pause_start": "09:07",
     "regular_market_open": "09:15",
     "market_close": "15:30",
     "eod_cancel_time": "15:29:30",

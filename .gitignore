@@ -53,3 +53,13 @@ strategies/*/st
 # Backtest data cache (large binary files, re-downloadable)
 backtest/cache/
 backtest/ticks/
+
+# Permanent-grid data cache (large, re-downloadable via fetch_*/screen scripts)
+permanent_grid/data/*.pkl
+permanent_grid/data/bhav_cache/
+
+# Market data (large, re-downloadable)
+data/
+
+# Backtest/live artifacts (generated output — not source)
+artifacts/

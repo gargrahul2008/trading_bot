@@ -1,0 +1,40 @@
+{
+  "symbols": [
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "trade_value_usd": 5000,
+  "entry_next_bar_open": true,
+  "strategy": {
+    "variant": "BASE",
+    "min_impulse_pct": 0.25,
+    "target_ext": 1.618,
+    "stop_buffer_pct": 0.009,
+    "use_trailing_stop": true,
+    "stop_buffer_floor": 0.01
+  },
+  "mexc": {
+    "secrets_file": "mexc_secrets.json"
+  },
+  "telegram": {
+    "enabled": true,
+    "secrets_file": "strategies/pct_ladder/secrets/telegram.json",
+    "chat_id": "1042052650"
+  },
+  "scaling": {
+    "mode": "lookback",
+    "lookback_days": 7,
+    "refresh": "daily_utc"
+  },
+  "output_dir": "artifacts/fib_live_dual",
+  "_notes": [
+    "DUAL-FEED paper: signals+triggers from Binance, fills captured from MEXC bid/ask.",
+    "Records entry_binance/exit_binance + entry_basis/exit_basis per trade.",
+    "Runs alongside the MEXC-only bot (artifacts/fib_live) for comparison."
+  ],
+  "dual_feed": {
+    "enabled": true,
+    "signals": "binance",
+    "fills": "mexc"
+  }
+}

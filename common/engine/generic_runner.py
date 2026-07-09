@@ -1957,7 +1957,14 @@ class GenericRunner:
         buy_missing = [(k, p) for k, p in sorted(new_buy_targets.items()) if p not in keep_buy_prices]
         available_cash = max(self.state.cash - quote_reserve - kept_buy_cost, D0)
         placed_cash = D0
+        # MEXC and most exchanges reject limit BUYs placed too far above market (price band).
+        # Skip BUY levels that are above the current price — they'd fire as marketable orders anyway,
+        # which is not the grid's intent. The bot will retry placing them once price catches up.
         for k, bp in buy_missing:
+            if price > D0 and bp > price:
+                LOG.debug("PRO %s BUY L%d @ %s: above current price %s, skipping (will place when price catches up)",
+                         sym, k, bp, price)
+                continue
             _rej_ck = f"_pro_reject_cooldown_{sym}_BUY_{bp}"
             _rej_until = self.state.extras.get(_rej_ck)
             if _rej_until:
@@ -2161,6 +2168,13 @@ class GenericRunner:
             for k, lvl_price, qty in buy_levels:
                 if qty <= D0:
                     continue
+                # Skip BUY levels above current market — they'd fire as marketable orders
+                # (or get rejected by exchange price-band protection like MEXC's 30087).
+                # The bot will retry placing them once price catches up.
+                if price > D0 and lvl_price > price:
+                    LOG.debug("PRO %s BUY L%d @ %s: above market %s, skipping",
+                              sym, k, lvl_price, price)
+                    continue
                 order_cost = qty * lvl_price
                 if placed_cash + order_cost > available_cash:
                     LOG.warning("PRO %s BUY L%d @ %s: insufficient cash, skipping remaining levels",
@@ -2244,6 +2258,12 @@ class GenericRunner:
                 placed_qty = D0
                 for k, lvl_price, qty in sell_levels:
                     if qty <= D0:
+                        continue
+                    # Skip SELL levels below current market — they'd fire as marketable orders
+                    # (or get rejected by exchange price-band protection).
+                    if price > D0 and lvl_price < price:
+                        LOG.debug("PRO %s SELL L%d @ %s: below market %s, skipping",
+                                  sym, k, lvl_price, price)
                         continue
                     if placed_qty + qty > base_qty:
                         LOG.warning("PRO %s SELL L%d @ %s: insufficient inventory, skipping remaining levels",
