@@ -347,7 +347,7 @@ class GenericRunner:
         pos = self.broker.positions()
         hld = self.broker.holdings()
         for sym in self.symbols:
-            total_sellable, _, w_cost = compute_sellable_qty(
+            total_sellable, bd, w_cost = compute_sellable_qty(
                 sym,
                 positions=pos,
                 holdings=hld,
@@ -359,6 +359,35 @@ class GenericRunner:
             ss.traded_qty = total_sellable
             if ss.traded_qty > 0 and ss.traded_avg_price <= 0:
                 ss.traded_avg_price = w_cost
+
+            # --- net_sold drift sanity check (proactive sell-cap strategies) ---
+            # net_sold has no broker ground truth, so a mis-booked fill can silently drift it.
+            # Anchor it against the *total shares owned* (settled + T1 + T0), which is stable
+            # across settlement, via the invariant: base_qty = owned + net_sold.
+            # On first run we capture base_qty; on later runs we flag any divergence.
+            max_pro_sell = getattr(self.exec_cfg, "max_pro_sell_qty", None)
+            if max_pro_sell:
+                owned = bd.pos_long + bd.settled_holdings + bd.t1_holdings
+                net_sold = _dec(self.state.extras.get(f"pro_net_sold_{sym}", "0"))
+                base_key = f"pro_base_qty_{sym}"
+                base_str = self.state.extras.get(base_key)
+                if base_str is None:
+                    base_qty = owned + net_sold
+                    self.state.extras[base_key] = str(base_qty)
+                    LOG.info("PRO %s net_sold anchor established: base_qty=%s (owned=%s + net_sold=%s)",
+                             sym, base_qty, owned, net_sold)
+                else:
+                    base_qty = _dec(base_str)
+                    expected_net_sold = base_qty - owned
+                    drift = net_sold - expected_net_sold
+                    remaining_cap = max(D0, _dec(str(max_pro_sell)) - net_sold)
+                    if abs(drift) > _dec("1"):
+                        LOG.warning("PRO %s net_sold DRIFT=%s: tracked=%s but base(%s)-owned(%s)=%s "
+                                    "— a fill likely mis-booked; verify before trusting the sell cap",
+                                    sym, drift, net_sold, base_qty, owned, expected_net_sold)
+                    else:
+                        LOG.info("PRO %s net_sold OK: tracked=%s owned=%s base=%s remaining_cap=%s",
+                                 sym, net_sold, owned, base_qty, remaining_cap)
 
         LOG.info("Reconciled cash and adopted broker inventory into traded_qty.")
 
@@ -1662,6 +1691,12 @@ class GenericRunner:
                             self._add_pro_oid(sym, side, oid, qty, price=lvl_price)
                             LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s disc=%s",
                                      sym, side, k, oid, qty, lvl_price, _disclosed(qty))
+                            self.state.extras.pop(f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}", None)
+                        else:
+                            _rej_until = (utcnow() + dt.timedelta(seconds=300)).isoformat()
+                            self.state.extras[f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}"] = _rej_until
+                            LOG.warning("PRO %s %s L%d @ %s: placement failed, cooldown 5min until %s",
+                                        sym, side, k, lvl_price, _rej_until)
                     except Exception as e:
                         LOG.warning("PRO %s parallel place error: %s", sym, e)
         except Exception as e:
@@ -1825,6 +1860,14 @@ class GenericRunner:
         ref = _dec(ss.reference_price) if ss.reference_price is not None else price
         step = _dec(cfg.fixed_step)
 
+        # Hard floor on ref: clamp ref up to pro_min_ref and persist so sells never drop below floor.
+        _pro_min_ref = getattr(cfg, "pro_min_ref", None)
+        _min_ref_dec = _dec(str(_pro_min_ref)) if _pro_min_ref is not None else None
+        if _min_ref_dec is not None and ref < _min_ref_dec:
+            LOG.info("PRO %s ref=%s below pro_min_ref=%s, clamping", sym, ref, _min_ref_dec)
+            ref = _min_ref_dec
+            ss.reference_price = ref
+
         # After a gap-fill (pre-open auction executing far from the limit):
         #   BUY gap-down: sell ref = limit price, buy anchor = fill price
         #   SELL gap-up:  buy ref = limit price, sell anchor = fill price
@@ -1835,15 +1878,20 @@ class GenericRunner:
         buy_ref = _dec(_buy_anchor_str) if _buy_anchor_str else ref
         sell_ref = _dec(_sell_anchor_str) if _sell_anchor_str else ref
 
-        # Compute new target prices for all levels on both sides
+        # Ceiling on sell orders: skip any sell level above pro_max_sell_price.
+        _pro_max_sell = getattr(cfg, "pro_max_sell_price", None)
+        _max_sell_dec = _dec(str(_pro_max_sell)) if _pro_max_sell is not None else None
+
+        # Compute new target prices for all levels on both sides.
+        # Skip buy levels below pro_min_ref floor; skip sell levels above pro_max_sell_price ceiling.
         new_buy_targets: dict = {}   # k -> price
         new_sell_targets: dict = {}  # k -> price
         for k in range(1, n_levels + 1):
             bp = self._round_price_to_tick(buy_ref - k * step)
             sp = self._round_price_to_tick(sell_ref + k * step)
-            if bp > D0:
+            if bp > D0 and (_min_ref_dec is None or bp >= _min_ref_dec):
                 new_buy_targets[k] = bp
-            if sp > D0:
+            if sp > D0 and (_max_sell_dec is None or sp <= _max_sell_dec):
                 new_sell_targets[k] = sp
 
         buy_target_prices = set(new_buy_targets.values())
@@ -1910,6 +1958,16 @@ class GenericRunner:
         available_cash = max(self.state.cash - quote_reserve - kept_buy_cost, D0)
         placed_cash = D0
         for k, bp in buy_missing:
+            _rej_ck = f"_pro_reject_cooldown_{sym}_BUY_{bp}"
+            _rej_until = self.state.extras.get(_rej_ck)
+            if _rej_until:
+                try:
+                    if utcnow() < dt.datetime.fromisoformat(_rej_until):
+                        LOG.info("PRO %s BUY L%d @ %s: rejection cooldown until %s, skipping", sym, k, bp, _rej_until)
+                        continue
+                    self.state.extras.pop(_rej_ck, None)
+                except Exception:
+                    self.state.extras.pop(_rej_ck, None)
             if cfg.sizing_mode == "fixed_qty":
                 qty = _dec(cfg.fixed_qty_buy)
                 partial_key = f"_pro_partial_remaining_{sym}_BUY_{bp}"
@@ -1958,6 +2016,16 @@ class GenericRunner:
             available_for_new_sell = max(D0, base_qty - kept_sell_qty)
             placed_sell_qty = D0
             for k, sp in sell_missing:
+                _rej_ck = f"_pro_reject_cooldown_{sym}_SELL_{sp}"
+                _rej_until = self.state.extras.get(_rej_ck)
+                if _rej_until:
+                    try:
+                        if utcnow() < dt.datetime.fromisoformat(_rej_until):
+                            LOG.info("PRO %s SELL L%d @ %s: rejection cooldown until %s, skipping", sym, k, sp, _rej_until)
+                            continue
+                        self.state.extras.pop(_rej_ck, None)
+                    except Exception:
+                        self.state.extras.pop(_rej_ck, None)
                 if cfg.sizing_mode == "fixed_qty":
                     qty = _dec(cfg.fixed_qty_sell)
                     partial_key = f"_pro_partial_remaining_{sym}_SELL_{sp}"
@@ -2286,7 +2354,15 @@ class GenericRunner:
                 limit_px = self._pro_oid_price.get(oid, D0)
                 if limit_px > D0 and not is_partial:
                     ss.pending_expected_price = limit_px
-                    if side == "BUY" and fill_px < limit_px:
+                    if not getattr(cfg, "pro_drift_recenter", True):
+                        # Drift disabled: ref is always the order's limit price, never the fill price.
+                        # Gap anchors would shift sell_ref/buy_ref to the fill price — skip them entirely.
+                        self.state.extras.pop(f"_pro_buy_anchor_{sym}", None)
+                        self.state.extras.pop(f"_pro_sell_anchor_{sym}", None)
+                        if fill_px != limit_px:
+                            LOG.info("PRO %s %s fill oid=%s: limit=%.4f fill=%.4f — ref=%.4f (drift disabled, ignoring fill price)",
+                                     sym, side, oid, float(limit_px), float(fill_px), float(limit_px))
+                    elif side == "BUY" and fill_px < limit_px:
                         # Gap-down: BUY filled below its limit (e.g. pre-open auction).
                         # Sell ref stays at limit; buy anchor at fill so next BUY is below where we bought.
                         self.state.extras[f"_pro_buy_anchor_{sym}"] = str(fill_px)
@@ -2307,9 +2383,26 @@ class GenericRunner:
                         if fill_px != limit_px:
                             LOG.info("PRO %s %s fill oid=%s: limit=%.4f fill=%.4f — keeping ref at limit price",
                                      sym, side, oid, float(limit_px), float(fill_px))
-                self._apply_fill(sym, side, filled_qty, fill_px, cum_q,
-                                 reason=reason, order_id=oid, status="FILLED",
-                                 skip_ref_update=is_partial)
+                # Subtract fill already credited via _poll_live_fills to avoid double-counting
+                # traded_qty / cash / realized_pnl / net_sold. Only the not-yet-booked delta is
+                # applied here; _pro_oid_applied tracks the cumulative already-credited qty.
+                already_applied = _dec(self.state.extras.get(f"_pro_oid_applied_{oid}", "0"))
+                apply_qty = max(D0, filled_qty - already_applied)
+                if apply_qty > D0:
+                    apply_cum_q = fill_px * apply_qty
+                    self._apply_fill(sym, side, apply_qty, fill_px, apply_cum_q,
+                                     reason=reason, order_id=oid, status="FILLED",
+                                     skip_ref_update=is_partial)
+                elif not is_partial:
+                    # Whole order already booked via live partials; still advance ref for the
+                    # now-complete fill (the qty=0 path in _apply_fill skips the ref update).
+                    if not (reason or "").startswith("rebalance_"):
+                        trigger_px = _dec(ss.pending_expected_price) if ss.pending_expected_price is not None else D0
+                        ss.reference_price = trigger_px if trigger_px > 0 else fill_px
+                    LOG.info("PRO %s %s terminal oid=%s: full qty=%s already booked via live partials — ref->%s",
+                             sym, side, oid, filled_qty, ss.reference_price)
+                if already_applied > D0:
+                    self.state.extras.pop(f"_pro_oid_applied_{oid}", None)
                 return True
             else:
                 LOG.info("PRO %s %s terminal (no fill) oid=%s", sym, side, oid)
@@ -2359,8 +2452,9 @@ class GenericRunner:
             else:
                 l1_buy_price = new_ref * (Decimal("1") - eff_lower_pct / Decimal("100"))
                 new_sell_level = new_ref * (Decimal("1") + eff_upper_pct / Decimal("100"))
-            if price >= new_sell_level:
-                # Guard re-center: price ran past sell level after buy
+            if price >= new_sell_level and _drift_enabled:
+                # Guard re-center: price ran past sell level after buy.
+                # Skipped when pro_drift_recenter=False — ref must only move via completed fills.
                 LOG.info("PRO %s BUY filled, price=%s >= new_sell=%s, re-centering", sym, price, new_sell_level)
                 if _use_fixed_step:
                     self._cancel_all_pro_orders(sym)
@@ -2400,8 +2494,10 @@ class GenericRunner:
             else:
                 l1_sell_price = new_ref * (Decimal("1") + eff_upper_pct / Decimal("100"))
                 new_buy_level = new_ref * (Decimal("1") - eff_lower_pct / Decimal("100"))
-            if price <= new_buy_level:
-                # Guard re-center: price dropped past buy level after sell
+            if price <= new_buy_level and _drift_enabled:
+                # Guard re-center: price dropped past buy level after sell.
+                # Skipped when pro_drift_recenter=False — ref must only move via completed fills,
+                # never based on market price.
                 LOG.info("PRO %s SELL filled, price=%s <= new_buy=%s, re-centering", sym, price, new_buy_level)
                 if _use_fixed_step:
                     self._cancel_all_pro_orders(sym)

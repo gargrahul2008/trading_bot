@@ -58,6 +58,16 @@ class LadderPctConfig:
     pro_drift_recenter: bool = True
     pro_drift_pct: Optional[Decimal] = None
 
+    # Hard floor for the reference price. When set, ref is never allowed to fall below this
+    # value, and any buy level computed below this floor is skipped entirely.
+    # E.g. pro_min_ref=11.70 with step=0.18 keeps sells >= 11.88 and buys >= 11.70.
+    pro_min_ref: Optional[Decimal] = None
+
+    # Hard ceiling for sell orders. Any sell level computed above this price is skipped.
+    # E.g. pro_max_sell_price=12.24 prevents the grid from ever placing a sell above 12.24
+    # even if ref drifts upward after fills.
+    pro_max_sell_price: Optional[Decimal] = None
+
     # Fixed absolute price step (e.g. 0.09). When set, overrides upper_pct/lower_pct for
     # grid level pricing so that ref ± k*fixed_step gives exact, reusable prices across
     # fills — enabling smart order reuse instead of cancel-all + place-all on each fill.
@@ -220,6 +230,8 @@ def create_strategy(strategy_cfg: dict) -> LadderPctStrategy:
         rebalance_target_steps=int(strategy_cfg.get("rebalance_target_steps", 8)),
         pro_drift_recenter=bool(strategy_cfg.get("pro_drift_recenter", True)),
         pro_drift_pct=_dec(strategy_cfg["pro_drift_pct"]) if strategy_cfg.get("pro_drift_pct") is not None else None,
+        pro_min_ref=_dec(strategy_cfg["pro_min_ref"]) if strategy_cfg.get("pro_min_ref") is not None else None,
+        pro_max_sell_price=_dec(strategy_cfg["pro_max_sell_price"]) if strategy_cfg.get("pro_max_sell_price") is not None else None,
         fixed_step=_dec(strategy_cfg["fixed_step"]) if strategy_cfg.get("fixed_step") is not None else None,
     )
     return LadderPctStrategy(cfg)

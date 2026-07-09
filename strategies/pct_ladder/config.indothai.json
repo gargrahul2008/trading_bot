@@ -1,13 +1,12 @@
 {
-  "_comment": "SHISHIND sell-first grid — 30,000 shares from existing holdings, zero new capital",
+  "_comment": "INDOTHAI sell-first grid — uses existing NSE holdings, zero new capital",
   "_capital_notes": {
-    "symbol": "BSE:SHISHIND-X",
-    "reference_price": 12.78,
-    "shares_per_level": 10000,
+    "symbol": "NSE:INDOTHAI-EQ",
+    "reference_price": 232,
+    "shares_per_level": 500,
     "levels": 3,
-    "total_shares_committed": 30000,
-    "total_value_approx_inr": 383400,
-    "grid_pct": "1.5%",
+    "total_shares_committed": 1500,
+    "grid_step": 8,
     "product_type": "CNC",
     "new_capital": "NONE — uses existing holdings only",
     "cash_model": "isolated — starts at 0, grows only from sell fills"
@@ -23,16 +22,16 @@
     "log_path": ""
   },
   "strategy": {
-    "symbols": ["BSE:SHISHIND-X"],
+    "symbols": ["NSE:INDOTHAI-EQ"],
     "upper_pct": 0.7,
     "lower_pct": 0.7,
-    "fixed_step": 0.18,
+    "fixed_step": 8,
     "pro_drift_recenter": false,
-    "pro_min_ref": 11.70,
-    "pro_max_sell_price": 12.24,
+    "pro_min_ref": 224,
+    "pro_max_sell_price": 256,
     "sizing_mode": "fixed_qty",
-    "fixed_qty_buy": 10000,
-    "fixed_qty_sell": 10000,
+    "fixed_qty_buy": 500,
+    "fixed_qty_sell": 500,
     "qty_step": 1,
     "min_qty": 1,
     "rebalance_threshold_steps": 0
@@ -41,7 +40,7 @@
     "product_type": "CNC",
     "isolated_cash": true,
     "pro_levels": 3,
-    "max_pro_sell_qty": 30000,
+    "max_pro_sell_qty": 1500,
     "allow_btst_auto": true,
     "sync_on_start": true,
     "adopt_broker_inventory": true,
@@ -53,12 +52,12 @@
     "market_close": "15:30",
     "eod_cancel_time": "15:29:30",
     "cancel_all_open_orders": true,
-    "price_tick": 0.01,
+    "price_tick": 0.05,
     "pro_disclosed_pct": 0.10
   },
   "paths": {
-    "state_path": "state/shishind_state.json",
-    "trades_path": "state/shishind_trades.jsonl",
-    "rejects_path": "state/shishind_rejects.jsonl"
+    "state_path": "state/indothai_state.json",
+    "trades_path": "state/indothai_trades.jsonl",
+    "rejects_path": "state/indothai_rejects.jsonl"
   }
 }
