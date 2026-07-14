@@ -73,6 +73,12 @@ class LadderPctConfig:
     # fills — enabling smart order reuse instead of cancel-all + place-all on each fill.
     fixed_step: Optional[Decimal] = None
 
+    # Partial-fill carryover (next-day 50% rule). When an order rests, partially fills, and is
+    # cancelled at EOD, the next day: if it filled <50% of intended, re-place the *remaining*
+    # qty at the same level (keep selling/buying); if it filled >=50%, place the *filled* qty on
+    # the opposite side one step away (round-trip what actually traded). Keeps quantities matched.
+    pro_partial_carryover: bool = False
+
 class LadderPctStrategy:
     def __init__(self, cfg: LadderPctConfig):
         self.cfg = cfg
@@ -233,5 +239,6 @@ def create_strategy(strategy_cfg: dict) -> LadderPctStrategy:
         pro_min_ref=_dec(strategy_cfg["pro_min_ref"]) if strategy_cfg.get("pro_min_ref") is not None else None,
         pro_max_sell_price=_dec(strategy_cfg["pro_max_sell_price"]) if strategy_cfg.get("pro_max_sell_price") is not None else None,
         fixed_step=_dec(strategy_cfg["fixed_step"]) if strategy_cfg.get("fixed_step") is not None else None,
+        pro_partial_carryover=bool(strategy_cfg.get("pro_partial_carryover", False)),
     )
     return LadderPctStrategy(cfg)

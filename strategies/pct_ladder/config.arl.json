@@ -1,15 +1,19 @@
 {
-  "_comment": "INDOTHAI sell-first grid — uses existing NSE holdings, zero new capital",
+  "_comment": "ARL sell-first grid — trades a 5,700 slice of existing holdings, 1 level at a time",
   "_capital_notes": {
-    "symbol": "NSE:INDOTHAI-EQ",
-    "reference_price": 232,
-    "shares_per_level": 500,
-    "levels": 3,
-    "total_shares_committed": 1500,
-    "grid_step": 8,
+    "symbol": "BSE:ARL-B",
+    "reference_price": 56.24,
+    "shares_per_level": 1900,
+    "proactive_levels": 1,
+    "sell_ladder": "58.49 -> 60.74 -> 62.99 (walks up as fills happen; 1 order at a time)",
+    "sell_ceiling": 62.99,
+    "buy_floor": 56.24,
+    "total_trade_slice": 5700,
+    "held_total": 8782,
+    "core_hold_untouched": 3082,
+    "grid_step": 2.25,
     "product_type": "CNC",
-    "new_capital": "NONE — uses existing holdings only",
-    "cash_model": "isolated — starts at 0, grows only from sell fills"
+    "new_capital": "buy-backs funded by kept account capital until sell proceeds settle"
   },
   "strategy_name": "pct_ladder",
   "runner_type": "proactive",
@@ -22,17 +26,17 @@
     "log_path": ""
   },
   "strategy": {
-    "symbols": ["NSE:INDOTHAI-EQ"],
+    "symbols": ["BSE:ARL-B"],
     "upper_pct": 0.7,
     "lower_pct": 0.7,
-    "fixed_step": 8,
+    "fixed_step": 2.25,
     "pro_drift_recenter": false,
-    "pro_min_ref": 224,
-    "pro_max_sell_price": 256,
+    "pro_min_ref": 56.24,
+    "pro_max_sell_price": 62.99,
     "pro_partial_carryover": true,
     "sizing_mode": "fixed_qty",
-    "fixed_qty_buy": 500,
-    "fixed_qty_sell": 500,
+    "fixed_qty_buy": 1900,
+    "fixed_qty_sell": 1900,
     "qty_step": 1,
     "min_qty": 1,
     "rebalance_threshold_steps": 0
@@ -40,8 +44,8 @@
   "execution": {
     "product_type": "CNC",
     "isolated_cash": true,
-    "pro_levels": 3,
-    "max_pro_sell_qty": 1500,
+    "pro_levels": 1,
+    "max_pro_sell_qty": 5700,
     "allow_btst_auto": true,
     "sync_on_start": true,
     "adopt_broker_inventory": true,
@@ -53,12 +57,12 @@
     "market_close": "15:30",
     "eod_cancel_time": "15:29:30",
     "cancel_all_open_orders": true,
-    "price_tick": 0.05,
+    "price_tick": 0.01,
     "pro_disclosed_pct": 0.10
   },
   "paths": {
-    "state_path": "state/indothai_state.json",
-    "trades_path": "state/indothai_trades.jsonl",
-    "rejects_path": "state/indothai_rejects.jsonl"
+    "state_path": "state/arl_state.json",
+    "trades_path": "state/arl_trades.jsonl",
+    "rejects_path": "state/arl_rejects.jsonl"
   }
 }

@@ -14,6 +14,9 @@ _MARGIN_PATTERNS = [
     r"margin\s+shortfall", r"insufficient\s+margin", r"insufficient\s+funds",
     r"insufficient\s+balance", r"available\s+margin",
 ]
+_CIRCUIT_PATTERNS = [
+    r"circuit\s+limit", r"upper\s*circuit", r"lower\s*circuit", r"price\s+band",
+]
 
 _AUTH_PATTERNS = [
     r"tpin", r"e-?dis", r"authori[sz]e", r"cdsl", r"ddpi", r"poa", r"authorization required",
@@ -53,6 +56,10 @@ def parse_reject(resp_or_msg: Any) -> RejectAction:
     if any(re.search(p, low) for p in _MARGIN_PATTERNS):
         # Capital-bound: only worth retrying after freed capital (a sell fill), not on a blind timer.
         return RejectAction(kind="MARGIN_SHORTFALL", reason="Insufficient margin/funds", raw_message=msg)
+
+    if any(re.search(p, low) for p in _CIRCUIT_PATTERNS):
+        # Price band is fixed for the whole trading day — a short retry timer is futile.
+        return RejectAction(kind="CIRCUIT_LIMIT", reason="Order outside daily circuit/price band", raw_message=msg)
 
     if any(re.search(p, low) for p in _QTY_PATTERNS):
         # try to infer a max qty from message numbers

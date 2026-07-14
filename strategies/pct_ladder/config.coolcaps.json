@@ -1,15 +1,20 @@
 {
-  "_comment": "INDOTHAI sell-first grid — uses existing NSE holdings, zero new capital",
+  "_comment": "COOLCAPS sell-first grid — trades a 15,000 slice of existing holdings, 1 level at a time",
   "_capital_notes": {
-    "symbol": "NSE:INDOTHAI-EQ",
-    "reference_price": 232,
-    "shares_per_level": 500,
-    "levels": 3,
-    "total_shares_committed": 1500,
-    "grid_step": 8,
+    "symbol": "NSE:COOLCAPS-ST",
+    "reference_price": 24,
+    "shares_per_level": 5000,
+    "lot_size": 1250,
+    "proactive_levels": 1,
+    "sell_ceiling": 26.40,
+    "buy_floor": 24,
+    "total_trade_slice": 15000,
+    "held_total": 35000,
+    "core_hold_untouched": 20000,
+    "grid_step": 0.80,
     "product_type": "CNC",
-    "new_capital": "NONE — uses existing holdings only",
-    "cash_model": "isolated — starts at 0, grows only from sell fills"
+    "series_note": "-ST is NSE SME series; likely trade-to-trade (no intraday/BTST), sell proceeds settle T+1",
+    "new_capital": "buy-backs funded by kept account capital until sell proceeds settle"
   },
   "strategy_name": "pct_ladder",
   "runner_type": "proactive",
@@ -22,26 +27,26 @@
     "log_path": ""
   },
   "strategy": {
-    "symbols": ["NSE:INDOTHAI-EQ"],
+    "symbols": ["NSE:COOLCAPS-ST"],
     "upper_pct": 0.7,
     "lower_pct": 0.7,
-    "fixed_step": 8,
+    "fixed_step": 0.80,
     "pro_drift_recenter": false,
-    "pro_min_ref": 224,
-    "pro_max_sell_price": 256,
+    "pro_min_ref": 24,
+    "pro_max_sell_price": 26.40,
     "pro_partial_carryover": true,
     "sizing_mode": "fixed_qty",
-    "fixed_qty_buy": 500,
-    "fixed_qty_sell": 500,
-    "qty_step": 1,
-    "min_qty": 1,
+    "fixed_qty_buy": 5000,
+    "fixed_qty_sell": 5000,
+    "qty_step": 1250,
+    "min_qty": 1250,
     "rebalance_threshold_steps": 0
   },
   "execution": {
     "product_type": "CNC",
     "isolated_cash": true,
-    "pro_levels": 3,
-    "max_pro_sell_qty": 1500,
+    "pro_levels": 1,
+    "max_pro_sell_qty": 15000,
     "allow_btst_auto": true,
     "sync_on_start": true,
     "adopt_broker_inventory": true,
@@ -57,8 +62,8 @@
     "pro_disclosed_pct": 0.10
   },
   "paths": {
-    "state_path": "state/indothai_state.json",
-    "trades_path": "state/indothai_trades.jsonl",
-    "rejects_path": "state/indothai_rejects.jsonl"
+    "state_path": "state/coolcaps_state.json",
+    "trades_path": "state/coolcaps_trades.jsonl",
+    "rejects_path": "state/coolcaps_rejects.jsonl"
   }
 }

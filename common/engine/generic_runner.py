@@ -346,6 +346,23 @@ class GenericRunner:
         from common.broker.sellable_qty import compute_sellable_qty
         pos = self.broker.positions()
         hld = self.broker.holdings()
+
+        # The net_sold drift check needs a settlement-stable view of shares owned. Pre-market the
+        # broker's holdings/positions understate it (T0 not present, T1 not yet reflected), which
+        # would false-alarm. Only evaluate/anchor during regular market hours when owned is complete.
+        _owned_is_reliable = True
+        try:
+            import pytz
+            _tz = pytz.timezone(self.market_tz)
+            _now_local = utcnow().astimezone(_tz)
+            _reg_open = _now_local.replace(hour=self.regular_open_t.hour, minute=self.regular_open_t.minute,
+                                           second=0, microsecond=0)
+            _mkt_close = _now_local.replace(hour=self.close_t.hour, minute=self.close_t.minute,
+                                            second=0, microsecond=0)
+            _owned_is_reliable = _reg_open <= _now_local <= _mkt_close
+        except Exception:
+            pass
+
         for sym in self.symbols:
             total_sellable, bd, w_cost = compute_sellable_qty(
                 sym,
@@ -362,12 +379,17 @@ class GenericRunner:
 
             # --- net_sold drift sanity check (proactive sell-cap strategies) ---
             # net_sold has no broker ground truth, so a mis-booked fill can silently drift it.
-            # Anchor it against the *total shares owned* (settled + T1 + T0), which is stable
-            # across settlement, via the invariant: base_qty = owned + net_sold.
-            # On first run we capture base_qty; on later runs we flag any divergence.
+            # Anchor it against the *total shares owned* (settled + T1 + T0) via the invariant
+            # base_qty = owned + net_sold. Only when owned is reliable (market hours) — pre-market
+            # readings understate owned and would false-alarm. First reliable run captures base_qty;
+            # later reliable runs flag divergence.
             max_pro_sell = getattr(self.exec_cfg, "max_pro_sell_qty", None)
-            if max_pro_sell:
-                owned = bd.pos_long + bd.settled_holdings + bd.t1_holdings
+            if max_pro_sell and _owned_is_reliable:
+                # True shares owned = intraday long + ALL holdings (settled + T1), independent of
+                # BTST eligibility. bd.t1_holdings is zeroed for non-BTST symbols (e.g. SHISHIND-X),
+                # so sum the raw holdings directly instead — otherwise T1 shares look "missing".
+                _owned_hld = sum((_dec(h.remaining_qty) for h in hld if h.symbol == sym), D0)
+                owned = bd.pos_long + _owned_hld
                 net_sold = _dec(self.state.extras.get(f"pro_net_sold_{sym}", "0"))
                 base_key = f"pro_base_qty_{sym}"
                 base_str = self.state.extras.get(base_key)
@@ -1649,7 +1671,8 @@ class GenericRunner:
                                  reason="rebalance_restore", order_id=oid, status="FILLED")
             return terminal
 
-    def _place_orders_parallel(self, sym: str, orders: list, *, pre_sellable=None) -> None:
+    def _place_orders_parallel(self, sym: str, orders: list, *, pre_sellable=None,
+                               lot_size: "Decimal" = Decimal("1")) -> None:
         """
         Place multiple orders concurrently using a thread pool.
         Each entry in `orders` is (side, level_k, limit_price, qty, reason).
@@ -1657,11 +1680,11 @@ class GenericRunner:
         Falls back to sequential placement if threading fails.
         pre_sellable: if provided, used as the sellable qty for SELL orders instead of
         fetching from broker per-thread (avoids N concurrent positions/holdings API calls).
+        lot_size: exchange market lot; disclosed qty is rounded to whole lots (SME series etc.).
         """
-        import concurrent.futures
-
         import math
         _disc_pct = _dec(getattr(self.exec_cfg, "pro_disclosed_pct", D0))
+        _lot = lot_size if lot_size and lot_size > 0 else Decimal("1")
 
         _in_preopen = False
         if _disc_pct > D0 and self.regular_open_t != self.open_t:
@@ -1676,10 +1699,34 @@ class GenericRunner:
         def _disclosed(qty: Decimal) -> int:
             if _disc_pct <= D0 or _in_preopen:
                 return 0
-            return math.ceil(float(qty * _disc_pct))
+            raw = qty * _disc_pct
+            if _lot > 1:
+                # Exchange rule for lot-based series (e.g. NSE SME): disclosed qty must be a whole
+                # multiple of the market lot. Round the % up to the next lot, capped at order qty.
+                lots = math.ceil(float(raw / _lot))
+                return int(min(_dec(lots) * _lot, qty))
+            return math.ceil(float(raw))
 
-        def _place_one(entry):
-            side, k, lvl_price, qty, reason = entry
+        def _record_result(side, k, lvl_price, qty, oid):
+            if oid:
+                self._add_pro_oid(sym, side, oid, qty, price=lvl_price)
+                LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s disc=%s",
+                         sym, side, k, oid, qty, lvl_price, _disclosed(qty))
+                self.state.extras.pop(f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}", None)
+                return True
+            # Margin/funds rejects are capital-bound: a timer won't fix them, only a sell freeing
+            # capital will (which clears the cooldown in _apply_fill). Long fallback avoids re-probing.
+            _kind = self.state.extras.get(f"_last_reject_kind_{sym}")
+            # Margin (capital-bound) and circuit (day-fixed price band) rejects won't clear on a
+            # short timer — back off for an hour instead of re-probing every few minutes.
+            _secs = 3600 if _kind in ("MARGIN_SHORTFALL", "CIRCUIT_LIMIT") else 300
+            _rej_until = (utcnow() + dt.timedelta(seconds=_secs)).isoformat()
+            self.state.extras[f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}"] = _rej_until
+            LOG.warning("PRO %s %s L%d @ %s: placement failed (%s), cooldown %dmin until %s",
+                        sym, side, k, lvl_price, _kind or "reject", _secs // 60, _rej_until)
+            return False
+
+        def _place_one(side, k, lvl_price, qty, reason):
             req = PlaceOrderRequest(
                 symbol=sym, side=side, qty=qty,
                 product_type=self.exec_cfg.product_type,
@@ -1687,47 +1734,33 @@ class GenericRunner:
                 disclosed_qty=_disclosed(qty),
             )
             hint = pre_sellable if side == "SELL" else None
-            oid = self.exec.place_with_adaptive_qty(req, reason=reason, sellable_hint=hint)
-            return side, k, lvl_price, qty, oid
+            return self.exec.place_with_adaptive_qty(req, reason=reason, sellable_hint=hint)
 
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(orders)) as pool:
-                futures = [pool.submit(_place_one, entry) for entry in orders]
-                for fut in concurrent.futures.as_completed(futures):
-                    try:
-                        side, k, lvl_price, qty, oid = fut.result()
-                        if oid:
-                            self._add_pro_oid(sym, side, oid, qty, price=lvl_price)
-                            LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s disc=%s",
-                                     sym, side, k, oid, qty, lvl_price, _disclosed(qty))
-                            self.state.extras.pop(f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}", None)
-                        else:
-                            # Margin/funds rejects are capital-bound: a timer won't fix them, only a
-                            # sell freeing capital will (which clears the cooldown in _apply_fill).
-                            # Use a long fallback so we don't re-probe the broker every few minutes.
-                            _kind = self.state.extras.get(f"_last_reject_kind_{sym}")
-                            _secs = 3600 if _kind == "MARGIN_SHORTFALL" else 300
-                            _rej_until = (utcnow() + dt.timedelta(seconds=_secs)).isoformat()
-                            self.state.extras[f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}"] = _rej_until
-                            LOG.warning("PRO %s %s L%d @ %s: placement failed (%s), cooldown %dmin until %s",
-                                        sym, side, k, lvl_price, _kind or "reject", _secs // 60, _rej_until)
-                    except Exception as e:
-                        LOG.warning("PRO %s parallel place error: %s", sym, e)
-        except Exception as e:
-            LOG.warning("PRO %s parallel placement failed (%s), placing sequentially", sym, e)
-            for side, k, lvl_price, qty, reason in orders:
-                req = PlaceOrderRequest(
-                    symbol=sym, side=side, qty=qty,
-                    product_type=self.exec_cfg.product_type,
-                    order_type="LIMIT", limit_price=lvl_price, time_in_force="GTC",
-                    disclosed_qty=_disclosed(qty),
-                )
-                hint = pre_sellable if side == "SELL" else None
-                oid = self.exec.place_with_adaptive_qty(req, reason=reason, sellable_hint=hint)
-                if oid:
-                    self._add_pro_oid(sym, side, oid, qty, price=lvl_price)
-                    LOG.info("PRO %s %s L%d placed oid=%s qty=%s @ %s disc=%s",
-                             sym, side, k, oid, qty, lvl_price, _disclosed(qty))
+        # Place in priority order (nearest-market level first) and sequentially, so that under a
+        # margin constraint the most important level wins the available capital — e.g. BUY 11.88
+        # before BUY 11.70. Parallel placement raced and could place the farther level instead.
+        # SELLs (nearest = lowest price) don't consume buy margin; BUYs (nearest = highest price)
+        # do, so after a same-side MARGIN_SHORTFALL we skip the remaining, farther same-side levels
+        # (they can't fit either) and cool them down.
+        sells = sorted([o for o in orders if o[0] == "SELL"], key=lambda e: e[2])
+        buys = sorted([o for o in orders if o[0] == "BUY"], key=lambda e: e[2], reverse=True)
+        for group in (sells, buys):
+            margin_blocked = False
+            for side, k, lvl_price, qty, reason in group:
+                if margin_blocked:
+                    _rej_until = (utcnow() + dt.timedelta(seconds=3600)).isoformat()
+                    self.state.extras[f"_pro_reject_cooldown_{sym}_{side}_{lvl_price}"] = _rej_until
+                    LOG.info("PRO %s %s L%d @ %s: skipped — nearer level hit margin wall, cooldown 60min",
+                             sym, side, k, lvl_price)
+                    continue
+                try:
+                    oid = _place_one(side, k, lvl_price, qty, reason)
+                except Exception as e:
+                    LOG.warning("PRO %s %s L%d place error: %s", sym, side, k, e)
+                    continue
+                ok = _record_result(side, k, lvl_price, qty, oid)
+                if not ok and self.state.extras.get(f"_last_reject_kind_{sym}") == "MARGIN_SHORTFALL":
+                    margin_blocked = True
 
     def _smart_cancel_oid(self, sym: str, side: str, oid: str) -> None:
         """Cancel one OID and recover any partial fill (supports both MEXC and Fyers paths)."""
@@ -1911,6 +1944,24 @@ class GenericRunner:
         buy_target_prices = set(new_buy_targets.values())
         sell_target_prices = set(new_sell_targets.values())
 
+        # Partial-fill carryover orders (set by the next-day 50% rule in _check_terminal).
+        # These are explicit, specifically-sized levels that may sit off the normal grid (e.g. a
+        # buy-back at ref). Add their prices to the target sets so resting carryover orders are
+        # KEPT (not cancelled as "off-grid"); their qty is applied when placing below.
+        carryover_orders: dict = {}  # (side, price_dec) -> qty_dec
+        if getattr(cfg, "pro_partial_carryover", False):
+            _carry = json.loads(self.state.extras.get(f"_pro_carryover_{sym}", "{}"))
+            for _key, _qtystr in _carry.items():
+                _cside, _cpx = _key.split("|")
+                _cpx_d = _dec(_cpx); _cq = _dec(_qtystr)
+                if _cq <= D0:
+                    continue
+                carryover_orders[(_cside, _cpx_d)] = _cq
+                if _cside == "BUY":
+                    buy_target_prices.add(_cpx_d)
+                else:
+                    sell_target_prices.add(_cpx_d)
+
         # Detect and apply any live partial fills on kept orders before classifying.
         # This ensures kept_sell_qty and available_cash reflect actual remaining unfilled qty.
         self._poll_live_fills(sym)
@@ -2069,6 +2120,53 @@ class GenericRunner:
                 orders_to_place.append(("SELL", k, sp, qty, f"pro_sell_L{k}|ref+{k}x{step}"))
                 placed_sell_qty += qty
 
+        # Carryover orders (next-day 50% rule): place any not already resting or queued this tick.
+        # Respects the same cash / inventory / sell-cap budgets as normal levels, netting out what
+        # the normal levels above already committed.
+        if carryover_orders:
+            _pending_buy_cash = sum((e[2] * e[3] for e in orders_to_place if e[0] == "BUY"), D0)
+            _pending_sell_qty = sum((e[3] for e in orders_to_place if e[0] == "SELL"), D0)
+            _cy_cash = max(self.state.cash - quote_reserve - kept_buy_cost - _pending_buy_cash, D0)
+            _cy_base = _dec(self.state.extras.get(f"broker_base_qty_{sym}") or ss.traded_qty)
+            _cy_sell_inv = max(D0, _cy_base - kept_sell_qty - _pending_sell_qty)
+            _cy_sell_cap = (None if remaining_sell_cap is None
+                            else max(D0, remaining_sell_cap - kept_sell_qty - _pending_sell_qty))
+            _queued = {(e[0], e[2]) for e in orders_to_place}
+            for (cside, cpx), cq in carryover_orders.items():
+                if cq <= D0:
+                    continue
+                if cside == "BUY" and cpx in keep_buy_prices:
+                    continue   # already resting
+                if cside == "SELL" and cpx in keep_sell_prices:
+                    continue
+                if (cside, cpx) in _queued:
+                    continue   # a normal level already covers this price
+                _rej_until = self.state.extras.get(f"_pro_reject_cooldown_{sym}_{cside}_{cpx}")
+                if _rej_until:
+                    try:
+                        if utcnow() < dt.datetime.fromisoformat(_rej_until):
+                            continue   # under rejection cooldown; retry after it clears
+                        self.state.extras.pop(f"_pro_reject_cooldown_{sym}_{cside}_{cpx}", None)
+                    except Exception:
+                        self.state.extras.pop(f"_pro_reject_cooldown_{sym}_{cside}_{cpx}", None)
+                if cside == "BUY":
+                    if cq * cpx > _cy_cash:
+                        LOG.warning("PRO %s carryover BUY %s @ %s: insufficient cash, skipping", sym, cq, cpx)
+                        continue
+                    orders_to_place.append(("BUY", 0, cpx, cq, "pro_buy_carryover"))
+                    _cy_cash -= cq * cpx
+                else:
+                    if cq > _cy_sell_inv:
+                        LOG.warning("PRO %s carryover SELL %s @ %s: insufficient inventory, skipping", sym, cq, cpx)
+                        continue
+                    if _cy_sell_cap is not None and cq > _cy_sell_cap:
+                        LOG.info("PRO %s carryover SELL %s @ %s: max_pro_sell_qty cap reached, skipping", sym, cq, cpx)
+                        continue
+                    orders_to_place.append(("SELL", 0, cpx, cq, "pro_sell_carryover"))
+                    _cy_sell_inv -= cq
+                    if _cy_sell_cap is not None:
+                        _cy_sell_cap -= cq
+
         # Track ITM counts for gap-open step-down/up logic
         self.state.extras[f"_itm_buy_placed_{sym}"] = sum(
             1 for e in orders_to_place if e[0] == "BUY" and e[2] > price)
@@ -2087,7 +2185,8 @@ class GenericRunner:
                     pre_sellable = self.exec.compute_broker_sellable(sym)
                 except Exception as e:
                     LOG.warning("PRO %s: sellable pre-fetch failed (%s)", sym, e)
-            self._place_orders_parallel(sym, orders_to_place, pre_sellable=pre_sellable)
+            self._place_orders_parallel(sym, orders_to_place, pre_sellable=pre_sellable,
+                                        lot_size=_dec(getattr(cfg, "qty_step", 1)))
 
     def _place_proactive_orders(self, sym: str, strategy, price: Decimal) -> None:
         """
@@ -2309,7 +2408,8 @@ class GenericRunner:
                     pre_sellable = self.exec.compute_broker_sellable(sym)
                 except Exception as e:
                     LOG.warning("PRO %s: sellable pre-fetch failed (%s) — fetching per order", sym, e)
-            self._place_orders_parallel(sym, orders_to_place, pre_sellable=pre_sellable)
+            self._place_orders_parallel(sym, orders_to_place, pre_sellable=pre_sellable,
+                                        lot_size=_dec(getattr(cfg, "qty_step", 1)))
 
     def _poll_proactive_symbol(self, sym: str, strategy, price: Decimal, allow_new: bool = True) -> None:
         """
@@ -2437,6 +2537,42 @@ class GenericRunner:
                              sym, side, oid, filled_qty, ss.reference_price)
                 if already_applied > D0:
                     self.state.extras.pop(f"_pro_oid_applied_{oid}", None)
+
+                # Record complete-fill limit prices so ref can be set deterministically below,
+                # independent of the order these oids happen to be processed in this tick.
+                if not is_partial and limit_px > D0:
+                    (filled_buy_pxs if side == "BUY" else filled_sell_pxs).append(limit_px)
+
+                # --- Partial-fill carryover (next-day 50% rule) ---
+                # This order went terminal (typically EOD-cancelled and seen next morning).
+                # Clear any carryover instruction it fulfilled, then if it filled only partially:
+                #   <50% of intended -> re-place the REMAINING qty at the same level (keep trading)
+                #   >=50% of intended -> place the FILLED qty on the OPPOSITE side one step away
+                #                        (round-trip exactly what actually traded).
+                if getattr(cfg, "pro_partial_carryover", False) and limit_px > D0 \
+                        and getattr(cfg, "fixed_step", None) is not None:
+                    _ck = f"_pro_carryover_{sym}"
+                    _carry = json.loads(self.state.extras.get(_ck, "{}"))
+                    _carry.pop(f"{side}|{limit_px}", None)  # this order fulfilled its own carryover
+                    if is_partial and intended_qty > D0:
+                        _step = _dec(cfg.fixed_step)
+                        _ratio = filled_qty / intended_qty
+                        if _ratio < Decimal("0.5"):
+                            _rem = intended_qty - filled_qty
+                            _carry[f"{side}|{limit_px}"] = str(_rem)
+                            LOG.info("PRO %s carryover: %s @ %s filled %.0f%% (<50%%) -> re-place remaining %s",
+                                     sym, side, limit_px, float(_ratio * 100), _rem)
+                        else:
+                            _opp = "BUY" if side == "SELL" else "SELL"
+                            _opp_px = (limit_px - _step) if side == "SELL" else (limit_px + _step)
+                            _prev = _dec(_carry.get(f"{_opp}|{_opp_px}", "0"))
+                            _carry[f"{_opp}|{_opp_px}"] = str(_prev + filled_qty)
+                            LOG.info("PRO %s carryover: %s @ %s filled %.0f%% (>=50%%) -> %s %s @ %s (round-trip)",
+                                     sym, side, limit_px, float(_ratio * 100), _opp, filled_qty, _opp_px)
+                    if _carry:
+                        self.state.extras[_ck] = json.dumps(_carry)
+                    else:
+                        self.state.extras.pop(_ck, None)
                 return True
             else:
                 LOG.info("PRO %s %s terminal (no fill) oid=%s", sym, side, oid)
@@ -2444,6 +2580,8 @@ class GenericRunner:
 
         filled_buy = False
         filled_sell = False
+        filled_buy_pxs: list = []
+        filled_sell_pxs: list = []
 
         for oid in list(self._get_pro_oid_list(sym, "BUY")):
             if _check_terminal("BUY", oid):
@@ -2452,6 +2590,21 @@ class GenericRunner:
         for oid in list(self._get_pro_oid_list(sym, "SELL")):
             if _check_terminal("SELL", oid):
                 filled_sell = True
+
+        # Deterministic ref when MULTIPLE orders on one side fill in the same tick (e.g. a whole
+        # side crossing at the pre-open auction price). ref is otherwise set by whichever oid was
+        # processed last, which depends on list order. Snap it to the highest filled sell (so
+        # buy-backs sit below every sale) or the lowest filled buy — matching one-at-a-time semantics.
+        if filled_sell and not filled_buy and len(filled_sell_pxs) > 1:
+            _det = max(filled_sell_pxs)
+            LOG.info("PRO %s multi-sell fill this tick (%s) — ref set deterministically to highest=%s",
+                     sym, sorted(set(filled_sell_pxs)), _det)
+            ss.reference_price = _det
+        elif filled_buy and not filled_sell and len(filled_buy_pxs) > 1:
+            _det = min(filled_buy_pxs)
+            LOG.info("PRO %s multi-buy fill this tick (%s) — ref set deterministically to lowest=%s",
+                     sym, sorted(set(filled_buy_pxs)), _det)
+            ss.reference_price = _det
 
         # Drift re-center — configurable via pro_drift_recenter / pro_drift_pct on strategy cfg.
         # Only fires when no fills this iteration (fills take priority).

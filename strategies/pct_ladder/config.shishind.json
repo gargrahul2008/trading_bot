@@ -30,6 +30,7 @@
     "pro_drift_recenter": false,
     "pro_min_ref": 11.70,
     "pro_max_sell_price": 12.24,
+    "pro_partial_carryover": true,
     "sizing_mode": "fixed_qty",
     "fixed_qty_buy": 10000,
     "fixed_qty_sell": 10000,
