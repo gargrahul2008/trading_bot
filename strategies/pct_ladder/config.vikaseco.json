@@ -1,0 +1,65 @@
+{
+  "_comment": "VIKASECO sell-first grid — 50,000 shares from existing holdings, zero new capital (16,184 core untouched)",
+  "_capital_notes": {
+    "symbol": "NSE:VIKASECO-EQ",
+    "reference_price": 1.21,
+    "shares_per_level": 50000,
+    "levels": 1,
+    "sell_at": 1.30,
+    "buy_at": 1.21,
+    "grid_step": 0.09,
+    "total_shares_committed": 50000,
+    "held_total": 66184,
+    "core_hold_untouched": 16184,
+    "product_type": "CNC",
+    "new_capital": "NONE — uses existing holdings only",
+    "cash_model": "isolated — starts at 0, grows only from sell fills (sell-first)"
+  },
+  "strategy_name": "pct_ladder",
+  "runner_type": "proactive",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "json",
+    "auth_file": "../../fyers_auth.json",
+    "user_key": "user1",
+    "log_path": ""
+  },
+  "strategy": {
+    "symbols": ["NSE:VIKASECO-EQ"],
+    "upper_pct": 0.7,
+    "lower_pct": 0.7,
+    "fixed_step": 0.09,
+    "pro_drift_recenter": false,
+    "pro_partial_carryover": true,
+    "sizing_mode": "fixed_qty",
+    "fixed_qty_buy": 50000,
+    "fixed_qty_sell": 50000,
+    "qty_step": 1,
+    "min_qty": 1,
+    "rebalance_threshold_steps": 0
+  },
+  "execution": {
+    "product_type": "CNC",
+    "isolated_cash": true,
+    "pro_levels": 1,
+    "max_pro_sell_qty": 50000,
+    "allow_btst_auto": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true,
+    "poll_seconds": 5,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:00",
+    "regular_market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": true,
+    "price_tick": 0.01,
+    "pro_disclosed_pct": 0.10
+  },
+  "paths": {
+    "state_path": "state/vikaseco_state.json",
+    "trades_path": "state/vikaseco_trades.jsonl",
+    "rejects_path": "state/vikaseco_rejects.jsonl"
+  }
+}

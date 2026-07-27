@@ -497,6 +497,34 @@ class FibLiveBot:
             return _fetch_bars_binance(symbol, n)
         return _fetch_bars_mexc(symbol, n)
 
+    def _fetch_day_bars(self, symbol: str) -> pd.DataFrame:
+        """Fetch the CURRENT UTC day's closed bars (00:00 → now) from the signal feed.
+
+        This is what makes paper == backtest: the strategy resets per UTC trade_date and
+        is causal, so feeding it the full day-so-far each minute reproduces the backtest's
+        single stateful pass EXACTLY. (The old trailing-350 window truncated the day after
+        ~05:50 UTC and generated a different, larger signal set.)
+        """
+        now = datetime.now(timezone.utc)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        cur_min_ms = int(now.replace(second=0, microsecond=0).timestamp() * 1000)
+        use_binance = self.dual_feed and self.signal_feed == "binance"
+        rng = (self._fetch_binance_klines_range if use_binance else self._fetch_klines_range)
+        rows = rng(symbol, int(day_start.timestamp() * 1000), int(now.timestamp() * 1000))
+        rows = [b for b in rows if int(b[0]) < cur_min_ms]  # closed bars only (drop forming bar)
+        if not rows:
+            return pd.DataFrame()
+        src = f"{'BINANCE' if use_binance else 'MEXC'}:{symbol}"
+        df = pd.DataFrame({
+            "timestamp": [pd.Timestamp(int(b[0]), unit="ms", tz="UTC") for b in rows],
+            "symbol":    src,
+            "open":  [float(b[1]) for b in rows], "high": [float(b[2]) for b in rows],
+            "low":   [float(b[3]) for b in rows], "close": [float(b[4]) for b in rows],
+            "volume": [float(b[5]) for b in rows],
+        })
+        df["trade_date"] = df["timestamp"].dt.date.astype(str)
+        return df.drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+
     def _mexc_marketable_price(self, symbol: str, is_buy: bool) -> Optional[float]:
         """MEXC marketable fill price: ask for a buy, bid for a sell — the price you
         actually cross. Returns None on failure (caller falls back to the signal level)."""
@@ -792,7 +820,9 @@ class FibLiveBot:
 
                 for sym in self.symbols:
                     try:
-                        df = self._fetch_signal_bars(sym, 350)
+                        # Full current-UTC-day window → reproduces the backtest's
+                        # stateful single pass (was: trailing 350 bars).
+                        df = self._fetch_day_bars(sym)
                         self.on_bar(sym, df)
                     except Exception as e:
                         LOG.error("[%s] Bar processing error: %s", sym, e)

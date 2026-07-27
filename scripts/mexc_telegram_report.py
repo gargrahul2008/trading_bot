@@ -228,6 +228,11 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
     period_rebal_pnl    = D0
     period_cycles       = 0
     period_rebal_cycles = 0
+    # All-time grid (non-rebalance) completed-cycle counters
+    at_cycles           = 0   # total matched grid sells (completed cycles)
+    at_cycle_wins       = 0   # cycles closed at a profit
+    at_cycle_losses     = 0   # cycles closed at a loss
+    at_cycle_pnl        = D0  # sum of those cycles' realized PnL (LIFO)
     rebalance_qty       = D0
     period_ladder_values: list[Decimal] = []
 
@@ -247,6 +252,7 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
         """Unified LIFO for period cycle counting. Standard matching (all sells, not just profitable)."""
         nonlocal all_time_pnl, period_cycles, period_rebal_cycles
         nonlocal period_pnl, period_rebal_pnl
+        nonlocal at_cycles, at_cycle_wins, at_cycle_losses, at_cycle_pnl
 
         if side == "BUY":
             open_buys.append([qty, price, is_rebal])
@@ -268,6 +274,14 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
 
         if sell_pnl != D0 or rem < qty:
             all_time_pnl += sell_pnl
+            if not any_rebal:
+                # All-time completed grid cycle (this matched sell closed inventory)
+                at_cycles += 1
+                at_cycle_pnl += sell_pnl
+                if sell_pnl >= D0:
+                    at_cycle_wins += 1
+                else:
+                    at_cycle_losses += 1
             if in_period:
                 if any_rebal:
                     period_rebal_pnl += sell_pnl
@@ -347,6 +361,10 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
         "rebal_cycles":        period_rebal_cycles,
         "period_rebal_pnl":   period_rebal_pnl,
         "total_bot_pnl":       all_time_pnl,
+        "at_cycles":           at_cycles,
+        "at_cycle_wins":       at_cycle_wins,
+        "at_cycle_losses":     at_cycle_losses,
+        "at_cycle_pnl":        at_cycle_pnl,
         "grid_net_usdc":      float(grid_net_usdc),
         "grid_net_eth":       float(grid_net_eth),
         "rebal_net_usdc":     float(rebal_net_usdc),
@@ -482,6 +500,11 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
         f"Bot{_sgn(grid_realized, 0)}(u{_sgn(grid_unrealized, 0)}), "
         f"Rbl{_sgn(rebal_realized, 0)}(u{_sgn(rebal_unrealized, 0)})"
     )
+    # All-time completed grid cycles: total, win/loss split, and their realized PnL (LIFO)
+    line_cyc = (
+        f"Cyc{m['at_cycles']}: {m['at_cycle_wins']}W/{m['at_cycle_losses']}L, "
+        f"R{_sgn(float(m['at_cycle_pnl']), 0)}"
+    )
     parts4 = []
     if eth_holding_pnl is not None:
         parts4.append(f"H{_sgn(eth_holding_pnl, 0)}")
@@ -492,7 +515,7 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
     line4 = ", ".join(parts4)
 
     # Optional line5: show HODL/extra-ETH breakdown so the message reflects total bucket holdings.
-    msg = f"{line1}\n{line2}\n{line3}\n{line4}"
+    msg = f"{line1}\n{line2}\n{line_cyc}\n{line3}\n{line4}"
     if extra_eth > 0:
         bot_eth = float(broker_eth)
         msg += f"\nETH bot {bot_eth:.2f} + HODL {extra_eth:.2f} = {bot_eth + extra_eth:.2f} @ ${float(price):,.0f}"
@@ -525,6 +548,10 @@ def main() -> None:
     ap.add_argument("--extra-eth",    type=float, default=0,
                     help="Untracked ETH held outside the bot's view (e.g., HODL stack). "
                          "Added to bot ETH for PV display so the message reflects total bucket holdings.")
+    ap.add_argument("--since",        default=None,
+                    help="Baseline cutoff: ignore all fills before this time. "
+                         "Accepts 'YYYY-MM-DD HH:MM:SS' (assumed IST) or ISO-8601 with tz. "
+                         "Scopes cycle/PnL accounting to trades on/after this instant.")
     ap.add_argument("--secrets",      default=None,
                     help="Telegram secrets JSON (default: <config_dir>/secrets/telegram.json)")
     ap.add_argument("--dry-run",      action="store_true", help="Print message, don't send")
@@ -554,6 +581,24 @@ def main() -> None:
         last_report_path = os.path.join(os.path.dirname(state_path), "telegram_last_report.json")
 
     fills   = load_trades(args.trades)
+
+    # Baseline cutoff: drop fills before --since so all accounting starts from that instant.
+    if args.since:
+        try:
+            _cut = datetime.datetime.fromisoformat(args.since)
+        except ValueError:
+            _cut = datetime.datetime.strptime(args.since, "%Y-%m-%d %H:%M:%S")
+        if _cut.tzinfo is None:
+            _cut = _cut.replace(tzinfo=IST)   # bare timestamps interpreted as IST
+        _cut_utc = _cut.astimezone(UTC)
+        def _ts(r):
+            try:
+                d = datetime.datetime.fromisoformat(r.get("ts", ""))
+                return d if d.tzinfo else d.replace(tzinfo=UTC)
+            except Exception:
+                return None
+        fills = [r for r in fills if (_ts(r) is not None and _ts(r) >= _cut_utc)]
+
     metrics = compute_metrics(fills, since, strategy)
     msg, pv_snapshot = build_message(metrics, since, now, args.hours, state_path, symbol,
                                      last_report_path=last_report_path,
