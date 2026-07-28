@@ -1,0 +1,71 @@
+{
+  "_comment": "COOLCAPS sell-first grid \u2014 trades a 15,000 slice of existing holdings, 1 level at a time",
+  "_capital_notes": {
+    "symbol": "NSE:COOLCAPS-ST",
+    "reference_price": 24,
+    "shares_per_level": 5000,
+    "lot_size": 1250,
+    "proactive_levels": 1,
+    "sell_ceiling": 26.4,
+    "buy_floor": 24,
+    "total_trade_slice": 15000,
+    "held_total": 35000,
+    "core_hold_untouched": 20000,
+    "grid_step": 0.8,
+    "product_type": "CNC",
+    "series_note": "-ST is NSE SME series; likely trade-to-trade (no intraday/BTST), sell proceeds settle T+1",
+    "new_capital": "buy-backs funded by kept account capital until sell proceeds settle"
+  },
+  "strategy_name": "pct_ladder",
+  "runner_type": "proactive",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "json",
+    "auth_file": "../../../fyers_auth.json",
+    "user_key": "user2",
+    "log_path": "logs"
+  },
+  "strategy": {
+    "symbols": [
+      "NSE:COOLCAPS-ST"
+    ],
+    "upper_pct": 0.7,
+    "lower_pct": 0.7,
+    "fixed_step": 0.8,
+    "pro_drift_recenter": false,
+    "pro_min_ref": 24,
+    "pro_max_sell_price": 26.4,
+    "pro_partial_carryover": true,
+    "sizing_mode": "fixed_qty",
+    "fixed_qty_buy": 5000,
+    "fixed_qty_sell": 5000,
+    "qty_step": 1250,
+    "min_qty": 1250,
+    "rebalance_threshold_steps": 0
+  },
+  "execution": {
+    "product_type": "CNC",
+    "isolated_cash": true,
+    "pro_levels": 1,
+    "max_pro_sell_qty": 15000,
+    "allow_btst_auto": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true,
+    "poll_seconds": 5,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:00",
+    "regular_market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": true,
+    "price_tick": 0.05,
+    "pro_disclosed_pct": 0.1
+  },
+  "paths": {
+    "state_path": "state/state.json",
+    "trades_path": "state/trades.jsonl",
+    "rejects_path": "state/rejects.jsonl"
+  },
+  "_migrated_from": "strategies/pct_ladder/config.coolcaps.json"
+}

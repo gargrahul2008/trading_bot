@@ -89,7 +89,12 @@ def build_broker(cfg: Dict[str, Any], base_dir: str):
         if not client_id or not access_token:
             raise SystemExit("Missing FYERS auth. Use broker.auth_mode=db, broker.auth_mode=json, or set FYERS_CLIENT_ID/FYERS_ACCESS_TOKEN.")
 
-        log_path = str(b.get("log_path") or "")
+        log_path = str(b.get("log_path") or "").strip()
+        if log_path:
+            # Resolve relative to the config dir (like state_path) so each account/strategy
+            # writes its Fyers SDK logs into its own folder instead of colliding in the CWD.
+            log_path = _abs(log_path, base_dir)
+            os.makedirs(log_path, exist_ok=True)
         return FyersClient(client_id=client_id, access_token=access_token, log_path=log_path)
 
     if btype == "mexc_spot":

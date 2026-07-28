@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -74,6 +75,28 @@ def daterange_chunks(start: dt.date, end: dt.date, chunk_days: int) -> Iterable[
         current = chunk_end + dt.timedelta(days=1)
 
 
+# FYERS per-minute request cap returns {'code': 429, 'message': 'request limit
+# reached'}; the client's internal retries max out at ~6s which never outlives
+# it, so cool down for a full minute and continue where we were.
+RATE_LIMIT_COOLDOWN_SECONDS = 61.0
+RATE_LIMIT_MAX_COOLDOWNS = 15
+REQUEST_THROTTLE_SECONDS = 0.25
+_RATE_LIMIT_MARKERS = ("'code': 429", "request limit")
+
+
+def _history_with_cooldown(client: FyersClient, payload: dict) -> dict:
+    for _ in range(RATE_LIMIT_MAX_COOLDOWNS):
+        try:
+            return client.history(payload)
+        except Exception as exc:
+            message = str(exc)
+            if not any(marker in message for marker in _RATE_LIMIT_MARKERS):
+                raise
+            print(f"FYERS rate limit hit; cooling down {RATE_LIMIT_COOLDOWN_SECONDS:.0f}s ...", flush=True)
+            time.sleep(RATE_LIMIT_COOLDOWN_SECONDS)
+    raise RuntimeError(f"still rate limited after {RATE_LIMIT_MAX_COOLDOWNS} cooldowns: {payload['symbol']}")
+
+
 def fetch_symbol_history(
     client: FyersClient,
     *,
@@ -85,7 +108,8 @@ def fetch_symbol_history(
 ) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     for range_from, range_to in daterange_chunks(start, end, chunk_days):
-        response = client.history(
+        response = _history_with_cooldown(
+            client,
             {
                 "symbol": symbol,
                 "resolution": resolution,
@@ -93,8 +117,9 @@ def fetch_symbol_history(
                 "range_from": range_from.isoformat(),
                 "range_to": range_to.isoformat(),
                 "cont_flag": "1",
-            }
+            },
         )
+        time.sleep(REQUEST_THROTTLE_SECONDS)
         candles = response.get("candles") or []
         if not candles:
             continue

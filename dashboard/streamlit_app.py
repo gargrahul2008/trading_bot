@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
 from dashboard.auth import require_password
 from dashboard.views.fyers_auth_page import render_page as render_fyers_auth_page
 from dashboard.views.mexc_dashboard_page import render_page as render_mexc_dashboard_page
+from dashboard.views.pnl_page import render_page as render_pnl_page
 
 
 st.set_page_config(page_title="Trading Dashboard", layout="wide")
@@ -20,10 +21,13 @@ allowed_pages = require_password()
 
 mexc_page = st.Page(render_mexc_dashboard_page, title="Dashboard", icon=":material/monitoring:")
 fyers_page = st.Page(render_fyers_auth_page, title="FYERS Auth", icon=":material/key:", url_path="fyers-auth", default=True)
+pnl_page = st.Page(render_pnl_page, title="P&L", icon=":material/payments:", url_path="pnl")
 
 pages = []
 if "dashboard" in allowed_pages:
     pages.append(mexc_page)
+if "pnl" in allowed_pages:
+    pages.append(pnl_page)
 if "fyers-auth" in allowed_pages:
     pages.append(fyers_page)
 

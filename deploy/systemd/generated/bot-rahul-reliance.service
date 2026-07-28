@@ -1,0 +1,16 @@
+[Unit]
+Description=Fyers bot: rahul/reliance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading_bot
+EnvironmentFile=/opt/trading_bot/accounts/rahul/account.env
+ExecStart=/opt/trading_bot/.venv/bin/python run_strategy.py --config accounts/rahul/reliance/config.json
+Restart=always
+RestartSec=5
+SyslogIdentifier=bot-rahul-reliance
+
+[Install]
+WantedBy=multi-user.target

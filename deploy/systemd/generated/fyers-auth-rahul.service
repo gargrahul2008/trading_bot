@@ -1,0 +1,18 @@
+[Unit]
+Description=Fyers daily token refresh (IP-bound) for account rahul
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading_bot
+EnvironmentFile=/opt/trading_bot/accounts/rahul/account.env
+# Refresh THIS user only (never --enabled-only, which would use one shared IP).
+ExecStart=/opt/trading_bot/.venv/bin/python scripts/fyers_auto_auth.py --auth-file fyers_auth.json \
+    --user-key ${FYERS_USER_KEY} --loop --daily-at 08:30 --timezone Asia/Kolkata
+Restart=always
+RestartSec=30
+SyslogIdentifier=fyers-auth-rahul
+
+[Install]
+WantedBy=multi-user.target

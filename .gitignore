@@ -50,6 +50,13 @@ strategies/*/state/
 strategies/*/st/
 strategies/*/st
 
+# Per-account (multi-account host) runtime state, logs, and env — never commit.
+# account.env names the whitelisted IP; state/ holds live positions. See docs/multi_account_*.md
+# Layout is accounts/<user>/<strategy>/state/, so match state/logs at any depth.
+accounts/**/state/
+accounts/**/logs/
+accounts/**/*.env
+
 # Backtest data cache (large binary files, re-downloadable)
 backtest/cache/
 backtest/ticks/

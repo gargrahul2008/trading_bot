@@ -1,0 +1,16 @@
+[Unit]
+Description=Fyers bot: pratibha/coolcaps
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading_bot
+EnvironmentFile=/opt/trading_bot/accounts/pratibha/account.env
+ExecStart=/opt/trading_bot/.venv/bin/python run_strategy.py --config accounts/pratibha/coolcaps/config.json
+Restart=always
+RestartSec=5
+SyslogIdentifier=bot-pratibha-coolcaps
+
+[Install]
+WantedBy=multi-user.target

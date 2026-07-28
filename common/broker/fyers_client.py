@@ -326,3 +326,42 @@ class FyersClient(Broker):
                 raise BrokerError(f"History error: {resp!r}", resp=resp)
             return resp
         return with_retries(_call, max_retries=4, base_sleep=0.6, max_sleep=6.0, logger=LOG)
+
+    # ── Reporting endpoints (P&L / charges) ─────────────────────────────────────
+    # Read-only. Used by the IP-bound broker-P&L fetch (scripts/fetch_broker_pnl.py)
+    # to cache broker-truth data for the dashboard. Never call these from a process
+    # that is not bound to this account's whitelisted IP.
+
+    def tradebook(self) -> Dict[str, Any]:
+        """Executed trades for the current day (per-account, per-symbol)."""
+        def _call():
+            resp = self._fyers.tradebook()
+            if not isinstance(resp, dict) or resp.get("s") not in {"ok", "no_data"}:
+                raise BrokerError(f"Tradebook error: {resp!r}", resp=resp)
+            return resp
+        return with_retries(_call, max_retries=3, base_sleep=0.5, max_sleep=4.0, logger=LOG)
+
+    def charges_history(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Charges (brokerage/STT/exchange/GST/stamp) over a date range. See SDK for
+        the `data` fields (from_date, to_date, segment_type, exchange_type, report_type)."""
+        def _call():
+            try:
+                resp = self._fyers.charges_history(data=data)
+            except TypeError:
+                resp = self._fyers.charges_history(data)
+            if not isinstance(resp, dict) or resp.get("s") not in {"ok", "no_data"}:
+                raise BrokerError(f"charges_history error: {resp!r}", resp=resp)
+            return resp
+        return with_retries(_call, max_retries=3, base_sleep=0.6, max_sleep=5.0, logger=LOG)
+
+    def realised_profit_history(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Broker-computed realized profit over a date range (per-symbol)."""
+        def _call():
+            try:
+                resp = self._fyers.realised_profit_history(data=data)
+            except TypeError:
+                resp = self._fyers.realised_profit_history(data)
+            if not isinstance(resp, dict) or resp.get("s") not in {"ok", "no_data"}:
+                raise BrokerError(f"realised_profit_history error: {resp!r}", resp=resp)
+            return resp
+        return with_retries(_call, max_retries=3, base_sleep=0.6, max_sleep=5.0, logger=LOG)

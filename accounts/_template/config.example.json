@@ -1,0 +1,36 @@
+{
+  "_comment": "Template account config. Copy to accounts/<name>/config.json and edit. Behavior is entirely config-driven — no per-user code.",
+  "strategy_name": "pct_ladder",
+  "runner_type": "proactive",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "json",
+    "auth_file": "../../fyers_auth.json",
+    "user_key": "CHANGEME",
+    "log_path": ""
+  },
+  "strategy": {
+    "symbols": ["NSE:CHANGEME-EQ"],
+    "sizing_mode": "fixed_qty",
+    "fixed_qty_buy": 1,
+    "fixed_qty_sell": 1
+  },
+  "execution": {
+    "product_type": "CNC",
+    "poll_seconds": 5,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:00",
+    "regular_market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true
+  },
+  "paths": {
+    "state_path": "state/state.json",
+    "trades_path": "state/trades.jsonl",
+    "rejects_path": "state/rejects.jsonl"
+  }
+}

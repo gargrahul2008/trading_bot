@@ -12,9 +12,14 @@
       "pages": ["fyers-auth"]
     },
     {
+      "label": "pnl-only",
+      "password": "pnl123",
+      "pages": ["pnl"]
+    },
+    {
       "label": "full-access",
       "password": "admin123",
-      "pages": ["dashboard", "fyers-auth"]
+      "pages": ["dashboard", "fyers-auth", "pnl"]
     }
   ]
 }

@@ -1,0 +1,68 @@
+{
+  "_comment": "India MTF strategy \u2014 Reliance Industries, 3X leverage, \u20b94,00,000 capital @ ~\u20b91460/share",
+  "_capital_notes": {
+    "total_capital": 400000,
+    "leverage": "3X MTF",
+    "effective_buying_power": 1200000,
+    "initial_shares": 420,
+    "initial_shares_value": 614124,
+    "trading_cash": 585876,
+    "step_shares": 70,
+    "step_value_approx": 102354,
+    "pct_step": "0.5%",
+    "buy_sell_levels_each_side": 2,
+    "rebalance_range": "\u00b11.0% from reference (rebalance at \u00b11.5%)",
+    "gross_per_cycle_inr": 511,
+    "net_per_cycle_inr_approx": 281
+  },
+  "strategy_name": "pct_ladder",
+  "runner_type": "proactive",
+  "broker": {
+    "type": "fyers",
+    "auth_mode": "json",
+    "auth_file": "../../../fyers_auth.json",
+    "user_key": "user1",
+    "log_path": "logs"
+  },
+  "strategy": {
+    "symbols": [
+      "NSE:RELIANCE-EQ"
+    ],
+    "upper_pct": 0.5,
+    "lower_pct": 0.5,
+    "fixed_step": 14.0,
+    "pro_drift_recenter": false,
+    "sizing_mode": "fixed_qty",
+    "fixed_qty_buy": 140,
+    "fixed_qty_sell": 140,
+    "qty_step": 1,
+    "min_qty": 1,
+    "rebalance_threshold_steps": 0,
+    "rebalance_target_steps": 0
+  },
+  "execution": {
+    "product_type": "MTF",
+    "mtf_leverage": 3,
+    "pro_levels": 3,
+    "pro_disclosed_pct": 0.1,
+    "allow_btst_auto": true,
+    "sync_on_start": true,
+    "adopt_broker_inventory": true,
+    "poll_seconds": 5,
+    "closed_poll_seconds": 30,
+    "market_tz": "Asia/Kolkata",
+    "market_open": "09:00",
+    "preopen_pause_start": "09:07",
+    "regular_market_open": "09:15",
+    "market_close": "15:30",
+    "eod_cancel_time": "15:29:30",
+    "cancel_all_open_orders": true,
+    "price_tick": 0.1
+  },
+  "paths": {
+    "state_path": "state/state.json",
+    "trades_path": "state/trades.jsonl",
+    "rejects_path": "state/rejects.jsonl"
+  },
+  "_migrated_from": "strategies/pct_ladder/config.reliance.mtf.json"
+}
