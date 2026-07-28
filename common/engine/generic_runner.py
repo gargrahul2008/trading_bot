@@ -13,6 +13,7 @@ from common.engine.strategy_base import ReactiveStrategy, ManagedOrderStrategy, 
 from common.engine.execution import OrderExecutor, ExecutionConfig
 from common.utils.logger import setup_logger
 from common.utils.timeutils import parse_hhmm, parse_hhmmss, now_local, utcnow
+from common.engine.market_calendar import load_holidays, is_trading_day
 from common.engine.pnl import (
     PnLWriter, PnLPoint,
     infer_broker_name, compute_portfolio_value_for_symbols,
@@ -49,7 +50,9 @@ class GenericRunner:
                  eod_cancel_time: str, poll_seconds: int, closed_poll_seconds: int, cancel_all_open_orders: bool,
                  sync_on_start: bool, adopt_broker_inventory: bool, manual_adjustments_path: str | None = None,
                  regular_market_open: str | None = None,
-                 preopen_pause_start: str | None = None):
+                 preopen_pause_start: str | None = None,
+                 session_guard: bool = False,
+                 holidays_file: str | None = None):
         self.broker = broker
         self.state = state
         self.symbols = symbols
@@ -69,6 +72,10 @@ class GenericRunner:
         self.cancel_all_open_orders = bool(cancel_all_open_orders)
         self.sync_on_start = bool(sync_on_start)
         self.adopt_broker_inventory = bool(adopt_broker_inventory)
+        # Equity session guard (opt-in). When on, the loop skips ALL broker calls outside
+        # NSE trading hours / on weekends / on holidays. Off by default → crypto unaffected.
+        self.session_guard = bool(session_guard)
+        self._holidays = load_holidays(holidays_file) if self.session_guard else set()
         base_dir = os.path.dirname(os.path.abspath(trades_path)) or "."
         self._pnl_writer = PnLWriter(
             csv_path=os.path.join(base_dir, "pnl_points.csv"),
@@ -94,6 +101,17 @@ class GenericRunner:
         self._maybe_backfill_daily_files()
         if self.manual_adjustments_path:
             os.makedirs(os.path.dirname(self.manual_adjustments_path) or ".", exist_ok=True)
+
+    def _session_guard_closed(self, now, open_dt, close_dt) -> bool:
+        """True when the equity session guard is on AND the market is closed right now
+        (weekend, NSE holiday, or outside [market_open, market_close]). When True, the loop
+        must not touch the broker — just idle. Always False when the guard is off (crypto),
+        so behavior there is unchanged."""
+        if not self.session_guard:
+            return False
+        if not is_trading_day(now.date(), self._holidays):
+            return True
+        return not (open_dt <= now < close_dt)
 
     def _append_jsonl(self, path: str, rec: Dict[str, Any]) -> None:
         try:
@@ -1093,6 +1111,15 @@ class GenericRunner:
             open_dt = now.replace(hour=self.open_t.hour, minute=self.open_t.minute, second=self.open_t.second, microsecond=0)
             close_dt = now.replace(hour=self.close_t.hour, minute=self.close_t.minute, second=self.close_t.second, microsecond=0)
             eod_cancel_dt = now.replace(hour=self.eod_cancel_t.hour, minute=self.eod_cancel_t.minute, second=self.eod_cancel_t.second, microsecond=0)
+
+            # Equity session guard (opt-in): outside NSE hours / weekends / holidays, do NOT
+            # touch the exchange at all — just idle. Avoids off-hours quote polling that can
+            # get the account flagged. No-op for crypto/always-on (guard off). EOD cancel is
+            # unaffected: it runs at eod_cancel_dt, which is inside [open, close].
+            if self._session_guard_closed(now, open_dt, close_dt):
+                self.state.last_update_ts = utcnow().isoformat()
+                time.sleep(max(int(self.closed_poll_seconds), 30))
+                continue
 
             # EOD cancel once (equities). For crypto you can set eod_cancel_time far in the future or ignore.
             if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:

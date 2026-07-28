@@ -64,6 +64,12 @@ def build_one(account: str, user_key: str, strat: str, source: Path) -> Path:
         "rejects_path": "state/rejects.jsonl",
     }
 
+    # Equity accounts: enable the session guard so bots don't hit the exchange outside NSE
+    # hours / on weekends / on holidays (safe under always-on systemd). Uses the bundled
+    # common/engine/nse_holidays.json unless a holidays_file is set.
+    cfg.setdefault("execution", {})
+    cfg["execution"]["equity_session_guard"] = True
+
     # Provenance breadcrumb.
     cfg["_migrated_from"] = str(source.relative_to(REPO))
 
