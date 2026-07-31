@@ -6,8 +6,8 @@ Emits into deploy/systemd/generated/ (review, then copy to /etc/systemd/system/)
   - bot-<user>-<strategy>.service   : one live bot per strategy run.
       Reads accounts/<user>/account.env (identity + this account's IP/proxy — single source),
       runs run_strategy.py against that run's config.
-  - fyers-auth-<user>.service       : one daily TOTP token refresh per user, IP-bound
-      (reads the SAME account.env, so auth exits through the account's whitelisted IP).
+Token refresh is NOT a systemd unit — it runs as a daily cron one-shot
+(deploy/cron/refresh_tokens.sh, per-user and IP-bound). So only bot units are emitted here.
 
 All of a user's bot units share that user's ONE account.env, so changing the account's IP
 is a one-file edit. Re-run this after adding/removing a strategy folder.
@@ -24,7 +24,10 @@ OUT = REPO / "deploy" / "systemd" / "generated"
 
 # Where the repo lives on the CONTROL HOST (edit to match, e.g. /root/trading_bot).
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/opt/trading_bot")
-PYTHON = f"{INSTALL_DIR}/.venv/bin/python"
+# Venv location on the control host. Override PYTHON directly, or VENV to name the venv dir
+# (this host uses env/, not the .venv/ default). PYTHON wins if both are set.
+VENV = os.environ.get("VENV", ".venv")
+PYTHON = os.environ.get("PYTHON") or f"{INSTALL_DIR}/{VENV}/bin/python"
 
 BOT_UNIT = """[Unit]
 Description=Fyers bot: {user}/{strat}
@@ -44,38 +47,12 @@ SyslogIdentifier=bot-{user}-{strat}
 WantedBy=multi-user.target
 """
 
-AUTH_UNIT = """[Unit]
-Description=Fyers daily token refresh (IP-bound) for account {user}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory={install}
-EnvironmentFile={install}/accounts/{user}/account.env
-# Refresh THIS user only (never --enabled-only, which would use one shared IP).
-ExecStart={python} scripts/fyers_auto_auth.py --auth-file fyers_auth.json \\
-    --user-key ${{FYERS_USER_KEY}} --loop --daily-at 08:30 --timezone Asia/Kolkata
-Restart=always
-RestartSec=30
-SyslogIdentifier=fyers-auth-{user}
-
-[Install]
-WantedBy=multi-user.target
-"""
-
-
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     for user_dir in sorted(ACCOUNTS.iterdir()):
         if not user_dir.is_dir() or user_dir.name.startswith("_"):
             continue
         user = user_dir.name
-        # one auth unit per user
-        (OUT / f"fyers-auth-{user}.service").write_text(
-            AUTH_UNIT.format(user=user, install=INSTALL_DIR, python=PYTHON)
-        )
-        print(f"  fyers-auth-{user}.service")
         # one bot unit per strategy folder (a dir containing config.json)
         for strat_dir in sorted(user_dir.iterdir()):
             if not strat_dir.is_dir() or not (strat_dir / "config.json").exists():

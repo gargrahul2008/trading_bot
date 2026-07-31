@@ -55,7 +55,8 @@
     "eod_cancel_time": "15:29:30",
     "cancel_all_open_orders": true,
     "price_tick": 0.05,
-    "pro_disclosed_pct": 0.1
+    "pro_disclosed_pct": 0.1,
+    "equity_session_guard": true
   },
   "paths": {
     "state_path": "state/state.json",

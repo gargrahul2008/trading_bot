@@ -57,7 +57,8 @@
     "market_close": "15:30",
     "eod_cancel_time": "15:29:30",
     "cancel_all_open_orders": true,
-    "price_tick": 0.1
+    "price_tick": 0.1,
+    "equity_session_guard": true
   },
   "paths": {
     "state_path": "state/state.json",

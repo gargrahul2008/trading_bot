@@ -2782,6 +2782,14 @@ class GenericRunner:
             close_dt = now.replace(hour=self.close_t.hour, minute=self.close_t.minute, second=self.close_t.second, microsecond=0)
             eod_cancel_dt = now.replace(hour=self.eod_cancel_t.hour, minute=self.eod_cancel_t.minute, second=self.eod_cancel_t.second, microsecond=0)
 
+            # Equity session guard (opt-in): outside NSE hours / weekends / holidays, do NOT
+            # touch the exchange at all — just idle. No-op for crypto/always-on (guard off).
+            # EOD cancel unaffected: eod_cancel_dt (15:29:30) is inside [open, close].
+            if self._session_guard_closed(now, open_dt, close_dt):
+                self.state.last_update_ts = utcnow().isoformat()
+                time.sleep(max(int(self.closed_poll_seconds), 30))
+                continue
+
             # EOD cancel: pull all proactive orders off the book
             if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:
                 for sym in self.symbols:
@@ -3206,6 +3214,14 @@ class GenericRunner:
             open_dt       = now.replace(hour=self.open_t.hour,       minute=self.open_t.minute,       second=self.open_t.second,       microsecond=0)
             close_dt      = now.replace(hour=self.close_t.hour,      minute=self.close_t.minute,      second=self.close_t.second,      microsecond=0)
             eod_cancel_dt = now.replace(hour=self.eod_cancel_t.hour, minute=self.eod_cancel_t.minute, second=self.eod_cancel_t.second, microsecond=0)
+
+            # Equity session guard (opt-in): outside NSE hours / weekends / holidays, do NOT
+            # touch the exchange at all — just idle. No-op for crypto/always-on (guard off).
+            # EOD cancel unaffected: eod_cancel_dt (15:29:30) is inside [open, close].
+            if self._session_guard_closed(now, open_dt, close_dt):
+                self.state.last_update_ts = utcnow().isoformat()
+                time.sleep(max(int(self.closed_poll_seconds), 30))
+                continue
 
             # --- EOD cancel ---
             if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:
