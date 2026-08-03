@@ -350,9 +350,22 @@ class GenericRunner:
                 # Default leverage=0/1 means no scaling (non-MTF and MEXC).
                 lev = _dec(getattr(self.exec_cfg, "mtf_leverage", "0"))
                 if lev > _dec("1"):
-                    self.state.cash = raw_cash * lev
-                    LOG.info("MTF cash sync: actual=%.2f leverage=%.1fx buying_power=%.2f",
-                             float(raw_cash), float(lev), float(self.state.cash))
+                    # funds_cash() is the broker's net 'available balance' — it already EXCLUDES
+                    # margin reserved for OPEN orders. The placement logic treats state.cash as
+                    # GROSS (open buys are deducted separately via kept_buy_cost), so add the open
+                    # BUY notional back here, or resting orders get double-counted and buying power
+                    # reads ~0. This is 0 at a clean post-EOD-cancel start; non-zero only when
+                    # syncing with orders still resting (e.g. a mid-session restart).
+                    open_buy = D0
+                    try:
+                        _f = getattr(self.broker, "open_buy_notional", None)
+                        if _f is not None:
+                            open_buy = _dec(_f(self.symbols))
+                    except Exception:
+                        open_buy = D0
+                    self.state.cash = raw_cash * lev + open_buy
+                    LOG.info("MTF cash sync: actual=%.2f leverage=%.1fx open_buy=%.2f buying_power=%.2f",
+                             float(raw_cash), float(lev), float(open_buy), float(self.state.cash))
                 else:
                     self.state.cash = raw_cash
             except Exception:
@@ -2082,7 +2095,21 @@ class GenericRunner:
                 continue
             order_cost = qty * bp
             if placed_cash + order_cost > available_cash:
-                # Try placing a reduced qty with whatever cash remains
+                # Prioritize NEAR levels. If this (nearer) level can't be funded at full qty but a
+                # FARTHER buy is still resting, cancel the single farthest resting buy to free its
+                # margin — this level then places on the next cycle. Trades the deepest (least
+                # productive) level for the nearer one that fills sooner. Only possible with >1
+                # level (needs a farther resting order to give up); a natural no-op otherwise.
+                farther = sorted(p for p in keep_buy_prices if p < bp)
+                if farther:
+                    f_oid = next((o for o in self._get_pro_oid_list(sym, "BUY")
+                                  if self._pro_oid_price.get(o) == farther[0]), None)
+                    if f_oid is not None:
+                        LOG.info("PRO %s BUY L%d @ %s unaffordable — cancelling farthest resting buy @ %s "
+                                 "to fund this nearer level next cycle", sym, k, bp, farther[0])
+                        self._smart_cancel_oid(sym, "BUY", f_oid)
+                        break
+                # Nothing farther to reallocate → place a reduced qty with whatever remains, else skip.
                 affordable_qty = self._round_qty_pro((available_cash - placed_cash) / bp, strategy)
                 affordable_cost = affordable_qty * bp
                 if affordable_qty > D0 and affordable_cost >= Decimal("30000"):

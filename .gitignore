@@ -56,6 +56,7 @@ strategies/*/st
 accounts/**/state/
 accounts/**/logs/
 accounts/**/*.env
+accounts/**/reports/
 
 # Backtest data cache (large binary files, re-downloadable)
 backtest/cache/

@@ -145,6 +145,40 @@ class FyersClient(Broker):
         except Exception:
             return {}
 
+    def open_buy_notional(self, symbols: Optional[List[str]] = None) -> Decimal:
+        """Total remaining notional of currently-open BUY LIMIT orders (optionally filtered to
+        `symbols`). Used by MTF cash accounting to convert the broker's net 'available balance'
+        (which already excludes margin reserved for open orders) back into gross buying power.
+        Best-effort: returns 0 on any error."""
+        try:
+            ob = self.orderbook()
+        except Exception:
+            return to_decimal(0)
+        symset = set(symbols) if symbols else None
+        total = to_decimal(0)
+        for o in self._iter_orders(ob):
+            if not isinstance(o, dict):
+                continue
+            st = o.get("status") or o.get("orderStatus") or o.get("order_status")
+            if isinstance(st, int) and st != 6:            # Fyers 6 = pending/open
+                continue
+            if isinstance(st, str) and st.upper() not in {"PENDING", "OPEN", "6"}:
+                continue
+            if o.get("side") not in (1, "1", "BUY", "B"):
+                continue
+            if o.get("type") not in (1, "1", "LIMIT"):     # Fyers 1 = LIMIT
+                continue
+            sym = str(o.get("symbol") or o.get("tradingSymbol") or "")
+            if symset is not None and sym not in symset:
+                continue
+            qty = to_decimal(o.get("qty") or o.get("quantity") or 0)
+            filled = to_decimal(o.get("filledQty") or o.get("tradedQty") or o.get("filled_qty") or 0)
+            px = to_decimal(o.get("limitPrice") or o.get("limit_price") or o.get("limitPr") or 0)
+            rem = qty - filled
+            if rem > 0 and px > 0:
+                total += rem * px
+        return total
+
     def get_order_terminal(self, order_id: str) -> Optional[OrderTerminal]:
         ob = self.orderbook()
         found = None
@@ -309,6 +343,27 @@ class FyersClient(Broker):
                 cash = to_decimal(resp.get("cash") or resp.get("availableCash") or resp.get("available_balance") or 0)
             return to_decimal(cash or 0)
         return with_retries(_call, max_retries=3, base_sleep=0.5, max_sleep=4.0, logger=LOG)
+
+    def funds_detail(self) -> Dict[str, Decimal]:
+        """Full funds breakdown from fund_limit: total / utilized / available / clear /
+        realized_day (Realized Profit and Loss for the day). Best-effort per title match."""
+        def _call():
+            resp = self._fyers.funds()
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Funds error: {resp!r}", resp=resp)
+            return resp
+        resp = with_retries(_call, max_retries=3, base_sleep=0.5, max_sleep=4.0, logger=LOG)
+        titles = {"total balance": "total", "utilized amount": "utilized",
+                  "available balance": "available", "clear balance": "clear",
+                  "realized profit and loss": "realized_day"}
+        out: Dict[str, Decimal] = {}
+        for it in (resp.get("fund_limit") or []):
+            if not isinstance(it, dict):
+                continue
+            key = titles.get(str(it.get("title") or "").strip().lower())
+            if key:
+                out[key] = to_decimal(it.get("equityAmount") or it.get("amount") or 0)
+        return out
 
     def balances(self) -> Dict[str, Dict[str, Decimal]]:
         # Not applicable to FYERS equities; return empty map

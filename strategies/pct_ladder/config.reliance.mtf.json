@@ -43,7 +43,7 @@
   "execution": {
     "product_type": "MTF",
     "mtf_leverage": 3,
-    "pro_levels": 3,
+    "pro_levels": 1,
     "pro_disclosed_pct": 0.10,
     "allow_btst_auto": true,
     "sync_on_start": true,

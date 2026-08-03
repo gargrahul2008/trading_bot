@@ -1,9 +1,16 @@
 """
-P&L dashboard page — strategy-level and user-level, gross (local) vs net (broker).
+P&L dashboard page — per user, two layers:
 
-Pure reader: aggregates each run's local trades.jsonl and the cached broker report
-(accounts/<user>/reports/broker_pnl.json written by the IP-bound scripts/fetch_broker_pnl.py).
-Makes no broker calls itself.
+  1. Portfolio (broker, live)  — holdings + open positions + funds, with mark-to-market
+     UNREALIZED P&L. "What I hold and what it's worth." From accounts/<user>/reports/portfolio.json
+     (scripts/fetch_broker_portfolio.py).
+  2. Bot performance           — REALIZED P&L per strategy/symbol/day from each bot's own trade
+     logs. "How the strategies are doing." From accounts/<user>/reports/bot_pnl_history.json
+     (scripts/build_bot_pnl_history.py), validated to match state.
+
+These two are additive, not a cross-check: portfolio P&L includes base holdings the bot never
+traded. A broker-vs-bot reconciliation (charges + audit) is available in the expander at the
+bottom. Pure reader — makes no broker calls itself.
 """
 from __future__ import annotations
 
@@ -35,102 +42,162 @@ def _inr(x) -> str:
     return f"₹{_f(x):,.2f}"
 
 
-def _broker_freshness(accounts_dir: Path) -> dict:
-    out = {}
+def _load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _users(accounts_dir: Path) -> list:
     if not accounts_dir.exists():
-        return out
-    for user_dir in accounts_dir.iterdir():
-        rep = user_dir / "reports" / "broker_pnl.json"
-        if rep.exists():
-            try:
-                out[user_dir.name] = json.loads(rep.read_text()).get("fetched_at")
-            except Exception:
-                out[user_dir.name] = "unreadable"
-    return out
+        return []
+    return sorted(p.name for p in accounts_dir.iterdir()
+                  if p.is_dir() and not p.name.startswith("_"))
+
+
+def _user_aggregates(accounts_dir: Path, user_filter) -> tuple:
+    """(bot_realized, unrealized, charges, mtf_interest, grid_realized) over the selected user(s)."""
+    bot_r = unreal = chg = mtf = grid = 0.0
+    for name in _users(accounts_dir):
+        if user_filter and name != user_filter:
+            continue
+        rep = accounts_dir / name / "reports"
+        bh = _load_json(rep / "bot_pnl_history.json")
+        bot_r += _f(bh.get("total_realized", 0))
+        grid += _f(bh.get("total_grid_realized", 0))   # grid's own round-trips (excl. base)
+        chg += _f(bh.get("total_charges", 0))          # trade charges from bot's full history
+        mtf += _f(bh.get("total_mtf_interest", 0))     # MTF funding interest (leveraged runs)
+        unreal += _f(_load_json(rep / "portfolio.json").get("totals", {}).get("unrealized_total", 0))
+    return bot_r, unreal, chg, mtf, grid
+
+
+def _render_portfolio(accounts_dir: Path, user_filter) -> None:
+    st.subheader("Portfolio — holdings & positions (broker, live)")
+    any_shown = False
+    for name in _users(accounts_dir):
+        if user_filter and name != user_filter:
+            continue
+        pf = _load_json(accounts_dir / name / "reports" / "portfolio.json")
+        if not pf:
+            continue
+        any_shown = True
+        st.markdown(f"**{name}**")
+        funds = pf.get("funds", {})
+        tot = pf.get("totals", {})
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Available", _inr(funds.get("available", 0)))
+        c2.metric("Utilized", _inr(funds.get("utilized", 0)))
+        c3.metric("Holdings value", _inr(tot.get("holdings_value", 0)))
+        c4.metric("Unrealized (total)", _inr(tot.get("unrealized_total", 0)))
+        if pf.get("holdings"):
+            st.caption("Holdings")
+            st.dataframe(pd.DataFrame(pf["holdings"]), use_container_width=True, hide_index=True)
+        if pf.get("positions"):
+            st.caption("Open positions")
+            st.dataframe(pd.DataFrame(pf["positions"]), use_container_width=True, hide_index=True)
+        st.caption(f"fetched: {pf.get('fetched_at', '—')}")
+    if not any_shown:
+        st.info("No portfolio snapshot yet — run `fetch_broker_portfolio.py` per account "
+                "(through its IP) to populate holdings/positions/funds.")
+
+
+def _render_bot_history(accounts_dir: Path, user_filter=None) -> None:
+    """Bot realized-P&L history from each bot's own trade logs (validated vs state)."""
+    st.subheader("Bot performance — realized P&L (from trade logs)")
+    st.caption("Realized P&L on the quantity each strategy manages — gross of charges, "
+               "independent of base holdings.")
+    any_shown = False
+    for name in _users(accounts_dir):
+        if user_filter and name != user_filter:
+            continue
+        h = _load_json(accounts_dir / name / "reports" / "bot_pnl_history.json")
+        if not h:
+            continue
+        any_shown = True
+        st.markdown(f"**{name}** — grid P&L {_inr(h.get('total_grid_realized', 0))} · "
+                    f"realized {_inr(h.get('total_realized', 0))} · "
+                    f"charges {_inr(h.get('total_charges', 0))} · "
+                    f"MTF interest {_inr(h.get('total_mtf_interest', 0))} · "
+                    f"net {_inr(h.get('net_realized', 0))}")
+        # per strategy (run) → per symbol
+        strat_rows = []
+        for run, r in (h.get("runs") or {}).items():
+            cbs = r.get("charges_by_symbol") or {}
+            mbs = r.get("mtf_interest_by_symbol") or {}
+            gbs = r.get("grid_realized_by_symbol") or {}
+            for sym, sv in (r.get("by_symbol") or {}).items():
+                real = round(_f(sv.get("realized")), 2)
+                gr = round(_f(gbs.get(sym)), 2)
+                chg = round(_f(cbs.get(sym)), 2)
+                mtf = round(_f(mbs.get(sym)), 2)
+                strat_rows.append({"Strategy": run, "Symbol": sym, "Grid RT (₹)": gr,
+                                   "Realized (₹)": real, "Charges (₹)": chg, "MTF int (₹)": mtf,
+                                   "Net (₹)": round(real - chg - mtf, 2),
+                                   "Fills": int(_f(sv.get("n_fills")))})
+        if strat_rows:
+            st.dataframe(pd.DataFrame(strat_rows), use_container_width=True, hide_index=True)
+        days = h.get("by_day", {})
+        if days:
+            dd = pd.DataFrame([{"date": d, "daily": _f(v)} for d, v in sorted(days.items())])
+            dd["cumulative"] = dd["daily"].cumsum()
+            st.line_chart(dd.set_index("date")[["cumulative"]], height=200)
+            with st.expander(f"{name} — daily P&L"):
+                st.dataframe(dd.set_index("date"), use_container_width=True)
+    if not any_shown:
+        st.info("No bot P&L history yet — run `build_bot_pnl_history.py`.")
+
+
+def _render_audit(rows, user_filter) -> None:
+    """Broker-vs-bot reconciliation (charges + realized). Additive-not-a-check for base holdings,
+    so it's tucked away — useful mainly for full-position symbols and charge totals."""
+    with st.expander("Broker reconciliation & charges (audit)"):
+        st.caption("Broker-truth realized (replayed from tradebook) vs the bot's realized, plus "
+                   "estimated charges. Expect divergence where you hold base quantity or trade "
+                   "manually — that's activity outside the bot, not an error.")
+        df = pd.DataFrame([sp.as_row() for sp in rows])
+        for c in ["local_realized", "broker_realized", "charges", "net_realized", "reconcile_delta"]:
+            if c in df:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        disp = df.rename(columns={
+            "user": "User", "strategy": "Strategy", "symbol": "Symbol",
+            "local_realized": "Bot realized", "broker_realized": "Broker realized",
+            "charges": "Charges", "reconcile_delta": "Δ (broker−bot)", "n_fills": "Fills"})
+        cols = [c for c in ["User", "Strategy", "Symbol", "Bot realized", "Broker realized",
+                            "Charges", "Δ (broker−bot)", "Fills"] if c in disp.columns]
+        st.dataframe(disp[cols], use_container_width=True, hide_index=True)
 
 
 def render_page() -> None:
-    st.title("P&L — by strategy & user")
+    st.title("P&L — by user")
     accounts_dir = REPO_ROOT / "accounts"
 
-    rows = pnl_mod.build_report(accounts_dir)
-    if not rows:
-        st.info(
-            "No account runs found under `accounts/`. Once bots have traded (and written "
-            "`state/trades.jsonl`), and `fetch_broker_pnl.py` has cached broker reports, "
-            "P&L will appear here."
-        )
+    users = _users(accounts_dir)
+    if not users:
+        st.info("No accounts found under `accounts/`.")
         return
 
-    totals = pnl_mod.user_totals(rows)
-    grand = totals.get("", {})
+    choice = st.selectbox("Select user", ["All users"] + users, index=0)
+    user_filter = None if choice == "All users" else choice
 
-    # ── grand totals ────────────────────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    net = grand.get("net_realized", Decimal(0))
-    c1.metric("Net realized (all users)", _inr(net))
-    c2.metric("Gross realized (local)", _inr(grand.get("local_realized", 0)))
-    c3.metric("Charges", _inr(grand.get("charges", 0)))
-    c4.metric("Fills", int(_f(grand.get("n_fills", 0))))
+    # ── headline ─────────────────────────────────────────────────────────────────
+    bot_r, unreal, chg, mtf, grid = _user_aggregates(accounts_dir, user_filter)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Grid round-trip P&L", _inr(grid))
+    c2.metric(f"Bot realized — {choice}", _inr(bot_r))
+    c3.metric("Charges (est.)", _inr(chg))
+    c4.metric("MTF interest (est.)", _inr(mtf))
+    c5.metric("Unrealized (holdings)", _inr(unreal))
+    c6.metric("Total P&L", _inr(bot_r - chg - mtf + unreal))
+    st.caption("**Grid round-trip P&L** = the grid's own buy↔sell cycles only (excludes selling "
+               "down base holdings). **Bot realized** = actual, incl. base-holding liquidation. "
+               "**Total P&L** = bot realized − charges − MTF interest + holdings unrealized.")
 
-    # broker data freshness / presence
-    fresh = _broker_freshness(accounts_dir)
-    has_broker = any(sp.broker_realized is not None for sp in rows)
-    if not has_broker:
-        st.warning(
-            "Showing **local gross** P&L only — no broker report found. Run "
-            "`fetch_broker_pnl.py` per account (through its IP) to add broker-truth net P&L "
-            "and charges."
-        )
-    if fresh:
-        st.caption("Broker report last fetched: " + " · ".join(f"{u}: {t}" for u, t in fresh.items()))
+    _render_portfolio(accounts_dir, user_filter)
+    _render_bot_history(accounts_dir, user_filter)
 
-    # ── per-strategy table ──────────────────────────────────────────────────────
-    df = pd.DataFrame([sp.as_row() for sp in rows])
-    num_cols = ["local_realized", "broker_realized", "charges", "net_realized",
-                "reconcile_delta", "avg_slippage_bps"]
-    for col in num_cols:
-        if col in df:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    display = df.rename(columns={
-        "user": "User", "strategy": "Strategy", "symbol": "Symbol",
-        "local_realized": "Gross (local)", "broker_realized": "Realized (broker)",
-        "charges": "Charges", "net_realized": "Net", "reconcile_delta": "Recon Δ",
-        "n_fills": "Fills", "avg_slippage_bps": "Slip bps", "last_trade_ts": "Last trade",
-    })
-    cols = ["User", "Strategy", "Symbol", "Gross (local)", "Realized (broker)", "Charges",
-            "Net", "Recon Δ", "Fills", "Slip bps", "Last trade"]
-    cols = [c for c in cols if c in display.columns]
-
-    st.subheader("Per strategy")
-    st.dataframe(display[cols], use_container_width=True, hide_index=True)
-
-    # Reconciliation flag — local vs broker realized disagree beyond a small tolerance.
-    if "reconcile_delta" in df:
-        flagged = df[df["reconcile_delta"].abs() > 1]
-        if not flagged.empty:
-            st.subheader("⚠️ Reconciliation mismatches (local vs broker)")
-            st.caption("Non-trivial gap between the bot's recorded realized P&L and the "
-                       "broker's — investigate missed/partial/phantom fills.")
-            st.dataframe(
-                display.loc[flagged.index, ["User", "Strategy", "Symbol",
-                                            "Gross (local)", "Realized (broker)", "Recon Δ"]],
-                use_container_width=True, hide_index=True,
-            )
-
-    # ── per-user subtotals ──────────────────────────────────────────────────────
-    st.subheader("Per user")
-    user_rows = []
-    for user, t in totals.items():
-        if user == "":
-            continue
-        user_rows.append({
-            "User": user,
-            "Gross (local)": _f(t["local_realized"]),
-            "Realized (broker)": _f(t["broker_realized"]),
-            "Charges": _f(t["charges"]),
-            "Net": _f(t["net_realized"]),
-            "Fills": int(_f(t["n_fills"])),
-        })
-    st.dataframe(pd.DataFrame(user_rows), use_container_width=True, hide_index=True)
+    # audit / reconciliation (de-emphasized)
+    rows = pnl_mod.build_report(accounts_dir)
+    sel_rows = rows if user_filter is None else [sp for sp in rows if sp.user == user_filter]
+    if sel_rows:
+        _render_audit(sel_rows, user_filter)

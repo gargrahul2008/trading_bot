@@ -104,16 +104,22 @@ def _read_local(run_dir: Path, sp: StrategyPnL) -> None:
 def _merge_broker(account_report: Optional[dict], sp: StrategyPnL) -> None:
     if not account_report:
         return
-    by_symbol = ((account_report.get("normalized") or {}).get("by_symbol")) or {}
+    # New schema: top-level by_symbol {broker_realized, bot_realized, discrepancy, charges,
+    # broker_net}. Fall back to the old "normalized.by_symbol" shape.
+    by_symbol = account_report.get("by_symbol") or ((account_report.get("normalized") or {}).get("by_symbol")) or {}
     row = by_symbol.get(sp.symbol)
     if not row:
         return
     if "broker_realized" in row:
         sp.broker_realized = _dec(row["broker_realized"])
         sp.reconcile_delta = sp.broker_realized - sp.local_realized
-    if "charges_apportioned" in row:
+    if "charges" in row:
+        sp.charges = _dec(row["charges"])
+    elif "charges_apportioned" in row:
         sp.charges = _dec(row["charges_apportioned"])
-    if "net_realized" in row:
+    if "broker_net" in row:
+        sp.net_realized = _dec(row["broker_net"])
+    elif "net_realized" in row:
         sp.net_realized = _dec(row["net_realized"])
 
 
