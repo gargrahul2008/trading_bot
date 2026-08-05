@@ -5,7 +5,8 @@ from typing import Any, Optional
 
 @dataclass
 class RejectAction:
-    kind: str  # 'REDUCE_QTY' | 'AUTH_REQUIRED' | 'MARGIN_SHORTFALL' | 'NOT_RETRYABLE'
+    kind: str  # 'REDUCE_QTY' | 'AUTH_REQUIRED' | 'MARGIN_SHORTFALL' | 'CIRCUIT_LIMIT'
+               # | 'SESSION_CLOSED' | 'DQ_NOT_ALLOWED' | 'NOT_RETRYABLE'
     max_qty: Optional[int] = None
     reason: str = ""
     raw_message: str = ""
@@ -16,6 +17,19 @@ _MARGIN_PATTERNS = [
 ]
 _CIRCUIT_PATTERNS = [
     r"circuit\s+limit", r"upper\s*circuit", r"lower\s*circuit", r"price\s+band",
+]
+# CAS (Closing Auction Session) for F&O stocks: after ~15:15 the continuous market
+# closes and normal limit orders are rejected ("not allowed to trade in this market");
+# in the auction window disclosed-qty (DQ / iceberg) orders are rejected. Both are
+# session-window rejects that only clear next session — never worth re-probing on a
+# short timer, so classify them for a long back-off.
+_SESSION_PATTERNS = [
+    r"not\s+allowed\s+to\s+trade\s+in\s+this\s+market", r"\b16387\b",
+    r"market\s+is\s+closed", r"trading\s+is\s+not\s+allowed", r"session\s+is\s+closed",
+]
+_DQ_PATTERNS = [
+    r"\b16439\b", r"dq\s+orders?\s+are\s+not\s+allowed", r"disclosed\s+q",
+    r"iceberg.*not\s+allowed",
 ]
 
 _AUTH_PATTERNS = [
@@ -60,6 +74,16 @@ def parse_reject(resp_or_msg: Any) -> RejectAction:
     if any(re.search(p, low) for p in _CIRCUIT_PATTERNS):
         # Price band is fixed for the whole trading day — a short retry timer is futile.
         return RejectAction(kind="CIRCUIT_LIMIT", reason="Order outside daily circuit/price band", raw_message=msg)
+
+    if any(re.search(p, low) for p in _DQ_PATTERNS):
+        # Disclosed-qty not accepted in this session (e.g. CAS auction window) — the order
+        # would go through without disclosed qty, but it won't clear on a short timer here.
+        return RejectAction(kind="DQ_NOT_ALLOWED", reason="Disclosed-qty order not allowed in this session", raw_message=msg)
+
+    if any(re.search(p, low) for p in _SESSION_PATTERNS):
+        # Security not tradable in this market/session right now (e.g. CAS closes the
+        # continuous market ~15:15 for F&O names). Persists for the rest of the session.
+        return RejectAction(kind="SESSION_CLOSED", reason="Security not tradable now (session/CAS)", raw_message=msg)
 
     if any(re.search(p, low) for p in _QTY_PATTERNS):
         # try to infer a max qty from message numbers

@@ -56,6 +56,7 @@
     "regular_market_open": "09:15",
     "market_close": "15:30",
     "eod_cancel_time": "15:29:30",
+    "cas_freeze_time": "15:15:00",
     "cancel_all_open_orders": true,
     "price_tick": 0.1,
     "equity_session_guard": true

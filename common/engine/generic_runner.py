@@ -8,6 +8,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List
 
 from common.broker.interfaces import Broker, PlaceOrderRequest, to_decimal, OrderTerminal
+from common.broker.reject_parser import parse_reject
 from common.engine.state import GlobalState
 from common.engine.strategy_base import ReactiveStrategy, ManagedOrderStrategy, OrderIntent
 from common.engine.execution import OrderExecutor, ExecutionConfig
@@ -52,6 +53,7 @@ class GenericRunner:
                  regular_market_open: str | None = None,
                  preopen_pause_start: str | None = None,
                  session_guard: bool = False,
+                 cas_freeze_time: str | None = None,
                  holidays_file: str | None = None):
         self.broker = broker
         self.state = state
@@ -76,6 +78,12 @@ class GenericRunner:
         # NSE trading hours / on weekends / on holidays. Off by default → crypto unaffected.
         self.session_guard = bool(session_guard)
         self._holidays = load_holidays(holidays_file) if self.session_guard else set()
+        # CAS (Closing Auction Session) freeze — opt-in, for F&O symbols. After this IST time
+        # (~15:15) the continuous market closes and new/refreshed orders are rejected
+        # ("not allowed to trade", DQ-not-allowed). When set, the grid stops placing/refreshing
+        # at this time and leaves resting orders to ride the closing auction. Off by default
+        # (crypto / non-F&O equity) → no behaviour change.
+        self.cas_freeze_t = parse_hhmmss(cas_freeze_time) if cas_freeze_time else None
         base_dir = os.path.dirname(os.path.abspath(trades_path)) or "."
         self._pnl_writer = PnLWriter(
             csv_path=os.path.join(base_dir, "pnl_points.csv"),
@@ -112,6 +120,17 @@ class GenericRunner:
         if not is_trading_day(now.date(), self._holidays):
             return True
         return not (open_dt <= now < close_dt)
+
+    def _cas_frozen(self, now) -> bool:
+        """True once we're at/after the CAS freeze time (F&O continuous close, ~15:15 IST).
+        Past this point the grid must stop placing/refreshing orders (they'd be rejected) and
+        let any resting orders ride the closing auction. Always False when cas_freeze_time is
+        unset (crypto / non-F&O), so behaviour there is unchanged. `now` is market-tz local."""
+        if self.cas_freeze_t is None:
+            return False
+        freeze_dt = now.replace(hour=self.cas_freeze_t.hour, minute=self.cas_freeze_t.minute,
+                                second=self.cas_freeze_t.second, microsecond=0)
+        return now >= freeze_dt
 
     def _append_jsonl(self, path: str, rec: Dict[str, Any]) -> None:
         try:
@@ -2483,6 +2502,7 @@ class GenericRunner:
 
         # --- Single orderbook fetch for this tick ---
         open_oids: set = set()
+        reject_msgs: dict = {}   # oid -> reject message (status=5), for terminal-reject cooldown
         try:
             ob = self.broker.orderbook()
             for o in (ob.get("orderBook") or []):
@@ -2495,6 +2515,8 @@ class GenericRunner:
                 is_fyers_terminal = isinstance(status, int) and status in (1, 2, 5)
                 if oid and not is_fyers_terminal:
                     open_oids.add(oid)
+                elif oid and status == 5:
+                    reject_msgs[oid] = str(o.get("message") or o.get("msg") or "")
         except Exception as e:
             LOG.warning("PRO %s: orderbook fetch failed: %s — skipping tick", sym, e)
             return
@@ -2507,6 +2529,7 @@ class GenericRunner:
             nonlocal filled_buy, filled_sell
             if oid in open_oids:
                 return False  # still open — no API call needed
+            _lvl_px = self._pro_oid_price.get(oid, D0)  # level price for reject cooldown (pre-removal)
             # Not in open orders → terminal: fetch details
             result = self._check_pro_fill(sym, oid)
             self._remove_pro_oid(sym, side, oid)
@@ -2629,7 +2652,24 @@ class GenericRunner:
                         self.state.extras.pop(_ck, None)
                 return True
             else:
-                LOG.info("PRO %s %s terminal (no fill) oid=%s", sym, side, oid)
+                # Terminal without a fill. If the exchange REJECTED it (status=5), classify the
+                # reason and cool this level down so the smart-rebuild doesn't re-place-and-reject
+                # every ~5s. Without this, a persistent async reject (CAS "not allowed to trade",
+                # DQ-not-allowed, margin, etc.) floods the exchange with hundreds of orders/hour.
+                # This mirrors the synchronous placement-failure cooldown at _record_result.
+                _msg = reject_msgs.get(oid)
+                if _msg and _lvl_px > D0:
+                    _act = parse_reject(_msg)
+                    _long = _act.kind in ("MARGIN_SHORTFALL", "CIRCUIT_LIMIT", "SESSION_CLOSED",
+                                          "DQ_NOT_ALLOWED", "AUTH_REQUIRED", "NOT_RETRYABLE")
+                    _secs = 3600 if _long else 300
+                    _until = (utcnow() + dt.timedelta(seconds=_secs)).isoformat()
+                    self.state.extras[f"_pro_reject_cooldown_{sym}_{side}_{_lvl_px}"] = _until
+                    self.state.extras[f"_last_reject_kind_{sym}"] = _act.kind
+                    LOG.warning("PRO %s %s terminal REJECT oid=%s (%s) — cooldown %dmin: %s",
+                                sym, side, oid, _act.kind, _secs // 60, _msg[:90])
+                else:
+                    LOG.info("PRO %s %s terminal (no fill) oid=%s", sym, side, oid)
                 return False
 
         filled_buy = False
@@ -2817,8 +2857,19 @@ class GenericRunner:
                 time.sleep(max(int(self.closed_poll_seconds), 30))
                 continue
 
-            # EOD cancel: pull all proactive orders off the book
-            if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today:
+            # CAS freeze (F&O): once the continuous market closes (~15:15), stop placing/
+            # refreshing — the exchange rejects new orders and the grid has no continuous market
+            # to trade. Resting orders are LEFT on the book to ride the closing auction, and the
+            # manual EOD cancel is skipped so we don't yank an order the 15:30 auction might match
+            # (the exchange auto-cancels unfilled DAY orders after the auction).
+            cas_frozen = self._cas_frozen(now)
+            if cas_frozen and self.state.extras.get("_cas_frozen_logged_date") != today:
+                self.state.extras["_cas_frozen_logged_date"] = today
+                LOG.warning("PRO CAS freeze at %s — stop placing; resting orders left for the closing auction",
+                            self.cas_freeze_t.strftime("%H:%M:%S"))
+
+            # EOD cancel: pull all proactive orders off the book (skipped under CAS freeze).
+            if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today and not cas_frozen:
                 for sym in self.symbols:
                     self._cancel_all_pro_orders(sym)
                 n = self.cancel_open_orders(cancel_all=self.cancel_all_open_orders)
@@ -2827,7 +2878,7 @@ class GenericRunner:
                 self.state.halt_reason = "EOD_CANCEL"
                 LOG.warning("PRO EOD cancel done: cancelled=%d", n)
 
-            allow_new = (now >= open_dt) and (now < eod_cancel_dt)
+            allow_new = (now >= open_dt) and (now < eod_cancel_dt) and not cas_frozen
 
             # Pre-open pause: NSE blocks order entry/cancel between pause_start and regular open.
             # Only active when market_open < regular_market_open (i.e. pre-open trading is enabled).

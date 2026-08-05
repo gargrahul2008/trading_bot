@@ -202,6 +202,7 @@ def main() -> None:
         regular_market_open=str(ex.get("regular_market_open") or ("09:15" if is_india else "")) or None,
         preopen_pause_start=str(ex.get("preopen_pause_start") or ("09:07" if is_india else "")) or None,
         session_guard=bool(ex.get("equity_session_guard") or False),
+        cas_freeze_time=(str(ex.get("cas_freeze_time")) if ex.get("cas_freeze_time") else None),
         holidays_file=(str(ex.get("holidays_file")) if ex.get("holidays_file") else None),
     )
 
