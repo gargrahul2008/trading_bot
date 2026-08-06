@@ -54,6 +54,7 @@ class GenericRunner:
                  preopen_pause_start: str | None = None,
                  session_guard: bool = False,
                  cas_freeze_time: str | None = None,
+                 cas_auction_time: str | None = None,
                  holidays_file: str | None = None):
         self.broker = broker
         self.state = state
@@ -78,12 +79,18 @@ class GenericRunner:
         # NSE trading hours / on weekends / on holidays. Off by default → crypto unaffected.
         self.session_guard = bool(session_guard)
         self._holidays = load_holidays(holidays_file) if self.session_guard else set()
-        # CAS (Closing Auction Session) freeze — opt-in, for F&O symbols. After this IST time
-        # (~15:15) the continuous market closes and new/refreshed orders are rejected
-        # ("not allowed to trade", DQ-not-allowed). When set, the grid stops placing/refreshing
-        # at this time and leaves resting orders to ride the closing auction. Off by default
-        # (crypto / non-F&O equity) → no behaviour change.
+        # CAS (Closing Auction Session) handling — opt-in, for F&O symbols. At cas_freeze_time
+        # (~15:15) the continuous market closes: the exchange cancels our resting disclosed-qty
+        # (DQ) orders and new/refreshed continuous orders are rejected, so the continuous grid
+        # stops. A cancelled order does NOT carry into the auction, so at cas_auction_time
+        # (~15:20, the auction order-entry window) we place the grid's MISSING levels once,
+        # WITHOUT DQ (DQ orders are rejected in the auction), and leave them to match at the
+        # 15:30 close. "Place missing" means non-F&O names (orders still resting) get nothing —
+        # only the F&O names the exchange cancelled are re-placed. Off by default → crypto /
+        # non-F&O equity unchanged.
         self.cas_freeze_t = parse_hhmmss(cas_freeze_time) if cas_freeze_time else None
+        self.cas_auction_t = parse_hhmmss(cas_auction_time) if cas_auction_time else None
+        self._cas_auction_active = False   # set during the auction pass → _disclosed() drops DQ
         base_dir = os.path.dirname(os.path.abspath(trades_path)) or "."
         self._pnl_writer = PnLWriter(
             csv_path=os.path.join(base_dir, "pnl_points.csv"),
@@ -131,6 +138,17 @@ class GenericRunner:
         freeze_dt = now.replace(hour=self.cas_freeze_t.hour, minute=self.cas_freeze_t.minute,
                                 second=self.cas_freeze_t.second, microsecond=0)
         return now >= freeze_dt
+
+    def _in_cas_auction(self, now) -> bool:
+        """True once we're at/after the CAS auction order-entry time (~15:20 IST). In this window
+        we re-place the grid's missing levels without disclosed qty so F&O names participate in
+        the closing auction. Requires both cas_freeze_time and cas_auction_time set. `now` is
+        market-tz local."""
+        if self.cas_freeze_t is None or self.cas_auction_t is None:
+            return False
+        auc_dt = now.replace(hour=self.cas_auction_t.hour, minute=self.cas_auction_t.minute,
+                             second=self.cas_auction_t.second, microsecond=0)
+        return now >= auc_dt
 
     def _append_jsonl(self, path: str, rec: Dict[str, Any]) -> None:
         try:
@@ -1756,7 +1774,9 @@ class GenericRunner:
                 LOG.info("PRO %s pre-open session: disclosed qty suppressed until %s", sym, self.regular_open_t)
 
         def _disclosed(qty: Decimal) -> int:
-            if _disc_pct <= D0 or _in_preopen:
+            # DQ is suppressed in the morning pre-open and in the CAS closing auction — the
+            # exchange rejects disclosed-qty orders in both auction windows.
+            if _disc_pct <= D0 or _in_preopen or self._cas_auction_active:
                 return 0
             raw = qty * _disc_pct
             if _lot > 1:
@@ -2857,16 +2877,22 @@ class GenericRunner:
                 time.sleep(max(int(self.closed_poll_seconds), 30))
                 continue
 
-            # CAS freeze (F&O): once the continuous market closes (~15:15), stop placing/
-            # refreshing — the exchange rejects new orders and the grid has no continuous market
-            # to trade. Resting orders are LEFT on the book to ride the closing auction, and the
-            # manual EOD cancel is skipped so we don't yank an order the 15:30 auction might match
-            # (the exchange auto-cancels unfilled DAY orders after the auction).
+            # CAS (F&O): at cas_freeze_time (~15:15) the continuous market closes — the exchange
+            # cancels our resting DQ orders and rejects new continuous orders, so stop the
+            # continuous grid. At cas_auction_time (~15:20, the auction entry window) do ONE
+            # missing-levels pass without DQ so F&O names get an order into the closing auction
+            # (a cancelled order does not carry over on its own). Then leave everything to match
+            # at 15:30 — the manual EOD cancel is skipped so we don't yank those orders.
             cas_frozen = self._cas_frozen(now)
+            cas_auction = self._in_cas_auction(now)
+            cas_auction_pending = cas_auction and self.state.extras.get("_cas_auction_placed_date") != today
+            self._cas_auction_active = cas_auction   # _disclosed() drops DQ during the auction
             if cas_frozen and self.state.extras.get("_cas_frozen_logged_date") != today:
                 self.state.extras["_cas_frozen_logged_date"] = today
-                LOG.warning("PRO CAS freeze at %s — stop placing; resting orders left for the closing auction",
-                            self.cas_freeze_t.strftime("%H:%M:%S"))
+                LOG.warning("PRO CAS freeze at %s — continuous grid stopped; will re-place missing "
+                            "levels without DQ into the closing auction at %s",
+                            self.cas_freeze_t.strftime("%H:%M:%S"),
+                            self.cas_auction_t.strftime("%H:%M:%S") if self.cas_auction_t else "-")
 
             # EOD cancel: pull all proactive orders off the book (skipped under CAS freeze).
             if now >= eod_cancel_dt and self.state.last_eod_cancel_date != today and not cas_frozen:
@@ -2878,7 +2904,10 @@ class GenericRunner:
                 self.state.halt_reason = "EOD_CANCEL"
                 LOG.warning("PRO EOD cancel done: cancelled=%d", n)
 
+            # Continuous placement stops at the freeze; re-enabled for the single auction pass.
             allow_new = (now >= open_dt) and (now < eod_cancel_dt) and not cas_frozen
+            if cas_auction_pending:
+                allow_new = True
 
             # Pre-open pause: NSE blocks order entry/cancel between pause_start and regular open.
             # Only active when market_open < regular_market_open (i.e. pre-open trading is enabled).
@@ -2913,6 +2942,13 @@ class GenericRunner:
                         # Safety net: place any still-missing orders (drift re-center, startup, etc.)
                         if allow_new:
                             self._place_proactive_orders(sym, strategy, price)
+
+                    # CAS auction: after this single missing-levels pass, mark done so we don't
+                    # keep placing/churning — the no-DQ orders now rest for the 15:30 close match.
+                    if cas_auction_pending:
+                        self.state.extras["_cas_auction_placed_date"] = today
+                        LOG.warning("PRO CAS auction pass done — missing grid levels placed without DQ "
+                                    "for the closing auction; leaving them to match at close")
 
                 # --- Status log ---
                 parts = []
