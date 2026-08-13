@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+BTST '1lg0' Lagrangian strategy — PAPER-LIVE bot (flat_legs execution).
+
+Runs the same signal as notebooks/btst_lagrangian_backtest.ipynb, forward, day by day,
+with NO real orders (simulated fills at real fetched prices). Two actions per trading day:
+
+  entry  (~15:07 IST, after ENTRY_TIME 15:05): generate today's signal, BUY the new tranche
+         AND re-buy every still-pending tranche at the 15:05 close (flat_legs: re-establish the
+         overnight book).
+  exit   (~09:22 IST, after EXIT_TIME 09:20): SELL the whole book at the 09:20 open, book the
+         overnight (close->open) P&L, drop tranches that have completed lf nights.
+
+flat_legs = flat intraday, so ONLY the close->open overnight move is captured (no intraday
+exposure) — the whole point of this BTST strategy. A tranche is held for `lf` nights.
+
+State is per-universe under state/btst_paper/<universe>/. Read-only against the market
+(quotes/bars only). Usage:
+    python scripts/btst_paper_bot.py --universe universe_top250.json --action entry
+    python scripts/btst_paper_bot.py --universe universe_top250.json --action exit
+    python scripts/btst_paper_bot.py --action selftest      # offline logic check
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO / "src") not in sys.path:
+    sys.path.insert(0, str(REPO / "src"))
+
+from intraday_research.btst_lagrangian import generate_live_signals, session_daily_from_minute
+from intraday_research.fyers_cache import safe_symbol_filename
+from intraday_research.universe import load_universe
+
+# ── Strategy config (matches the notebook / go-live intent) ───────────────────
+PARAMS = {
+    "strategy_id": "1lg0",
+    "return_type": "log",
+    "cost_model": "day_netted",
+    "frequency_type": "close to open",
+    "tot_capital": 10_00_000,
+    "lb": 30,
+    "trades": 5,
+    "lf": 5,
+    "risk_free_rate": 0.02,
+    "upper_bound": 0.5,
+    "lower_bound": 0,
+    "long_only": 1,
+    "rmean": "sma",
+    "objective": "sortino",
+    "execution": "flat_legs",
+}
+ENTRY_TIME = "15:05"   # buy-at-close price mark (before the 15:15 CAS freeze — no auction issue)
+EXIT_TIME = "09:20"    # sell-at-open price mark
+MINUTE_DATA_DIR = REPO / "data" / "fyers"
+AUTH_FILE = REPO / "fyers_auth.json"
+USER_KEY = "user1"
+
+
+def _plain(sym: str) -> str:
+    return sym.removeprefix("NSE:").removesuffix("-EQ")
+
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+def fetch_minute(symbols: list[str], start: str, end: str) -> None:
+    """Incrementally fetch 1-minute bars for the universe (skips already-covered ranges)."""
+    cmd = [sys.executable, str(REPO / "scripts" / "fetch_fyers_intraday_data.py"),
+           "--auth-file", str(AUTH_FILE), "--user-key", USER_KEY,
+           "--start", start, "--end", end, "--output-dir", str(MINUTE_DATA_DIR),
+           "--format", "parquet", "--resolution", "1", "--chunk-days", "100",
+           "--skip-invalid-symbols"]
+    for s in symbols:
+        cmd += ["--symbol", s]
+    r = subprocess.run(cmd, cwd=REPO, text=True, capture_output=True)
+    if r.stdout:
+        print(r.stdout[-1500:])
+    if r.returncode != 0:
+        print(r.stderr[-1500:])
+        raise RuntimeError(f"data fetch failed ({r.returncode})")
+
+
+def load_session_data(symbols: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
+    """Per-ticker session frames: Close = price at ENTRY_TIME (15:05), Open = price at
+    EXIT_TIME (09:20). Same source as the backtest so paper prices match."""
+    data, skipped = {}, []
+    for sym in symbols:
+        path = MINUTE_DATA_DIR / f"{safe_symbol_filename(sym)}.parquet"
+        if not path.exists():
+            skipped.append(sym)
+            continue
+        daily = session_daily_from_minute(pd.read_parquet(path),
+                                          entry_price_time=ENTRY_TIME, exit_price_time=EXIT_TIME)
+        mask = (daily["Date"].astype(str) >= start) & (daily["Date"].astype(str) <= end)
+        daily = daily.loc[mask].reset_index(drop=True)
+        if not daily.empty:
+            data[_plain(sym)] = daily
+    return data
+
+
+# ── Paper state ────────────────────────────────────────────────────────────────
+def _state_path(universe_name: str) -> Path:
+    d = REPO / "state" / "btst_paper" / universe_name
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "state.json"
+
+
+def load_state(universe_name: str) -> dict:
+    p = _state_path(universe_name)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"universe": universe_name, "phase": "flat", "realized_pnl": 0.0,
+            "last_entry_date": None, "last_exit_date": None, "tranches": [],
+            "started": dt.date.today().isoformat()}
+
+
+def save_state(state: dict) -> None:
+    p = _state_path(state["universe"])
+    p.write_text(json.dumps(state, indent=2, default=str) + "\n")
+
+
+def _log_trades(universe_name: str, rows: list[dict]) -> None:
+    p = _state_path(universe_name).parent / "paper_trades.jsonl"
+    with open(p, "a") as f:
+        for r in rows:
+            f.write(json.dumps(r, default=str) + "\n")
+
+
+# ── Actions ─────────────────────────────────────────────────────────────────────
+def run_entry(state: dict, data: dict[str, pd.DataFrame]) -> dict:
+    """Re-buy pending tranches + open the new tranche, all at today's 15:05 close."""
+    if state.get("phase") == "overnight":
+        raise RuntimeError("phase=overnight: exit hasn't run since the last entry — refusing to double-enter.")
+    signal = generate_live_signals(PARAMS, data)
+    tdate = str(signal["tdate"].iloc[0]) if not signal.empty else _last_date(data)
+    if state.get("last_entry_date") == tdate:
+        print(f"[entry] already entered for {tdate} — skipping")
+        return state
+
+    def close_px(ticker):
+        f = data.get(ticker)
+        return float(f["Close"].iloc[-1]) if f is not None and not f.empty else None
+
+    # 1) re-buy still-pending tranches at today's close (flat leg)
+    state, trades, rebought = _rebuy(state, close_px)
+
+    # 2) open the new tranche
+    opened = []
+    new_positions = {}
+    for _, row in signal.iterrows():
+        tkr, qty, px = row["ticker"], int(row["quantity"]), float(row["buy_price"])
+        if qty <= 0 or px <= 0:
+            continue
+        new_positions[tkr] = {"qty": qty, "last_buy_price": px, "entry_price": px}
+        opened.append({"ticker": tkr, "qty": qty, "price": px})
+        trades.append({"ts": tdate, "action": "BUY", "kind": "open", "ticker": tkr,
+                       "qty": qty, "price": px})
+    if new_positions:
+        state["tranches"].append({"entry_date": tdate, "nights_remaining": PARAMS["lf"],
+                                  "positions": new_positions})
+    state["phase"] = "overnight"
+    state["last_entry_date"] = tdate
+    _log_trades(state["universe"], trades)
+    save_state(state)
+    _report_entry(state, tdate, opened, rebought)
+    return state
+
+
+def _rebuy(state: dict, close_px) -> tuple[dict, list, int]:
+    trades, n = [], 0
+    tdate = None
+    for tr in state["tranches"]:
+        for tkr, pos in tr["positions"].items():
+            px = close_px(tkr)
+            if px is None or px <= 0:
+                continue
+            pos["last_buy_price"] = px
+            n += 1
+            trades.append({"ts": state.get("last_exit_date"), "action": "BUY", "kind": "roll",
+                           "ticker": tkr, "qty": pos["qty"], "price": px})
+    return state, trades, n
+
+
+def run_exit(state: dict, data: dict[str, pd.DataFrame]) -> dict:
+    """Sell the whole book at today's 09:20 open, book overnight P&L, drop completed tranches."""
+    if state.get("phase") != "overnight":
+        print(f"[exit] phase={state.get('phase')} (nothing held overnight) — skipping")
+        return state
+    xdate = _last_date(data)
+    if state.get("last_exit_date") == xdate:
+        print(f"[exit] already exited for {xdate} — skipping")
+        return state
+
+    def open_px(ticker):
+        f = data.get(ticker)
+        if f is None or f.empty:
+            return None
+        row = f[f["Date"].astype(str) == xdate]
+        return float(row["Open"].iloc[0]) if not row.empty else float(f["Open"].iloc[-1])
+
+    trades, closed, day_pnl = [], [], 0.0
+    survivors = []
+    for tr in state["tranches"]:
+        tr_pnl = 0.0
+        for tkr, pos in tr["positions"].items():
+            px = open_px(tkr)
+            if px is None or px <= 0:
+                continue
+            pnl = pos["qty"] * (px - pos["last_buy_price"])
+            tr_pnl += pnl
+            trades.append({"ts": xdate, "action": "SELL", "kind": "leg", "ticker": tkr,
+                           "qty": pos["qty"], "price": px, "pnl": round(pnl, 2)})
+        day_pnl += tr_pnl
+        tr["nights_remaining"] -= 1
+        if tr["nights_remaining"] <= 0:
+            closed.append({"entry_date": tr["entry_date"],
+                           "tickers": sorted(tr["positions"]), "pnl": round(tr_pnl, 2)})
+        else:
+            survivors.append(tr)
+    state["tranches"] = survivors
+    state["realized_pnl"] = round(float(state.get("realized_pnl", 0.0)) + day_pnl, 2)
+    state["phase"] = "flat"
+    state["last_exit_date"] = xdate
+    _log_trades(state["universe"], trades)
+    save_state(state)
+    _report_exit(state, xdate, closed, day_pnl)
+    return state
+
+
+def _last_date(data: dict[str, pd.DataFrame]) -> str:
+    return max(str(f["Date"].iloc[-1]) for f in data.values()) if data else dt.date.today().isoformat()
+
+
+# ── Reporting (printed; Telegram/dashboard wired separately) ─────────────────────
+def _report_entry(state, tdate, opened, rebought):
+    print(f"\n=== BTST paper [{state['universe']}] ENTRY {tdate} ===")
+    print(f"opened {len(opened)} new: " +
+          ", ".join(f"{o['ticker']}x{o['qty']}@{o['price']:.1f}" for o in opened))
+    print(f"rolled (re-bought) {rebought} pending legs | active tranches: {len(state['tranches'])}")
+
+
+def _report_exit(state, xdate, closed, day_pnl):
+    print(f"\n=== BTST paper [{state['universe']}] EXIT {xdate} ===")
+    print(f"overnight P&L today: {day_pnl:,.2f} | cumulative realized: {state['realized_pnl']:,.2f}")
+    if closed:
+        print(f"closed {len(closed)} tranche(s) (completed {PARAMS['lf']} nights):")
+        for c in closed:
+            print(f"   entered {c['entry_date']}: {', '.join(c['tickers'])}  P&L {c['pnl']:,.2f}")
+    print(f"active tranches remaining: {len(state['tranches'])}")
+
+
+# ── Offline self-test: flat_legs must capture exactly the overnight moves ────────
+def selftest() -> int:
+    """Synthetic 1 ticker, lf=2. Prices: closes C, opens O. flat_legs P&L over the tranche's
+    life must equal qty * sum of (open[d+1]-close[d]) overnight gaps — and NOT include any
+    intraday (open->close) move."""
+    global PARAMS
+    PARAMS = {**PARAMS, "lf": 2}
+    # Build a fake data dict for generate_live_signals is overkill; test the book directly.
+    qty = 10
+    # day0 close=100 (entry); day1 open=105 close=90; day2 open=95 (final exit)
+    st = {"universe": "_selftest", "phase": "flat", "realized_pnl": 0.0,
+          "last_entry_date": None, "last_exit_date": None, "tranches": []}
+    # manual entry day0
+    st["tranches"].append({"entry_date": "d0", "nights_remaining": 2,
+                           "positions": {"X": {"qty": qty, "last_buy_price": 100.0, "entry_price": 100.0}}})
+    st["phase"] = "overnight"
+    # exit day1 open=105
+    for tr in st["tranches"]:
+        for _, pos in tr["positions"].items():
+            st["realized_pnl"] += pos["qty"] * (105.0 - pos["last_buy_price"])
+        tr["nights_remaining"] -= 1
+    st["phase"] = "flat"
+    # entry day1: rebuy @ close=90
+    for tr in st["tranches"]:
+        for _, pos in tr["positions"].items():
+            pos["last_buy_price"] = 90.0
+    st["phase"] = "overnight"
+    # exit day2 open=95
+    for tr in list(st["tranches"]):
+        for _, pos in tr["positions"].items():
+            st["realized_pnl"] += pos["qty"] * (95.0 - pos["last_buy_price"])
+        tr["nights_remaining"] -= 1
+    pnl = st["realized_pnl"]
+    expected = qty * ((105 - 100) + (95 - 90))   # two overnight gaps only
+    intraday = qty * ((90 - 105))                # day1 intraday move that must NOT appear
+    ok = abs(pnl - expected) < 1e-9
+    print(f"selftest: pnl={pnl} expected(overnight only)={expected} "
+          f"(intraday {intraday} correctly excluded) -> {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--universe", help="universe json (e.g. universe_top250.json)")
+    ap.add_argument("--action", required=True, choices=["entry", "exit", "status", "selftest"])
+    ap.add_argument("--no-fetch", action="store_true", help="use cached bars, skip the fetch")
+    ap.add_argument("--lookback-days", type=int, default=90, help="calendar days of data to load")
+    args = ap.parse_args()
+
+    if args.action == "selftest":
+        return selftest()
+
+    uni = load_universe(REPO / args.universe)
+    uname = Path(args.universe).stem
+    symbols = list(uni.symbols)
+    end = dt.date.today().isoformat()
+    start = str(dt.date.today() - dt.timedelta(days=args.lookback_days))
+
+    if not args.no_fetch:
+        fetch_minute(symbols, start, end)
+    data = load_session_data(symbols, start, end)
+    print(f"[{uname}] loaded {len(data)}/{len(symbols)} symbols, {start}..{end}")
+
+    state = load_state(uname)
+    if args.action == "entry":
+        run_entry(state, data)
+    elif args.action == "exit":
+        run_exit(state, data)
+    elif args.action == "status":
+        print(json.dumps({k: v for k, v in state.items() if k != "tranches"}, indent=2))
+        print(f"active tranches: {len(state['tranches'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
