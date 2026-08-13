@@ -71,3 +71,6 @@ data/
 
 # Backtest/live artifacts (generated output — not source)
 artifacts/
+
+# BTST paper-bot runtime state
+state/btst_paper/
