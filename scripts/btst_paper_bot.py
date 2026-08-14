@@ -70,7 +70,9 @@ AUTH_FILE = REPO / "fyers_auth.json"
 USER_KEY = "user1"
 
 
-TELEGRAM_SECRETS = REPO / "strategies" / "pct_ladder" / "secrets" / "telegram.json"
+# Dedicated BTST recipients (only the owner) — NOT the shared telegram.json the other bots use.
+TELEGRAM_SECRETS = REPO / "strategies" / "pct_ladder" / "secrets" / "telegram_btst.json"
+TELEGRAM_SENT_LOG = REPO / "state" / "btst_paper" / "telegram_sent.jsonl"
 NOTIFY = True   # set False by --no-telegram
 
 
@@ -94,8 +96,14 @@ def _send_telegram(text: str) -> None:
     for cid in chats:
         data = urllib.parse.urlencode({"chat_id": cid, "text": text}).encode()
         try:
-            urllib.request.urlopen(urllib.request.Request(
+            resp = urllib.request.urlopen(urllib.request.Request(
                 f"https://api.telegram.org/bot{token}/sendMessage", data=data, method="POST"), timeout=10)
+            mid = (json.loads(resp.read()).get("result") or {}).get("message_id")
+            if mid is not None:   # log id so any later cleanup is exact, never a range scan
+                TELEGRAM_SENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+                with open(TELEGRAM_SENT_LOG, "a") as f:
+                    f.write(json.dumps({"chat_id": cid, "message_id": mid,
+                                        "ts": dt.datetime.now(dt.timezone.utc).isoformat()}) + "\n")
         except Exception as e:
             print(f"[telegram] send failed: {e}", file=sys.stderr)
 
