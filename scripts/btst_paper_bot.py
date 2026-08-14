@@ -71,10 +71,10 @@ USER_KEY = "user1"
 
 
 # RECIPIENT POLICY (owner's standing rule): the second recipient in the SHARED telegram.json
-# (chat …3258) receives CRYPTO/MEXC info ONLY. Everything non-crypto (this BTST bot, equity,
-# etc.) goes to the owner's chat (…2650) ONLY — never …3258 — unless the owner explicitly asks
-# for a specific message to go there. Hence BTST uses this dedicated owner-only secrets file,
-# NOT the shared telegram.json.
+# (chat …3258) receives LIVE CRYPTO/MEXC info ONLY — NOT paper/backtest crypto, and NOT any
+# non-crypto info. Everything else (this BTST bot, equity, paper/backtest crypto, etc.) goes to
+# the owner's chat (…2650) ONLY — never …3258 — unless the owner explicitly asks for a specific
+# message to go there. Hence BTST uses this dedicated owner-only secrets file, not the shared one.
 TELEGRAM_SECRETS = REPO / "strategies" / "pct_ladder" / "secrets" / "telegram_btst.json"
 TELEGRAM_SENT_LOG = REPO / "state" / "btst_paper" / "telegram_sent.jsonl"
 NOTIFY = True   # set False by --no-telegram

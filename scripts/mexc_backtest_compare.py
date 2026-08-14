@@ -330,6 +330,9 @@ def format_report(since_date: str, end_date: str, days: float,
 
 
 def send_telegram(text: str, secrets_path: str) -> None:
+    # RECIPIENT POLICY: this is a live-vs-BACKTEST (paper) report. It must NOT go to …3258
+    # (that chat gets LIVE crypto only). If this cron is ever re-enabled, pass an owner-only
+    # secrets file (…2650), NOT the shared telegram.json. See feedback-telegram-recipient-policy.
     try:
         import requests
         with open(secrets_path) as f:

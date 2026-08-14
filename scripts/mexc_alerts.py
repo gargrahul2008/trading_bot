@@ -31,10 +31,11 @@ from typing import Any
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STATE_DIR = os.path.join(REPO_ROOT, "strategies", "pct_ladder", "state")
 LOG_DIR   = os.path.join(REPO_ROOT, "logs")
-# SHARED telegram.json has 2 recipients: owner (…2650) + a crypto-only recipient (…3258).
-# RECIPIENT POLICY: this shared file is for CRYPTO/MEXC messages only. Any NON-crypto sender
-# (equity, BTST, etc.) must use a dedicated owner-only secrets file (e.g. telegram_btst.json),
-# NOT this one — …3258 must never receive non-crypto info unless the owner explicitly asks.
+# SHARED telegram.json has 2 recipients: owner (…2650) + …3258.
+# RECIPIENT POLICY: …3258 gets LIVE CRYPTO/MEXC messages only. NON-crypto senders (equity, BTST)
+# AND paper/backtest crypto senders (fib paper bot, mexc_backtest_compare) must use a dedicated
+# owner-only secrets file — NOT this shared one — so …3258 only ever sees LIVE crypto, unless the
+# owner explicitly asks otherwise. (This mexc_alerts is live MEXC health → shared file is correct.)
 SECRETS   = os.path.join(REPO_ROOT, "strategies", "pct_ladder", "secrets", "telegram.json")
 
 BUCKETS = {
