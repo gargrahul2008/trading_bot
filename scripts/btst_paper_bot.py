@@ -30,6 +30,8 @@ import datetime as dt
 import json
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -68,8 +70,34 @@ AUTH_FILE = REPO / "fyers_auth.json"
 USER_KEY = "user1"
 
 
+TELEGRAM_SECRETS = REPO / "strategies" / "pct_ladder" / "secrets" / "telegram.json"
+NOTIFY = True   # set False by --no-telegram
+
+
 def _plain(sym: str) -> str:
     return sym.removeprefix("NSE:").removesuffix("-EQ")
+
+
+def _send_telegram(text: str) -> None:
+    if not NOTIFY:
+        return
+    try:
+        s = json.loads(TELEGRAM_SECRETS.read_text())
+    except Exception:
+        print("[telegram] secrets missing — skipping notify", file=sys.stderr)
+        return
+    token, chats = s.get("bot_token"), s.get("chat_id")
+    if isinstance(chats, str):
+        chats = [chats]
+    if not token or not chats:
+        return
+    for cid in chats:
+        data = urllib.parse.urlencode({"chat_id": cid, "text": text}).encode()
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"https://api.telegram.org/bot{token}/sendMessage", data=data, method="POST"), timeout=10)
+        except Exception as e:
+            print(f"[telegram] send failed: {e}", file=sys.stderr)
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
@@ -182,6 +210,16 @@ def run_entry(state: dict, data: dict[str, pd.DataFrame]) -> dict:
     _log_trades(state["universe"], trades)
     save_state(state)
     _report_entry(state, tdate, opened, rebought)
+
+    # afternoon Telegram: what OPENED today + rolled count
+    lines = [f"🌆 BTST {state['universe']} — afternoon {tdate}"]
+    if opened:
+        lines.append(f"OPENED {len(opened)}:")
+        lines += [f"  • {o['ticker']} ×{o['qty']} @ ₹{o['price']:.1f}" for o in opened]
+    else:
+        lines.append("OPENED today: none")
+    lines.append(f"Re-bought {rebought} rolled legs | active tranches: {len(state['tranches'])}")
+    _send_telegram("\n".join(lines))
     return state
 
 
@@ -205,6 +243,7 @@ def run_exit(state: dict, data: dict[str, pd.DataFrame]) -> dict:
     overnight P&L, drop completed tranches. THEN compute today's signal from that same ACTUAL
     09:20 bar (never LTP — it must match the backtest) and store the buy list for the 15:05 entry."""
     xdate = _last_date(data)
+    closed, day_pnl = [], 0.0
 
     def open_px(ticker):
         f = data.get(ticker)
@@ -215,7 +254,7 @@ def run_exit(state: dict, data: dict[str, pd.DataFrame]) -> dict:
 
     # 1) exit the overnight book at the 09:20 open (skip if nothing held or already done today)
     if state.get("phase") == "overnight" and state.get("last_exit_date") != xdate:
-        trades, closed, day_pnl = [], [], 0.0
+        trades = []
         survivors = []
         for tr in state["tranches"]:
             tr_pnl = 0.0
@@ -252,6 +291,18 @@ def run_exit(state: dict, data: dict[str, pd.DataFrame]) -> dict:
     save_state(state)
     names = [p["ticker"] for p in state["pending_entry"]]
     print(f"[signal] {xdate}: {len(names)} names for the 15:05 entry -> {names}")
+
+    # morning Telegram: overnight P&L + what CLOSED today + the signal to place at 15:05
+    lines = [f"🌅 BTST {state['universe']} — morning {xdate}",
+             f"Overnight P&L: ₹{day_pnl:,.0f}  |  cumulative ₹{state['realized_pnl']:,.0f}"]
+    if closed:
+        lines.append(f"CLOSED {len(closed)} (completed {PARAMS['lf']} nights):")
+        lines += [f"  • {', '.join(c['tickers'])} → ₹{c['pnl']:,.0f}" for c in closed]
+    else:
+        lines.append("CLOSED today: none")
+    lines.append(f"Signal to BUY at 15:05: {', '.join(names) if names else '(none)'}")
+    lines.append(f"Active tranches: {len(state['tranches'])}")
+    _send_telegram("\n".join(lines))
     return state
 
 
@@ -323,8 +374,12 @@ def main() -> int:
     ap.add_argument("--universe", help="universe json (e.g. universe_top250.json)")
     ap.add_argument("--action", required=True, choices=["entry", "exit", "status", "selftest"])
     ap.add_argument("--no-fetch", action="store_true", help="use cached bars, skip the fetch")
+    ap.add_argument("--no-telegram", action="store_true", help="don't send Telegram messages")
     ap.add_argument("--lookback-days", type=int, default=90, help="calendar days of data to load")
     args = ap.parse_args()
+
+    global NOTIFY
+    NOTIFY = not args.no_telegram
 
     if args.action == "selftest":
         return selftest()
