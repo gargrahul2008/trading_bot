@@ -31,6 +31,10 @@ from typing import Any
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STATE_DIR = os.path.join(REPO_ROOT, "strategies", "pct_ladder", "state")
 LOG_DIR   = os.path.join(REPO_ROOT, "logs")
+# SHARED telegram.json has 2 recipients: owner (…2650) + a crypto-only recipient (…3258).
+# RECIPIENT POLICY: this shared file is for CRYPTO/MEXC messages only. Any NON-crypto sender
+# (equity, BTST, etc.) must use a dedicated owner-only secrets file (e.g. telegram_btst.json),
+# NOT this one — …3258 must never receive non-crypto info unless the owner explicitly asks.
 SECRETS   = os.path.join(REPO_ROOT, "strategies", "pct_ladder", "secrets", "telegram.json")
 
 BUCKETS = {
@@ -43,6 +47,11 @@ BUCKETS = {
         "state_dir":  os.path.join(STATE_DIR, "bucket2"),
         "log":        os.path.join(LOG_DIR, "mexc_bucket2_runner.log"),
         "label":      "Bucket2",
+    },
+    "bucket3": {
+        "state_dir":  os.path.join(STATE_DIR, "bucket3"),
+        "log":        os.path.join(LOG_DIR, "mexc_bucket3_runner.log"),
+        "label":      "Bucket3",
     },
 }
 

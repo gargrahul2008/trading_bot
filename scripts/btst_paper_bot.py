@@ -70,7 +70,11 @@ AUTH_FILE = REPO / "fyers_auth.json"
 USER_KEY = "user1"
 
 
-# Dedicated BTST recipients (only the owner) — NOT the shared telegram.json the other bots use.
+# RECIPIENT POLICY (owner's standing rule): the second recipient in the SHARED telegram.json
+# (chat …3258) receives CRYPTO/MEXC info ONLY. Everything non-crypto (this BTST bot, equity,
+# etc.) goes to the owner's chat (…2650) ONLY — never …3258 — unless the owner explicitly asks
+# for a specific message to go there. Hence BTST uses this dedicated owner-only secrets file,
+# NOT the shared telegram.json.
 TELEGRAM_SECRETS = REPO / "strategies" / "pct_ladder" / "secrets" / "telegram_btst.json"
 TELEGRAM_SENT_LOG = REPO / "state" / "btst_paper" / "telegram_sent.jsonl"
 NOTIFY = True   # set False by --no-telegram
