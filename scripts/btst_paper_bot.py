@@ -209,10 +209,10 @@ def run_entry(state: dict, data: dict[str, pd.DataFrame]) -> dict:
         qty = int(perc * cap_tranche / px)
         if qty <= 0:
             continue
-        new_positions[tkr] = {"qty": qty, "last_buy_price": px, "entry_price": px}
+        new_positions[tkr] = {"qty": qty, "last_buy_price": px, "entry_price": px, "perc": perc}
         opened.append({"ticker": tkr, "qty": qty, "price": px})
         trades.append({"ts": tdate, "action": "BUY", "kind": "open", "ticker": tkr,
-                       "qty": qty, "price": px})
+                       "qty": qty, "price": px, "perc": round(perc, 4), "notional": round(qty * px, 2)})
     if new_positions:
         state["tranches"].append({"entry_date": tdate, "nights_remaining": PARAMS["lf"],
                                   "positions": new_positions})
