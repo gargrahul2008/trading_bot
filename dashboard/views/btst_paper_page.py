@@ -19,9 +19,37 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import sys
+
 REPO = Path(os.getenv("TRADING_BOT_ROOT", Path(__file__).resolve().parents[2]))
+if str(REPO / "src") not in sys.path:
+    sys.path.insert(0, str(REPO / "src"))
 BTST_DIR = REPO / "state" / "btst_paper"
 ENTRY_TIME, EXIT_TIME = "15:05", "09:20"   # buy-at-close / sell-at-open marks
+
+
+def _day_netted_costs(tdf: pd.DataFrame):
+    """Charges via the backtest's own day_netted model: per ticker per day, the same-day
+    matched buy/sell qty is charged at INTRADAY rates, the net carried residual at DELIVERY
+    rates. Returns (intraday_cost, delivery_cost, per_date_frame). Same rates as the backtest."""
+    if tdf.empty or "action" not in tdf:
+        return 0.0, 0.0, pd.DataFrame()
+    from intraday_research.btst_lagrangian import day_netted_costs
+    t = tdf.copy()
+    t["qty"] = pd.to_numeric(t["qty"], errors="coerce").fillna(0.0)
+    t["price"] = pd.to_numeric(t["price"], errors="coerce").fillna(0.0)
+    val = t["qty"] * t["price"]
+    is_buy = t["action"] == "BUY"
+    t["buy_qty"] = t["qty"].where(is_buy, 0.0)
+    t["buy_value"] = val.where(is_buy, 0.0)
+    t["sell_qty"] = t["qty"].where(~is_buy, 0.0)
+    t["sell_value"] = val.where(~is_buy, 0.0)
+    t["Date"] = t["ts"].astype(str)
+    led = (t.groupby(["Date", "ticker"], as_index=False)
+             .agg(buy_qty=("buy_qty", "sum"), buy_value=("buy_value", "sum"),
+                  sell_qty=("sell_qty", "sum"), sell_value=("sell_value", "sum")))
+    costs = day_netted_costs(led)   # per-date intra_cost / del_cost (discount broker)
+    return float(costs["intra_cost"].sum()), float(costs["del_cost"].sum()), costs
 
 
 def _load(p: Path) -> dict:
@@ -94,13 +122,21 @@ def render_page() -> None:
         st.header(uni)
         book = _book_rows(state)
         total_notional = sum(r["Notional ₹"] for r in book)
+        tdf = _trades(BTST_DIR / uni)
+        intra_cost, del_cost, cost_by_date = _day_netted_costs(tdf)
+        total_cost = intra_cost + del_cost
+        gross = float(state.get("realized_pnl", 0))
+        net = gross - total_cost
 
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Cumulative P&L", _inr(state.get("realized_pnl", 0)))
-        c2.metric("Deployed notional", _inr(total_notional))
-        c3.metric("Active tranches", len(state.get("tranches", [])))
-        c4.metric("Phase", state.get("phase", "—"))
-        c5.metric("Last signal", state.get("signal_date") or "—")
+        c1.metric("Gross P&L", _inr(gross))
+        c2.metric("Total cost", _inr(total_cost))
+        c3.metric("Net P&L (after cost)", _inr(net))
+        c4.metric("Deployed notional", _inr(total_notional))
+        c5.metric("Active tranches", len(state.get("tranches", [])))
+        st.caption(f"Cost split — **intraday** (same-day matched buy+sell legs) {_inr(intra_cost)} · "
+                   f"**delivery** (net carried overnight) {_inr(del_cost)}. "
+                   f"Phase {state.get('phase', '—')} · last signal {state.get('signal_date') or '—'}.")
 
         pending = state.get("pending_entry") or []
         if pending:
@@ -119,7 +155,6 @@ def render_page() -> None:
             st.write("— flat (no overnight positions right now) —")
 
         # ── today's activity ─────────────────────────────────────────────────
-        tdf = _trades(BTST_DIR / uni)
         if not tdf.empty:
             last_day = str(tdf["ts"].max())
             day = tdf[tdf["ts"].astype(str) == last_day].copy()
@@ -159,11 +194,15 @@ def render_page() -> None:
                 st.dataframe(led[cols].rename(columns={"ts": "date"}),
                              use_container_width=True, hide_index=True)
 
-            # ── daily overnight P&L curve ─────────────────────────────────────
+            # ── daily gross vs net (after cost) cumulative P&L ────────────────
             sells_all = tdf[tdf["action"] == "SELL"].copy()
             if not sells_all.empty and "pnl" in sells_all:
                 sells_all["pnl"] = pd.to_numeric(sells_all["pnl"], errors="coerce").fillna(0.0)
-                daily = sells_all.groupby("ts")["pnl"].sum().reset_index().sort_values("ts")
-                daily["cumulative"] = daily["pnl"].cumsum()
-                st.line_chart(daily.set_index("ts")[["cumulative"]], height=200)
+                daily = sells_all.groupby("ts")["pnl"].sum().rename("gross")
+                cost_ser = ((cost_by_date["intra_cost"] + cost_by_date["del_cost"])
+                            if not cost_by_date.empty else pd.Series(dtype=float)).rename("cost")
+                m = pd.concat([daily, cost_ser], axis=1).fillna(0.0).sort_index()
+                m["Gross cum"] = m["gross"].cumsum()
+                m["Net cum (after cost)"] = (m["gross"] - m["cost"]).cumsum()
+                st.line_chart(m[["Gross cum", "Net cum (after cost)"]], height=200)
         st.divider()
