@@ -113,8 +113,38 @@ def _send_telegram(text: str) -> None:
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
+def _force_refetch_from(symbols: list[str], from_date: str) -> None:
+    """Trim each symbol's fetch-meta so days >= from_date are re-fetched. The incremental
+    fetcher tracks coverage by DATE RANGE, so once the morning run marks 'today' covered it
+    never re-fetches the afternoon — leaving the 15:05 bars missing and the entry price stale
+    (a morning bar). Called with today each run (so 15:06 captures the full day), or an older
+    date to backfill. merge_cached_frames dedups, so re-fetching is safe."""
+    prev = (dt.date.fromisoformat(from_date) - dt.timedelta(days=1)).isoformat()
+    for sym in symbols:
+        mp = MINUTE_DATA_DIR / f"{safe_symbol_filename(sym)}.meta.json"
+        if not mp.exists():
+            continue
+        try:
+            m = json.loads(mp.read_text())
+            new = []
+            for r in m.get("fetched_ranges", []):
+                if r.get("end", "") >= from_date:
+                    if r.get("start", "") < from_date:
+                        r["end"] = prev
+                        new.append(r)      # keep the part before from_date
+                    # else: range is entirely >= from_date -> drop (re-fetch it all)
+                else:
+                    new.append(r)
+            m["fetched_ranges"] = new
+            mp.write_text(json.dumps(m))
+        except Exception:
+            pass
+
+
 def fetch_minute(symbols: list[str], start: str, end: str) -> None:
-    """Incrementally fetch 1-minute bars for the universe (skips already-covered ranges)."""
+    """Incrementally fetch 1-minute bars for the universe. Always force-refetches TODAY so the
+    afternoon run captures the full day through 15:05 (not just the morning bars)."""
+    _force_refetch_from(symbols, dt.date.today().isoformat())
     cmd = [sys.executable, str(REPO / "scripts" / "fetch_fyers_intraday_data.py"),
            "--auth-file", str(AUTH_FILE), "--user-key", USER_KEY,
            "--start", start, "--end", end, "--output-dir", str(MINUTE_DATA_DIR),
