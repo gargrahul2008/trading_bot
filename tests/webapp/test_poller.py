@@ -172,3 +172,46 @@ def test_session_uses_market_time_even_without_tzdata(monkeypatch):
 
     # And the same instant expressed in UTC must not be read as 05:30 local.
     assert ist_1100.astimezone(dt.timezone.utc).hour == 5
+
+
+def test_staleness_scales_with_the_session_cadence():
+    """A fixed tolerance marked every section stale the moment the market shut:
+    the closed-market interval is 60s but the tolerance was 10s, so all three
+    live agents reported live=False overnight."""
+    for interval in (3.0, 60.0, 900.0):
+        clock = FakeClock()
+        gateway = FakeGateway()
+        book = Book("rahul")
+        poller = Poller(
+            gateway, book,
+            budget=Budget(per_min=600.0, burst=50, clock=clock),
+            session=FixedSession({"positions": interval, "orders": interval,
+                                  "funds": interval, "holdings": interval}),
+            clock=clock,
+        )
+        poller.tick()
+        section = book.get("positions")
+        assert section["stale_after_s"] >= interval, (
+            "tolerance must cover at least one poll interval, got %s for %s"
+            % (section["stale_after_s"], interval)
+        )
+        assert book.health()["live"] is True, "idle is not the same as broken"
+
+
+def test_a_genuinely_missed_poll_is_still_reported_stale():
+    """Scaling the tolerance must not make staleness unreachable."""
+    import time as _time
+
+    clock = FakeClock()
+    book = Book("rahul")
+    poller = Poller(
+        FakeGateway(), book,
+        budget=Budget(per_min=600.0, burst=50, clock=clock),
+        session=FixedSession(LIVE), clock=clock,
+    )
+    poller.tick()
+    assert book.health()["live"] is True
+
+    # Three intervals pass with nothing refreshed.
+    book.section("positions").fetched_at = _time.time() - 30
+    assert book.health()["live"] is False

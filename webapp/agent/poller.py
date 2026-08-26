@@ -113,6 +113,9 @@ class Poller:
         intervals = self.session.intervals()
         self.phase = self.session.phase()
         self.ticks += 1
+        # Staleness is relative to the cadence we are meant to be running at,
+        # which changes with the session.
+        self.book.set_tolerances(intervals)
 
         for name in PRIORITY:
             if now < self._due.get(name, 0.0):

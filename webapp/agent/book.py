@@ -77,9 +77,11 @@ class Book:
     response can never show two sections caught mid-update against each other.
     """
 
-    #: name -> seconds after which the section is considered stale. Sized at
-    #: roughly three times its poll interval, so one missed poll is tolerated
-    #: and two are not.
+    #: name -> starting tolerance. These are replaced at runtime by
+    #: `set_tolerances`, because the poll interval changes with the market
+    #: session: 3s while it is open, 60s when it is closed, 15 minutes on a
+    #: holiday. A fixed tolerance would mark every section stale the moment the
+    #: market shut, which reads as "the agent is broken" when it is simply idle.
     STALE_AFTER = {
         "positions": 10.0,
         "orders": 10.0,
@@ -87,6 +89,13 @@ class Book:
         "holdings": 180.0,
         "trades": 180.0,
     }
+
+    #: A section is stale after this many missed polls. Two, so one lost poll is
+    #: tolerated and a second is not.
+    STALE_AFTER_MISSES = 3.0
+
+    #: Never tolerate less than this, however fast the cadence.
+    MIN_STALE_AFTER = 10.0
 
     def __init__(self, user: str) -> None:
         self.user = user
@@ -98,6 +107,21 @@ class Book:
 
     def section(self, name: str) -> Section:
         return self._sections[name]
+
+    def set_tolerances(self, intervals: Dict[str, float]) -> None:
+        """Scale each section's staleness tolerance to its current poll interval.
+
+        Called by the poller as the session changes, so "stale" always means
+        "later than the agent should have refreshed this", not "older than some
+        fixed number of seconds".
+        """
+        with self._lock:
+            for name, section in self._sections.items():
+                interval = intervals.get(name)
+                if interval:
+                    section.stale_after = max(
+                        interval * self.STALE_AFTER_MISSES, self.MIN_STALE_AFTER
+                    )
 
     def set(self, name: str, data: Any) -> None:
         with self._lock:
