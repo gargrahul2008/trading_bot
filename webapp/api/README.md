@@ -48,9 +48,24 @@ that entirely.
 
 ## Running it
 
+Build the UI once, then start one server — it serves both the API and the
+compiled frontend, so there is one process, one port and one SSH tunnel:
+
 ```bash
+cd webapp/web && npm install && npm run build && cd -
 webapp/api/.venv/bin/uvicorn app.main:app --app-dir webapp/api --port 8000
 ```
+
+Same single origin as production, so the session cookie behaves identically in
+development. Without a build, `/` says so and points at `/docs`.
+
+From your laptop:
+
+```bash
+ssh -L 8000:localhost:8000 root@64.227.135.117
+```
+
+then open <http://localhost:8000>.
 
 `GET /api/health` needs no login and reports whether the pieces are wired up —
 point a monitor at it. It deliberately exposes no account figures.

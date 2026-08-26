@@ -10,8 +10,10 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import overview as overview_mod
@@ -24,7 +26,7 @@ from app.auth import (
     password_hash,
     verify_password,
 )
-from app.config import agent_ports, get_settings, known_accounts
+from app.config import REPO, agent_ports, get_settings, known_accounts
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("api")
@@ -137,3 +139,36 @@ def health() -> Dict[str, Any]:
         "accounts": known_accounts(),
         "cookie_secure": cookie_secure(),
     }
+
+
+# ── The built UI ────────────────────────────────────────────────────────────
+# Serving the compiled frontend from the API means one process, one port and one
+# SSH tunnel rather than two — and it is the same single origin the production
+# setup uses, so the session cookie behaves identically here and there.
+#
+# Mounted last: every /api route above is already registered, so nothing static
+# can shadow them.
+UI_DIST = REPO / "webapp" / "web" / "dist"
+
+if UI_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(UI_DIST / "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str) -> FileResponse:
+        """Any non-API path serves index.html, so a deep link or a refresh on
+        /overview is handled by the router rather than 404ing."""
+        if full_path.startswith("api/"):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+        candidate = UI_DIST / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(UI_DIST / "index.html"))
+
+else:
+    @app.get("/", include_in_schema=False)
+    def no_ui() -> Dict[str, Any]:
+        return {
+            "error": "The UI has not been built.",
+            "fix": "cd webapp/web && npm install && npm run build",
+            "api_docs": "/docs",
+        }
