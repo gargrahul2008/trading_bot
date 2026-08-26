@@ -13,6 +13,7 @@ It places no orders and cannot: it never constructs an order request.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -38,6 +39,11 @@ def main(argv=None) -> int:
                         help="rows to print per section (0 for all)")
     parser.add_argument("--symbol", default=None,
                         help="only show rows whose symbol contains this, e.g. RELIANCE")
+    parser.add_argument("--raw", default=None,
+                        metavar="SECTION",
+                        help="dump the broker's untouched payload for one section "
+                             "(funds, positions, holdings, orders, trades) — use this to "
+                             "calibrate a field whose parsed value looks wrong")
     args = parser.parse_args(argv)
 
     user_key = args.user_key or os.getenv("FYERS_USER_KEY") or ""
@@ -77,9 +83,22 @@ def main(argv=None) -> int:
             print("%-10s FAILED  %s" % (name, exc))
             continue
 
+        if name == args.raw:
+            print("%-10s RAW PAYLOAD" % name)
+            payload = result["raw"] if name == "funds" else [r.get("raw") for r in result]
+            for line in json.dumps(payload, indent=2, default=str).splitlines():
+                print("    " + line)
+            print()
+
         if name == "funds":
             print("%-10s available=%.2f utilised=%.2f realised=%.2f"
                   % (name, result["available"], result["utilised"], result["realised_pnl"]))
+            if name == args.raw:
+                # The mapping is by title text, so show what we matched against.
+                titles = [str(r.get("title") or r.get("name") or "")
+                          for r in (result["raw"].get("fund_limit") or [])
+                          if isinstance(r, dict)]
+                print("           fund_limit titles: %s" % ", ".join(titles))
             continue
 
         if args.symbol:
