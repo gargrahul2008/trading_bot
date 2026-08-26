@@ -67,3 +67,6 @@ check_and_restart "Bucket1" "config.mexc.bucket1.json" \
 
 check_and_restart "Bucket2" "config.mexc.bucket2.json" \
     "/root/trading_bot/scripts/mexc_bucket2_runner.sh" "logs/mexc_bucket2_runner.log"
+
+check_and_restart "Bucket3" "config.mexc.bucket3.json" \
+    "/root/trading_bot/scripts/mexc_bucket3_runner.sh" "logs/mexc_bucket3_runner.log"

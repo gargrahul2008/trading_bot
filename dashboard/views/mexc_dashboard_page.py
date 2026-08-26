@@ -18,15 +18,20 @@ SUMMARY_FILE = os.path.join(STATE_DIR, "pnl_summary.json")
 
 # Bucket-aware paths (2-bucket design deployed 2026-05-28)
 BUCKETS = {
-    "Bucket 1 (tight 0.4%)": {
+    "Bucket 1 (3%)": {
         "state_dir": os.path.join(STATE_DIR, "bucket1"),
         "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket1.json"),
-        "label": "Bucket 1 — Tight 0.4% grid, $50k pool",
+        "label": "Bucket 1 — 3% grid, runway $1,700–$2,125",
     },
     "Bucket 2 (wide 10%)": {
         "state_dir": os.path.join(STATE_DIR, "bucket2"),
         "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket2.json"),
-        "label": "Bucket 2 — Wide 10% upside grid, $47k pool",
+        "label": "Bucket 2 — Wide 10% upside grid",
+    },
+    "Bucket 3 (tight 2%)": {
+        "state_dir": os.path.join(STATE_DIR, "bucket3"),
+        "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket3.json"),
+        "label": "Bucket 3 — Tight 2% grid, short runway (1 buy / 4 sells)",
     },
 }
 # Off-bot ETH allocated to Bucket 2's HODL stack (untouched by either bot)

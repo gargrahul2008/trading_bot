@@ -220,8 +220,15 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
     buy_quote = _dec(cfg_strategy.get("buy_quote", 0))
     upper_pct = _dec(cfg_strategy.get("upper_pct", 0))
 
+    # Seed opening inventory (ETH a bucket was funded with, not bought via grid trades).
+    # Without this, sells of that seed have no buy to match → they're skipped (no PnL shown).
+    _init_eth  = _dec(cfg_strategy.get("_initial_eth")  or 0)
+    _init_cost = _dec(cfg_strategy.get("_initial_cost") or 0)
+
     # Unified LIFO stack for period cycle counting — [remaining_qty, price, is_rebal]
     open_buys: list[list] = []
+    if _init_eth > D0 and _init_cost > D0:
+        open_buys.append([_init_eth, _init_cost, False])
 
     all_time_pnl        = D0
     period_pnl          = D0
@@ -247,6 +254,8 @@ def compute_metrics(fills: list[dict], since: datetime.datetime, cfg_strategy: d
     # Trade sequences for separate-stack LIFO (all-time)
     grid_seq:  list[tuple] = []
     rebal_seq: list[tuple] = []
+    if _init_eth > D0 and _init_cost > D0:
+        grid_seq.append(("BUY", float(_init_eth), float(_init_cost)))
 
     def process_trade(side, qty, price, is_rebal, in_period):
         """Unified LIFO for period cycle counting. Standard matching (all sells, not just profitable)."""
@@ -420,6 +429,7 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
     compound_s_str = None
     eth_holding_pnl = None
     net_pnl = None
+    held_str = None
 
     if state_path:
         try:
@@ -458,6 +468,8 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
             extra_eth_dec = _dec(str(extra_eth)) if extra_eth else D0
             pv = cash + (broker_eth + extra_eth_dec) * price
             pv_snapshot = {"ts": now.isoformat(), "pv": float(pv), "price": float(price)}
+            # Held ETH + cash for THIS bucket (tracked slice) — shown on every message.
+            held_str = f"Held: {float(broker_eth):.4f} ETH + ${float(cash):,.0f} cash"
 
             cbq = _dec(state.get("extras", {}).get("compound_buy_quote") or "0")
             if cbq > D0:
@@ -467,9 +479,11 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
             if wpct:
                 pct_str = f"{float(wpct):g}"
 
-            # Compute ETH holding PnL from start state
+            # Compute ETH holding PnL from start state. Compute even with ZERO trades —
+            # a bucket that just holds ETH still has mark-to-market PnL (was previously
+            # guarded by total_net_eth != 0, which made no-trade buckets show Net+0).
             fp = float(price)
-            if total_net_eth != 0 and fp > 0 and start_pv > 0:
+            if fp > 0 and start_pv > 0:
                 start_eth  = float(broker_eth) - total_net_eth
                 start_usdc = float(cash) - total_net_usdc
                 if start_eth > 0.1:
@@ -516,6 +530,8 @@ def build_message(metrics: dict, since: datetime.datetime, now: datetime.datetim
 
     # Optional line5: show HODL/extra-ETH breakdown so the message reflects total bucket holdings.
     msg = f"{line1}\n{line2}\n{line_cyc}\n{line3}\n{line4}"
+    if held_str:
+        msg += f"\n{held_str}"
     if extra_eth > 0:
         bot_eth = float(broker_eth)
         msg += f"\nETH bot {bot_eth:.2f} + HODL {extra_eth:.2f} = {bot_eth + extra_eth:.2f} @ ${float(price):,.0f}"

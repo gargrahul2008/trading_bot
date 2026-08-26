@@ -10,6 +10,9 @@ run_report () {
     local EXTRA_ETH="$4"   # untracked HODL ETH (0 for bucket1, 17.709 for bucket2)
     local SEND_VERIFY="$5" # "1" to also run pnl_verify; "0" to skip (skip when no trades file)
     local SINCE="$6"       # baseline cutoff (IST); "" to use full trade history
+    local VER="${7:-2026_05_28_v1}"  # state-file version suffix (bucket3 uses 2026_07_31_v1)
+    local INIT_ETH="${8:-0}"   # seed inventory ETH (funded, not grid-bought) — for FIFO seeding
+    local INIT_COST="${9:-0}"  # avg cost of that seed inventory
 
     echo "=== $B report ==="
 
@@ -23,18 +26,23 @@ run_report () {
         since_arg="--since $SINCE"
     fi
 
+    local init_arg=""
+    if [ "$INIT_ETH" != "0" ] && [ "$INIT_COST" != "0" ]; then
+        init_arg="--initial-eth $INIT_ETH --initial-cost $INIT_COST"
+    fi
+
     # telegram_report.py handles missing trades file gracefully (treats as zero fills);
     # report still sends with HODL info derived from state file + extra-eth.
     python3 scripts/mexc_telegram_report.py \
         --config "$CONFIG" \
         --trades "$TRADES" \
         --hours 8 \
-        $extra_arg $since_arg
+        $extra_arg $since_arg $init_arg
 
     # pnl_verify only makes sense when there ARE trades — skip when no trades file.
     if [ "$SEND_VERIFY" = "1" ] && [ -f "$TRADES" ]; then
-        local CAPITAL="strategies/pct_ladder/state/${B}/capital_flows_2026_05_28_v1.json"
-        local MANUAL="strategies/pct_ladder/state/${B}/manual_positions_2026_05_28_v1.json"
+        local CAPITAL="strategies/pct_ladder/state/${B}/capital_flows_${VER}.json"
+        local MANUAL="strategies/pct_ladder/state/${B}/manual_positions_${VER}.json"
         python3 scripts/mexc_pnl_verify.py \
             --config "$CONFIG" \
             --trades "$TRADES" \
@@ -60,3 +68,15 @@ run_report "bucket2" \
     "17.709" \
     "1" \
     ""
+
+# Bucket 3: tight 2% grid. Seeded with 19.7094 ETH @ real blended cost 1939.5
+# (8.42 bought @1865 + 11.29 moved from bucket1 @1995) — pass as initial inventory so seed sells book PnL.
+run_report "bucket3" \
+    "strategies/pct_ladder/config.mexc.bucket3.json" \
+    "strategies/pct_ladder/state/bucket3/trades_2026_07_31_v1.jsonl" \
+    "0" \
+    "1" \
+    "" \
+    "2026_07_31_v1" \
+    "19.7094" \
+    "1939.5"

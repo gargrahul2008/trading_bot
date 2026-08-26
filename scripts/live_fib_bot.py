@@ -251,6 +251,7 @@ def resolve_exit_on_bar(
     row: pd.Series,
     time_exit_bars: int,
     use_trail: bool,
+    full_target: bool = False,
 ) -> Optional[Tuple[float, str]]:
     """
     Check whether the position exits on this bar.
@@ -284,9 +285,15 @@ def resolve_exit_on_bar(
             pos.stop_pending = next_m
             pos.trail_milestone_idx += 1
             is_last = (m_idx == len(pos.trail_milestones) - 1)
-            if is_last and not pos.partial_done:
-                pos.partial_done = True
-                return float(next_m), "partial_target"
+            if is_last:
+                if full_target:
+                    # 100% exit at target as one maker limit — no 50% partial, so no
+                    # riding-half that can later hit a taker trail_stop (no upside was
+                    # ever captured beyond the target anyway).
+                    return float(next_m), "target"
+                if not pos.partial_done:
+                    pos.partial_done = True
+                    return float(next_m), "partial_target"
 
     # ── 4. Full target ────────────────────────────────────────────────────
     target_hit = (is_long and hi >= pos.target_price) or (is_short and lo <= pos.target_price)
@@ -298,6 +305,18 @@ def resolve_exit_on_bar(
         close_price = float(row["close"])
         return close_price, "time_exit"
 
+    return None
+
+
+def resolve_exit_intrabar(pos: "OpenPosition", price: float, use_trail: bool):
+    """Point 2: exit check against a single LIVE price (not bar high/low) — used by the
+    intrabar poller to fire the STOP the instant it's crossed, instead of waiting for the
+    bar close. Only checks the (trailed) stop; the target is a resting maker limit (Point 1)
+    that fills on touch regardless, and milestone advancement stays bar-based."""
+    is_long = pos.side == "LONG"
+    stop = pos.stop_pending if pos.stop_pending is not None else pos.stop_price
+    if (is_long and price <= stop) or ((not is_long) and price >= stop):
+        return stop, ("trail_stop" if use_trail and pos.trail_milestone_idx > 0 else "stop_loss")
     return None
 
 
@@ -314,6 +333,13 @@ class FibLiveBot:
         self.strat_cfg: dict    = cfg["strategy"]
         self.trade_value_usd: float = float(cfg.get("trade_value_usd", 5000))
         self.use_trail: bool    = bool(self.strat_cfg.get("use_trailing_stop", True))
+        # Point 1: target/partial exits fill AT the level (resting maker limit, MEXC 0% maker)
+        self.maker_exits: bool  = bool(cfg.get("maker_target_exits", False))
+        # Point 2: intrabar stop polling — poll live price every N sec while in a position and
+        # fire the stop the instant it's crossed (reduces the ~bar-close latency drift). 0 = off.
+        self.intrabar_poll_secs: float = float(cfg.get("intrabar_poll_secs", 0) or 0)
+        # 100% exit at the target (one maker limit) instead of a 50% partial + riding half
+        self.full_target: bool  = bool(cfg.get("full_target_exit", False))
         self.time_exit_bars: int = 90  # 90 min for ext > 1.0
         self.max_bars_wait: int = int(cfg.get("max_bars_wait", 3))  # limit-entry expiry
         # When True: fill at bar N+1 open (matches ENTRY_NEXT_BAR_OPEN=True backtest).
@@ -330,6 +356,8 @@ class FibLiveBot:
         self.dual_feed: bool = bool(_df_cfg.get("enabled", False))
         self.signal_feed: str = str(_df_cfg.get("signals", "mexc")).lower()
         self.fill_feed: str = str(_df_cfg.get("fills", "mexc")).lower()
+        self._last_book: dict = {}    # most recent MEXC book snapshot per symbol (instrumentation)
+        self._entry_book: dict = {}   # MEXC book captured at each position's entry fill
         if self.dual_feed:
             LOG.info("Dual-feed ON: signals=%s  fills=%s", self.signal_feed, self.fill_feed)
 
@@ -376,6 +404,7 @@ class FibLiveBot:
 
         # Paper P&L tracker (initialised before load so _load_state can restore it)
         self.paper_pnl: Dict[str, float] = {s: 0.0 for s in self.symbols}
+        self.paper_pnl_binance: Dict[str, float] = {s: 0.0 for s in self.symbols}  # idealized (Binance-fill) cum
         self.paper_trades: Dict[str, List[dict]] = {s: [] for s in self.symbols}
 
         # Daily-frozen lookback reference median per symbol (scaling_mode=lookback)
@@ -401,8 +430,21 @@ class FibLiveBot:
                 self.positions[sym] = OpenPosition.from_dict(p) if p else None
                 self.pending[sym]   = PendingEntry.from_dict(pe) if pe else None
                 self.paper_pnl[sym] = float(saved_pnl.get(sym, 0.0))
+                self.paper_pnl_binance[sym] = float(st.get("paper_pnl_binance", {}).get(sym, 0.0))
                 self.ref_median[sym] = saved_med.get(sym)
                 self.ref_median_day[sym] = saved_med_day.get(sym)
+            if "paper_pnl_binance" not in st and self.trades_path.exists():
+                # backward-compat: reconstruct idealized (Binance-fill) cum from the journal
+                for line in self.trades_path.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    s = r.get("symbol"); eb = r.get("entry_binance"); xb = r.get("exit_binance"); q = r.get("qty")
+                    if s in self.paper_pnl_binance and eb is not None and xb is not None and q is not None:
+                        self.paper_pnl_binance[s] += (xb - eb) * q * (1 if r.get("side") == "LONG" else -1)
             LOG.info("State loaded from %s (cum PnL: %s)",
                      self.state_path,
                      {s: round(v, 2) for s, v in self.paper_pnl.items()})
@@ -414,6 +456,7 @@ class FibLiveBot:
             "positions": {s: (p.to_dict() if p else None) for s, p in self.positions.items()},
             "pending":   {s: (pe.to_dict() if pe else None) for s, pe in self.pending.items()},
             "paper_pnl": {s: round(v, 6) for s, v in self.paper_pnl.items()},
+            "paper_pnl_binance": {s: round(v, 6) for s, v in self.paper_pnl_binance.items()},
             "ref_median": {s: v for s, v in self.ref_median.items()},
             "ref_median_day": {s: v for s, v in self.ref_median_day.items()},
             "saved_at":  datetime.now(timezone.utc).isoformat(),
@@ -538,13 +581,97 @@ class FibLiveBot:
             LOG.warning("[%s] MEXC bookTicker fetch failed: %s", symbol, e)
             return None
 
+    def _mexc_book(self, symbol: str):
+        """Full MEXC top-of-book: (bid, ask) or None on failure."""
+        try:
+            r = _requests.get("https://api.mexc.com/api/v3/ticker/bookTicker",
+                              params={"symbol": symbol}, timeout=10)
+            r.raise_for_status()
+            d = r.json()
+            return float(d["bidPrice"]), float(d["askPrice"])
+        except Exception as e:
+            LOG.warning("[%s] MEXC book fetch failed: %s", symbol, e)
+            return None
+
     def _capture_fill(self, symbol: str, signal_price: float, is_buy: bool):
         """Return (fill_price, signal_level). In dual-feed the fill is the MEXC marketable
-        price and signal_level is the signal-feed price (for basis). Else identity."""
+        price and signal_level is the signal-feed price (for basis). Else identity.
+
+        Also records a full book snapshot (bid/ask/mid/spread/basis/latency) into
+        self._last_book[symbol] for execution instrumentation — fill BEHAVIOUR is
+        unchanged (still crosses the spread; this only measures the alternatives)."""
         if not self.dual_feed:
             return signal_price, None
-        mx = self._mexc_marketable_price(symbol, is_buy)
-        return (mx if mx is not None else signal_price), signal_price
+        _t0 = time.time()
+        book = self._mexc_book(symbol)
+        _lat_ms = (time.time() - _t0) * 1000.0
+        if book is None:
+            return signal_price, signal_price
+        bid, ask = book
+        mid = (bid + ask) / 2.0
+        fill = ask if is_buy else bid          # unchanged: marketable (taker) fill
+        try:
+            self._last_book[symbol] = {
+                "binance": round(float(signal_price), 6),
+                "bid": round(bid, 6), "ask": round(ask, 6), "mid": round(mid, 6),
+                "spread_bps": round((ask - bid) / mid * 1e4, 3) if mid else None,
+                "basis_bps": round((mid - signal_price) / signal_price * 1e4, 3) if signal_price else None,
+                "fill_taker": round(fill, 6),
+                "is_buy": bool(is_buy),
+                "lat_ms": round(_lat_ms, 1),
+                "wc": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception:
+            pass
+        return fill, signal_price
+
+    def _exit_fill(self, sym: str, exit_price: float, reason: str, side: str):
+        """Return (fill, binance_level) for an exit. Point 1: target/partial exits fill AT the
+        level (resting maker limit); stops/trails/time cross the spread (taker). Always records
+        the MEXC book snapshot via _capture_fill for the instrumentation."""
+        is_buy = (side == "SHORT")
+        mkt, blevel = self._capture_fill(sym, exit_price, is_buy=is_buy)
+        if self.maker_exits and reason in ("target", "partial_target"):
+            return exit_price, blevel          # maker limit fills at the known level
+        return mkt, blevel
+
+    def _fetch_live_price(self, sym: str) -> Optional[float]:
+        """Current price from the signal feed (Binance in dual-feed) — for intrabar stop checks."""
+        base = "https://api.binance.com" if (self.dual_feed and self.signal_feed == "binance") else "https://api.mexc.com"
+        try:
+            r = _requests.get(f"{base}/api/v3/ticker/price", params={"symbol": sym}, timeout=5)
+            r.raise_for_status()
+            return float(r.json()["price"])
+        except Exception:
+            return None
+
+    def _intrabar_manage(self) -> None:
+        """Point 2: while any position is open, poll the live price every intrabar_poll_secs and
+        fire the stop the instant it's crossed — until ~1s before the next bar close."""
+        if self.intrabar_poll_secs <= 0:
+            return
+        now = datetime.now(timezone.utc)
+        deadline = now.replace(second=0, microsecond=0) + timedelta(minutes=1) - timedelta(seconds=1)
+        while datetime.now(timezone.utc) < deadline:
+            open_syms = [s for s in self.symbols if self.positions[s] is not None]
+            if not open_syms:
+                return
+            for sym in open_syms:
+                pos = self.positions[sym]
+                if pos is None:
+                    continue
+                price = self._fetch_live_price(sym)
+                if price is None:
+                    continue
+                res = resolve_exit_intrabar(pos, price, self.use_trail)
+                if res is not None:
+                    exit_price, reason = res
+                    ts = datetime.now(timezone.utc).isoformat()
+                    fill, blevel = self._exit_fill(sym, exit_price, reason, pos.side)
+                    LOG.info("[INTRABAR EXIT] %s %s live=%.4f → %s", sym, pos.side, price, reason)
+                    self._paper_close(sym, pos, fill, reason, False, ts, binance_level=blevel)
+                    self._save_state()
+            time.sleep(self.intrabar_poll_secs)
 
     def _compute_ref_median(self, symbol: str, day_start: pd.Timestamp) -> Optional[float]:
         """Median close over [day_start - lookback_days, day_start) — lookahead-free.
@@ -598,6 +725,7 @@ class FibLiveBot:
         )
         self.positions[sym] = pos
         self.pending[sym]   = None
+        self._entry_book[sym] = self._last_book.get(sym)   # snapshot MEXC book at entry fill
         tag = "PAPER" if self.paper else "LIVE"
         LOG.info(
             "[%s OPEN] %s %s qty=%.6g @ %.4f  stop=%.4f  target=%.4f  milestones=%s",
@@ -622,6 +750,12 @@ class FibLiveBot:
         qty = pos.qty / 2 if is_partial else pos.qty
         gross = (exit_price - pos.entry_price) * qty * (1 if is_long else -1)
         self.paper_pnl[sym] = self.paper_pnl.get(sym, 0.0) + gross
+        # idealized PnL as if filled at the Binance signal levels (the backtest world);
+        # gross - gross_bin = the execution slippage this trade cost us
+        gross_bin = None
+        if pos.entry_binance is not None and binance_level is not None:
+            gross_bin = (binance_level - pos.entry_binance) * qty * (1 if is_long else -1)
+            self.paper_pnl_binance[sym] = self.paper_pnl_binance.get(sym, 0.0) + gross_bin
 
         pct_return = round(
             (exit_price / pos.entry_price - 1) * 100 * (1 if is_long else -1), 4
@@ -649,6 +783,13 @@ class FibLiveBot:
                                   if pos.entry_binance is not None else None)
             rec["exit_basis"] = (round(exit_price - binance_level, 4)
                                  if binance_level is not None else None)
+            # execution instrumentation: full MEXC book (bid/ask/mid/spread/basis/latency)
+            # captured at the entry fill and this exit fill — to size mid-post / Binance-price
+            # / latency ideas without changing fill behaviour.
+            rec["entry_book"] = self._entry_book.get(sym)
+            rec["exit_book"] = self._last_book.get(sym)
+            rec["gross_pnl_binance"] = round(gross_bin, 4) if gross_bin is not None else None
+            rec["cumulative_pnl_binance"] = round(self.paper_pnl_binance[sym], 4)
         self.paper_trades[sym].append(rec)
         self._log_trade(sym, rec)
 
@@ -663,13 +804,26 @@ class FibLiveBot:
         total_pnl = sum(self.paper_pnl.values())
         emoji = "✅" if gross >= 0 else "❌"
         kind = "PARTIAL EXIT" if is_partial else "EXIT"
+        if gross_bin is not None:
+            total_bin = sum(self.paper_pnl_binance.values())
+            pnl_block = (
+                f"trade PnL: <b>${gross:+,.2f}</b> MEXC | ${gross_bin:+,.2f} Binance"
+                f"  (slip ${gross - gross_bin:+,.2f})\n"
+                f"{sym[0]} cum: ${self.paper_pnl[sym]:+,.2f} MEXC | ${self.paper_pnl_binance[sym]:+,.2f} Bin\n"
+                f"total: <b>${total_pnl:+,.2f}</b> MEXC | ${total_bin:+,.2f} Binance\n"
+                f"cum slippage gap: <b>${total_pnl - total_bin:+,.2f}</b>"
+            )
+        else:
+            pnl_block = (
+                f"trade PnL: <b>${gross:+,.2f}</b> ({pct_return:+.2f}%)\n"
+                f"{sym[0]} cum: ${self.paper_pnl[sym]:+,.2f}\n"
+                f"total PnL: <b>${total_pnl:+,.2f}</b>"
+            )
         self._send_telegram(
             f"{emoji} <b>{kind}</b> [{tag}]  <b>{sym[0]} {pos.side}</b>  ({reason})\n"
             f"entry {pos.entry_price:.4f} → exit {exit_price:.4f}\n"
             f"held: {pos.bars_held} bars\n"
-            f"trade PnL: <b>${gross:+,.2f}</b> ({pct_return:+.2f}%)\n"
-            f"{sym[0]} cum: ${self.paper_pnl[sym]:+,.2f}\n"
-            f"total PnL: <b>${total_pnl:+,.2f}</b>"
+            + pnl_block
         )
 
         if not is_partial:
@@ -696,12 +850,12 @@ class FibLiveBot:
         pos = self.positions[sym]
         if pos is not None:
             pos.bars_held += 1
-            result = resolve_exit_on_bar(pos, last_row, self.time_exit_bars, self.use_trail)
+            result = resolve_exit_on_bar(pos, last_row, self.time_exit_bars, self.use_trail, self.full_target)
             if result is not None:
                 exit_price, reason = result
                 is_partial = (reason == "partial_target")
-                # exiting a SHORT = buy back (ask); exiting a LONG = sell (bid)
-                fill, blevel = self._capture_fill(sym, exit_price, is_buy=(pos.side == "SHORT"))
+                # Point 1: target/partial fill at the level (maker); stops cross the spread (taker)
+                fill, blevel = self._exit_fill(sym, exit_price, reason, pos.side)
                 self._paper_close(sym, pos, fill, reason, is_partial, ts, binance_level=blevel)
             return  # don't look for new entries while in position
 
@@ -829,6 +983,13 @@ class FibLiveBot:
 
                 self._print_status()
                 self._save_state()
+
+                # Point 2: intrabar stop polling between bar closes (if enabled)
+                if self.intrabar_poll_secs > 0:
+                    try:
+                        self._intrabar_manage()
+                    except Exception as e:
+                        LOG.error("intrabar manage error: %s", e)
 
         except KeyboardInterrupt:
             LOG.info("Stopped by user.")

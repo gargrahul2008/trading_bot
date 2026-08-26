@@ -13,7 +13,36 @@ set -u
 cd /root/trading_bot || exit 1
 BOTS=(bot-rahul-reliance bot-pratibha-shishind bot-pratibha-indothai \
       bot-rahul-vikaseco bot-pratibha-coolcaps bot-pratibha-arl)
+
+# --- Bots held down INDEFINITELY. Listed here = does not start, on any day, until the entry
+# is removed from this list. Deliberately open-ended, not dated: a skip that expires by itself
+# would silently put a bot back into the market on a morning nobody asked for it.
+# ALL FOUR PRATIBHA BOTS are held down from 2026-08-17 on request (rahul): her account places
+# no automated orders at all for now. Rahul's two (reliance, vikaseco) are unaffected.
+#   bot-pratibha-shishind : stopped mid-session 2026-08-12, held down since. It was killed
+#                           holding inventory and live sell orders, so check its state.json
+#                           against the broker before restarting.
+#   bot-pratibha-indothai / -coolcaps / -arl : held down 2026-08-17, stopped normally at EOD.
+# Before restarting ANY of them, reconcile accounts/pratibha/<run>/state/state.json with the
+# broker — each day held down is a day its local view drifts from the real position.
+HOLD_DOWN=" bot-pratibha-shishind bot-pratibha-indothai bot-pratibha-coolcaps bot-pratibha-arl "
+
+# --- Skip for ONE dated morning only (e.g. the PCA engine is selling that holding at 09:00).
+# Expires by itself. Leave SKIP_ON empty when unused.
+SKIP_ON=""
+SKIP_ONE_DAY=" "
+
+SKIP_UNITS="$HOLD_DOWN"
+if [ -n "$SKIP_ON" ] && [ "$(date -u +%F)" = "$SKIP_ON" ]; then
+  SKIP_UNITS="$SKIP_UNITS$SKIP_ONE_DAY"
+  echo "$(date -u +%FT%TZ) $SKIP_ON: also skipping for today only:$SKIP_ONE_DAY"
+fi
+[ -n "$(echo "$SKIP_UNITS" | tr -d ' ')" ] && echo "$(date -u +%FT%TZ) holding down:$SKIP_UNITS"
+
 for u in "${BOTS[@]}"; do
+  case "$SKIP_UNITS" in
+    *" $u "*) echo "$(date -u +%FT%TZ) SKIPPED $u"; continue ;;
+  esac
   /usr/bin/systemctl start "$u" && echo "$(date -u +%FT%TZ) started $u" || echo "$(date -u +%FT%TZ) FAILED to start $u"
   sleep 8
 done

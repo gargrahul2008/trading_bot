@@ -11,7 +11,7 @@
     "target_ext": 1.618,
     "stop_buffer_pct": 0.009,
     "use_trailing_stop": true,
-    "stop_buffer_floor": 0.01
+    "stop_buffer_floor": 0.05
   },
   "mexc": {
     "secrets_file": "mexc_secrets.json"
@@ -36,5 +36,8 @@
     "enabled": true,
     "signals": "binance",
     "fills": "mexc"
-  }
+  },
+  "maker_target_exits": true,
+  "intrabar_poll_secs": 0.5,
+  "full_target_exit": true
 }
