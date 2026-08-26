@@ -28,7 +28,9 @@ OUT = REPO / "deploy" / "systemd" / "generated"
 
 # Where the repo lives on the CONTROL HOST (edit to match, e.g. /root/trading_bot).
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/opt/trading_bot")
-PYTHON = f"{INSTALL_DIR}/.venv/bin/python"
+# The interpreter the units run. Defaults to a .venv inside the repo; override
+# with PYTHON= when the host keeps its virtualenv somewhere else.
+PYTHON = os.environ.get("PYTHON", f"{INSTALL_DIR}/.venv/bin/python")
 
 # Loopback port for the first account's agent. Assignments are recorded in
 # AGENT_PORTS (tracked in git) and never reused, so an account keeps its port
