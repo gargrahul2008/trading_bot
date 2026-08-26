@@ -26,11 +26,12 @@ REPO = Path(__file__).resolve().parents[1]
 ACCOUNTS = REPO / "accounts"
 OUT = REPO / "deploy" / "systemd" / "generated"
 
-# Where the repo lives on the CONTROL HOST (edit to match, e.g. /root/trading_bot).
-INSTALL_DIR = os.environ.get("INSTALL_DIR", "/opt/trading_bot")
-# The interpreter the units run. Defaults to a .venv inside the repo; override
-# with PYTHON= when the host keeps its virtualenv somewhere else.
-PYTHON = os.environ.get("PYTHON", f"{INSTALL_DIR}/.venv/bin/python")
+# Where the repo and its virtualenv live on the CONTROL HOST (64.227.135.117).
+# These are the real values, not placeholders, so regenerating on the host
+# produces no diff — and the units committed here are the ones that actually
+# work if copied to /etc/systemd/system. Override for a different host.
+INSTALL_DIR = os.environ.get("INSTALL_DIR", "/root/trading_bot")
+PYTHON = os.environ.get("PYTHON", f"{INSTALL_DIR}/env/bin/python")
 
 # Loopback port for the first account's agent. Assignments are recorded in
 # AGENT_PORTS (tracked in git) and never reused, so an account keeps its port

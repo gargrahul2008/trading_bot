@@ -150,8 +150,12 @@ Ctrl-C to stop.
 
 ## 5. Install as services
 
+The generator already defaults to this host's paths (`/root/trading_bot`,
+`env/bin/python`), so no overrides are needed here:
+
 ```bash
-INSTALL_DIR=/root/trading_bot python3 deploy/gen_systemd_units.py
+python3 deploy/gen_systemd_units.py
+git status --short deploy/                             # expect: no changes
 cat deploy/systemd/generated/agent-pratibha.service    # review before installing
 
 sudo cp deploy/systemd/generated/agent-*.service /etc/systemd/system/

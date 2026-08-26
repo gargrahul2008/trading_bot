@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/trading_bot
-EnvironmentFile=/opt/trading_bot/accounts/rahul/account.env
+WorkingDirectory=/root/trading_bot
+EnvironmentFile=/root/trading_bot/accounts/rahul/account.env
 # Refresh THIS user only (never --enabled-only, which would use one shared IP).
-ExecStart=/opt/trading_bot/.venv/bin/python scripts/fyers_auto_auth.py --auth-file fyers_auth.json \
+ExecStart=/root/trading_bot/env/bin/python scripts/fyers_auto_auth.py --auth-file fyers_auth.json \
     --user-key ${FYERS_USER_KEY} --loop --daily-at 08:30 --timezone Asia/Kolkata
 Restart=always
 RestartSec=30
