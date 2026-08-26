@@ -53,14 +53,17 @@ the host could otherwise reach it and place a real order.
 Rahul uses the host IP directly.
 
 ```bash
-env $(grep -v '^#' accounts/pratibha/account.env | xargs) curl -s https://api.ipify.org; echo
-# expect: 157.245.108.24   (pratibha's whitelisted IP)
+# every proxied account
+env $(grep -v '^#' accounts/<user>/account.env | xargs) curl -s https://api.ipify.org; echo
+# expect that account's whitelisted IP, e.g. 157.245.108.24 for pratibha
 
+# the home account, which uses the host IP directly
 curl -s https://api.ipify.org; echo
-# expect: 64.227.135.117   (the host IP = rahul's whitelisted IP)
+# expect: 64.227.135.117
 ```
 
-If either is wrong, stop — everything below would leave from the wrong IP.
+Do this for **every** account under `accounts/`, not just the first two. If any
+is wrong, stop — everything below would leave from the wrong IP.
 
 **Now the read-only smoke test.** Five requests per account, no orders, nothing
 written:
@@ -153,11 +156,18 @@ cat deploy/systemd/generated/agent-pratibha.service    # review before installin
 
 sudo cp deploy/systemd/generated/agent-*.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now agent-pratibha agent-rahul
+sudo systemctl enable --now $(ls deploy/systemd/generated/agent-*.service \
+                              | xargs -n1 basename | sed 's/.service//')
 ```
 
-Ports are assigned in directory order and stay stable: **pratibha 9101, rahul
-9102**.
+Each account's loopback port is recorded in `deploy/agent_ports.json` and never
+changes, including when you add an account that sorts before an existing one.
+If the generator prints "Recorded new agent port(s)", **commit that file** so the
+host and your workstation agree on which port is which account.
+
+```bash
+cat deploy/agent_ports.json
+```
 
 ```bash
 systemctl status agent-pratibha agent-rahul

@@ -18,6 +18,7 @@ is a one-file edit. Re-run this after adding/removing a strategy folder.
 INSTALL_DIR must match where the repo lives on the control host.
 """
 from __future__ import annotations
+import json
 import os
 from pathlib import Path
 
@@ -29,10 +30,13 @@ OUT = REPO / "deploy" / "systemd" / "generated"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/opt/trading_bot")
 PYTHON = f"{INSTALL_DIR}/.venv/bin/python"
 
-# Loopback port for the first account's agent; each further account takes the
-# next one. Assigned in directory order so a user keeps the same port across
-# regenerations — the dashboard's config points at these.
+# Loopback port for the first account's agent. Assignments are recorded in
+# AGENT_PORTS (tracked in git) and never reused, so an account keeps its port
+# forever — including when a new account is added that sorts before it. The
+# dashboard config points at these, and a silent reshuffle would aim it at the
+# wrong account.
 AGENT_BASE_PORT = int(os.environ.get("AGENT_BASE_PORT", "9101"))
+AGENT_PORTS = REPO / "deploy" / "agent_ports.json"
 
 # Requests per minute each agent may spend. The bots on the same app are already
 # spending roughly 24/min per run, and the app limit is shared, so this is set
@@ -77,6 +81,27 @@ SyslogIdentifier=fyers-auth-{user}
 WantedBy=multi-user.target
 """
 
+def load_agent_ports() -> dict:
+    try:
+        with open(AGENT_PORTS, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+
+def assign_agent_port(ports: dict, user: str) -> int:
+    """The user's recorded port, or the lowest free one above the base."""
+    if user in ports:
+        return ports[user]
+    taken = set(ports.values())
+    port = AGENT_BASE_PORT
+    while port in taken:
+        port += 1
+    ports[user] = port
+    return port
+
+
 AGENT_UNIT = """[Unit]
 Description=Dashboard Fyers agent (IP-bound) for account {user}
 After=network-online.target
@@ -107,13 +132,15 @@ def main() -> None:
     # Trading routes are opt-in: without ALLOW_TRADING=1 the generated agents are
     # read-only and cannot place an order however they are called.
     allow_trading = os.environ.get("ALLOW_TRADING", "").strip() in ("1", "true", "yes")
-    port = AGENT_BASE_PORT
+    ports = load_agent_ports()
+    known = dict(ports)
 
     for user_dir in sorted(ACCOUNTS.iterdir()):
         if not user_dir.is_dir() or user_dir.name.startswith("_"):
             continue
         user = user_dir.name
-        # one dashboard agent per user, on its own loopback port
+        # one dashboard agent per user, on its own stable loopback port
+        port = assign_agent_port(ports, user)
         (OUT / f"agent-{user}.service").write_text(
             AGENT_UNIT.format(
                 user=user, install=INSTALL_DIR, python=PYTHON, port=port,
@@ -123,7 +150,6 @@ def main() -> None:
         )
         print(f"  agent-{user}.service (port {port}, trading "
               f"{'ENABLED' if allow_trading else 'disabled'})")
-        port += 1
         # one auth unit per user
         (OUT / f"fyers-auth-{user}.service").write_text(
             AUTH_UNIT.format(user=user, install=INSTALL_DIR, python=PYTHON)
@@ -138,6 +164,14 @@ def main() -> None:
                 BOT_UNIT.format(user=user, strat=strat, install=INSTALL_DIR, python=PYTHON)
             )
             print(f"  bot-{user}-{strat}.service")
+
+    if ports != known:
+        with open(AGENT_PORTS, "w", encoding="utf-8") as fh:
+            json.dump(dict(sorted(ports.items())), fh, indent=2)
+            fh.write("\n")
+        added = sorted(set(ports) - set(known))
+        print(f"\nRecorded new agent port(s) for {', '.join(added)} in {AGENT_PORTS.name}.")
+        print("Commit it, so the host and your workstation agree on the ports.")
 
 
 if __name__ == "__main__":

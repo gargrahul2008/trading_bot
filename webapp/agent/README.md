@@ -93,8 +93,13 @@ chmod 600 webapp/agent.env
 # generate the units (read-only unless ALLOW_TRADING=1)
 INSTALL_DIR=/opt/trading_bot python3 deploy/gen_systemd_units.py
 sudo cp deploy/systemd/generated/agent-*.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now agent-rahul agent-pratibha
+sudo systemctl daemon-reload
+sudo systemctl enable --now $(ls deploy/systemd/generated/agent-*.service \
+                              | xargs -n1 basename | sed 's/.service//')
 ```
+
+Ports come from `deploy/agent_ports.json`, which is tracked and append-only, so
+an account keeps its port even when a new one is added ahead of it alphabetically.
 
 By hand, for one account:
 
