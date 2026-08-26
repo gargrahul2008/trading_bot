@@ -150,3 +150,25 @@ def test_a_stale_section_is_reported_as_stale():
 
     book.section("positions").fetched_at = _time.time() - 60
     assert book.health()["live"] is False
+
+
+def test_session_uses_market_time_even_without_tzdata(monkeypatch):
+    """The control host runs UTC. If the session ever fell back to the host
+    clock, 11:00 IST would read as 05:30 and the agent would sit at closed
+    cadence through the whole trading day."""
+    import datetime as dt
+
+    from webapp.agent import session as session_mod
+
+    monkeypatch.setattr(session_mod, "ZoneInfo", None)
+    fallback = session_mod.Session(holidays=set())
+
+    assert fallback.now().utcoffset() == dt.timedelta(hours=5, minutes=30)
+
+    # A Wednesday, 11:00 IST == 05:30 UTC.
+    ist_1100 = dt.datetime(2026, 8, 26, 11, 0, tzinfo=session_mod.IST)
+    assert fallback.phase(ist_1100) == "live"
+    assert fallback.intervals(ist_1100)["positions"] == 3.0
+
+    # And the same instant expressed in UTC must not be read as 05:30 local.
+    assert ist_1100.astimezone(dt.timezone.utc).hour == 5

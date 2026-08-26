@@ -10,9 +10,16 @@ from __future__ import annotations
 import datetime as dt
 from typing import Dict, Optional, Set
 
+# IST is a fixed +05:30 and has had no daylight saving since 1945, so this is
+# exact rather than an approximation. It matters: without a tz the phase would
+# be computed from the host clock, and the control host runs UTC — every session
+# boundary would be out by five and a half hours, so the agent would poll at
+# holiday cadence through the morning and at live cadence past midnight.
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
 try:
     from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - Python 3.8 fallback, unused here
+except ImportError:  # Python 3.8, or a build without tzdata
     ZoneInfo = None  # type: ignore
 
 from common.engine.market_calendar import is_trading_day, load_holidays
@@ -50,11 +57,22 @@ _POSTCLOSE_UNTIL = dt.time(16, 15)
 
 class Session:
     def __init__(self, tz_name: str = MARKET_TZ, holidays: Optional[Set[str]] = None) -> None:
-        self._tz = ZoneInfo(tz_name) if ZoneInfo else None
+        self._tz = self._resolve_tz(tz_name)
         self._holidays = load_holidays() if holidays is None else holidays
 
+    @staticmethod
+    def _resolve_tz(tz_name: str) -> dt.tzinfo:
+        """Never returns None. A missing tzdata falls back to the fixed offset,
+        not to the host clock."""
+        if ZoneInfo is not None:
+            try:
+                return ZoneInfo(tz_name)
+            except Exception:
+                pass
+        return IST
+
     def now(self) -> dt.datetime:
-        return dt.datetime.now(self._tz) if self._tz else dt.datetime.now()
+        return dt.datetime.now(self._tz)
 
     def phase(self, now: Optional[dt.datetime] = None) -> str:
         now = now or self.now()
