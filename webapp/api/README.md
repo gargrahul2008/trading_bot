@@ -20,30 +20,27 @@ FastAPI runs on the host's Python 3.9, so no newer interpreter is needed.
 
 ## Configuration
 
-Two secrets, both in gitignored files next to the agents':
+Two secrets, both in gitignored files. `AGENT_TOKEN` in `webapp/agent.env` is
+already there from the agents — the API reads the same one.
+
+Set the dashboard password interactively:
 
 ```bash
-# webapp/agent.env   — already created for the agents; the API reads the same one
-AGENT_TOKEN=...
-
-# webapp/dashboard.env
-DASHBOARD_PASSWORD_HASH=$2b$12$...
-SESSION_SECRET=...
-COOKIE_SECURE=true          # false only for local http
+webapp/api/.venv/bin/python webapp/api/set_password.py
 ```
 
-Generate them:
+It prompts, so the password never appears in a command line — and therefore
+never in shell history, in `ps`, or in a scrolled-back terminal. It writes
+`webapp/dashboard.env` (mode 0600), generating a `SESSION_SECRET` the first
+time and keeping anything already there.
 
-```bash
-webapp/api/.venv/bin/python -c \
-  "import sys; sys.path.insert(0,'webapp/api'); from app.auth import hash_password; \
-   print('DASHBOARD_PASSWORD_HASH=' + hash_password('your-password'))" >> webapp/dashboard.env
-python3 -c "import secrets; print('SESSION_SECRET=' + secrets.token_urlsafe(32))" >> webapp/dashboard.env
-chmod 600 webapp/dashboard.env
-```
+Set `COOKIE_SECURE=true` in that file once the app is behind TLS. Until then it
+stays `false`, and the app belongs behind an SSH tunnel: without the Secure
+flag the session cookie would travel in clear.
 
-The hash is full of `$`, which every layer that carries an environment variable
-treats as a variable reference and silently blanks. Keeping it in a file avoids
+The password hash is full of `$`, which every layer that carries an environment
+variable treats as a variable reference and silently blanks — leaving a
+truncated hash that can never match any password. Keeping it in a file avoids
 that entirely.
 
 ## Running it
