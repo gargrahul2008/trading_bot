@@ -35,6 +35,11 @@ STATUS_NAMES = {
 # the dashboard: does this position survive the close?
 POSITIONAL_PRODUCTS = ("CNC", "MARGIN", "MTF")
 
+# Fyers segment codes: 10 is the cash market, 11 the derivatives one. More
+# reliable than reading "26SEPFUT" off the end of a symbol.
+SEGMENT_CASH = 10
+SEGMENT_DERIVATIVES = 11
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     try:
@@ -99,20 +104,59 @@ def normalise_order(row: Dict[str, Any], *, now: Optional[float] = None) -> Dict
 
 def normalise_position(row: Dict[str, Any]) -> Dict[str, Any]:
     """Positions carry their own LTP and unrealised P&L, which is why the agent
-    never polls quotes separately — see webapp/agent/README.md."""
+    never polls quotes separately — see webapp/agent/README.md.
+
+    Two realised figures exist and they are not interchangeable. `realised` here
+    is the position's `realized_profit`: the whole life of the trade. The
+    account-level figure in funds is *today's* mark-to-market from the previous
+    close, which differs for anything carried in overnight. A TATAELXSI short
+    carried in showed -9,275 on the position and -3,750 on the account; both
+    were right.
+    """
     net = _f(_first(row, "netQty", "net_qty", "qty", "quantity"))
-    product = str(_first(row, "productType", "product_type") or "")
+    product = str(_first(row, "productType", "product_type") or "").upper()
+
+    cf_buy = _f(_first(row, "cfBuyQty", "cf_buy_qty"))
+    cf_sell = _f(_first(row, "cfSellQty", "cf_sell_qty"))
+    day_buy = _f(_first(row, "dayBuyQty", "day_buy_qty"))
+    day_sell = _f(_first(row, "daySellQty", "day_sell_qty"))
+
+    # Fyers segment 10 is the cash market, 11 the derivatives one.
+    segment = _first(row, "segment")
+
+    # A negative CNC equity position is a sale of holdings awaiting settlement,
+    # not a short — you cannot short on delivery. Calling it SHORT on screen
+    # would read as an open risk position that has to be bought back.
+    delivery_sale = net < 0 and product == "CNC" and segment != SEGMENT_DERIVATIVES
+
     return {
         "position_id": str(_first(row, "id") or ""),
         "symbol": str(_first(row, "symbol", "tradingSymbol") or ""),
         "net_qty": net,
         "direction": "LONG" if net > 0 else ("SHORT" if net < 0 else "FLAT"),
-        "avg_price": _f(_first(row, "avgPrice", "netAvg", "averagePrice", "buyAvg")),
+        "delivery_sale": delivery_sale,
+        "avg_price": _f(_first(row, "netAvg", "avgPrice", "averagePrice")),
         "ltp": _f(_first(row, "ltp", "lastPrice")),
-        "unrealised": _f(_first(row, "unrealized_profit", "unrealizedProfit", "pl")),
+        "unrealised": _f(_first(row, "unrealized_profit", "unrealizedProfit")),
         "realised": _f(_first(row, "realized_profit", "realizedProfit")),
+        "total_pnl": _f(_first(row, "pl")),
         "buy_qty": _f(_first(row, "buyQty", "buy_qty")),
         "sell_qty": _f(_first(row, "sellQty", "sell_qty")),
+        "buy_avg": _f(_first(row, "buyAvg")),
+        "sell_avg": _f(_first(row, "sellAvg")),
+        "buy_value": _f(_first(row, "buyVal")),
+        "sell_value": _f(_first(row, "sellVal")),
+        # Carried vs opened today. This is the honest intraday/positional split:
+        # product type says what the position is *allowed* to be, these say what
+        # it actually is.
+        "cf_buy_qty": cf_buy,
+        "cf_sell_qty": cf_sell,
+        "day_buy_qty": day_buy,
+        "day_sell_qty": day_sell,
+        "carried": bool(cf_buy or cf_sell),
+        "opened_today": bool((day_buy or day_sell) and not (cf_buy or cf_sell)),
+        "segment": segment,
+        "is_derivative": segment == SEGMENT_DERIVATIVES,
         "product_type": product,
         "kind": product_kind(product),
         "raw": row,
@@ -132,6 +176,8 @@ def normalise_holding(row: Dict[str, Any]) -> Dict[str, Any]:
         "invested": qty * cost,
         "unrealised": _f(_first(row, "pl")) or (qty * (ltp - cost) if ltp else 0.0),
         "holding_type": str(_first(row, "holdingType", "type") or ""),
+        # A holding sold today comes back with qty 0 and its old cost price.
+        "is_open": qty != 0,
         "raw": row,
     }
 

@@ -61,6 +61,31 @@ Outside the session everything slows down, and on a weekend or NSE holiday it
 drops to a 15-minute heartbeat — enough to surface a dead token before Monday
 rather than during it.
 
+## Two realised P&L figures, and they differ
+
+A position's `realized_profit` covers the **life of the trade**. The account
+level `Realized Profit and Loss` in funds is **today's** mark-to-market from the
+previous close. For anything carried in overnight they are not the same number:
+a TATAELXSI short carried in showed -9,275 on the position and -3,750 on the
+account, and both were right.
+
+The agent exposes both — `realised` on the position, `realised_pnl` on funds —
+and they must never share a column on screen.
+
+## Intraday or positional, and long or short
+
+`product_type` says what a position is *allowed* to be. The `cf*`/`day*`
+quantities say what it actually is, so the agent derives `carried` and
+`opened_today` from those rather than guessing from the product.
+
+`segment` (10 cash, 11 derivatives) identifies a future or option, which is more
+reliable than reading "26SEPFUT" off the end of a symbol.
+
+One case needs care: **a negative CNC equity position is a sale of holdings, not
+a short.** You cannot short on delivery, so it is stock sold out of the holdings
+book and awaiting settlement. Rendering it as SHORT would read as open risk that
+has to be bought back, so the agent flags it `delivery_sale`.
+
 ## Staleness
 
 Every section is served with `as_of`, `age_s` and `stale`. A failed refresh keeps
