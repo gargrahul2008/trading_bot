@@ -1,0 +1,22 @@
+[Unit]
+Description=Dashboard Fyers agent (IP-bound) for account pratibha
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trading_bot
+# The SAME account.env as this user's bots: identity, and the proxy that puts
+# these calls on the account's whitelisted IP.
+EnvironmentFile=/opt/trading_bot/accounts/pratibha/account.env
+# AGENT_TOKEN is the shared secret the dashboard authenticates with. Keep it out
+# of account.env (which is per-account) and out of the repo.
+EnvironmentFile=/opt/trading_bot/webapp/agent.env
+ExecStart=/opt/trading_bot/.venv/bin/python -m webapp.agent.main \
+    --user pratibha --port 9101 --per-min 60
+Restart=always
+RestartSec=10
+SyslogIdentifier=agent-pratibha
+
+[Install]
+WantedBy=multi-user.target

@@ -365,3 +365,81 @@ class FyersClient(Broker):
                 raise BrokerError(f"realised_profit_history error: {resp!r}", resp=resp)
             return resp
         return with_retries(_call, max_retries=3, base_sleep=0.6, max_sleep=5.0, logger=LOG)
+
+    # ── Dashboard gateway endpoints ─────────────────────────────────────────────
+    # Added for the per-account agent (webapp/agent). Pure additions: the live
+    # bots do not call these. Like the reporting endpoints above, every one of
+    # them must run from a process bound to this account's whitelisted IP.
+
+    def funds_raw(self) -> Dict[str, Any]:
+        """The full funds payload, not just spendable cash.
+
+        `funds_cash()` collapses the response to one number for the bots' sizing
+        logic; the dashboard needs the whole `fund_limit` breakdown — margin
+        used, collateral, realized P&L for the day."""
+        def _call():
+            resp = self._fyers.funds()
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Funds error: {resp!r}", resp=resp)
+            return resp
+        return with_retries(_call, max_retries=3, base_sleep=0.5, max_sleep=4.0, logger=LOG)
+
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        qty: Optional[int] = None,
+        limit_price: Optional[Decimal] = None,
+        stop_price: Optional[Decimal] = None,
+        order_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Amend a pending order. Only the fields passed are sent — FYERS treats
+        an omitted field as unchanged, and sending a stale value for one we did
+        not mean to touch would silently move the order."""
+        payload: Dict[str, Any] = {"id": str(order_id)}
+        if qty is not None:
+            payload["qty"] = int(qty)
+        if limit_price is not None:
+            payload["limitPrice"] = float(limit_price)
+        if stop_price is not None:
+            payload["stopPrice"] = float(stop_price)
+        if order_type is not None:
+            payload["type"] = 2 if str(order_type).upper() == "MARKET" else 1
+
+        def _call():
+            try:
+                resp = self._fyers.modify_order(data=payload)
+            except TypeError:
+                resp = self._fyers.modify_order(payload)
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Modify order failed: {resp!r}", resp=resp)
+            return resp
+        # Not retried: a modify that timed out may well have landed, and a blind
+        # retry would move the order twice.
+        return _call()
+
+    def exit_position(self, position_id: str) -> Dict[str, Any]:
+        """Square off one position. `position_id` is the broker's position `id`
+        (symbol + product type), not an order id."""
+        def _call():
+            payload = {"id": str(position_id)}
+            try:
+                resp = self._fyers.exit_positions(data=payload)
+            except TypeError:
+                resp = self._fyers.exit_positions(payload)
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Exit position failed: {resp!r}", resp=resp)
+            return resp
+        return _call()
+
+    def convert_position(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Move a position between product types (e.g. INTRADAY -> CNC)."""
+        def _call():
+            try:
+                resp = self._fyers.convert_position(data=data)
+            except TypeError:
+                resp = self._fyers.convert_position(data)
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Convert position failed: {resp!r}", resp=resp)
+            return resp
+        return _call()

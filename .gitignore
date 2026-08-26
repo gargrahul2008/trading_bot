@@ -70,3 +70,6 @@ data/
 
 # Backtest/live artifacts (generated output — not source)
 artifacts/
+
+# dashboard agent secret (see webapp/agent.env.example)
+webapp/agent.env
