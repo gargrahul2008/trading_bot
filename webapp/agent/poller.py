@@ -82,7 +82,7 @@ class Poller:
         for order in orders:
             placed = order.get("epoch")
             age = (now - placed) if isinstance(placed, (int, float)) and placed else None
-            order.update(self.attribution.label(order.get("order_id", ""), age))
+            order.update(self.attribution.label(order, age))
         return orders
 
     def _note_fills(self, orders: List[Dict[str, Any]]) -> bool:

@@ -73,14 +73,31 @@ flagged `stale` rather than showing it as live.
 
 ## Bot or manual?
 
-`attribution.py` reads each run's own `state/state.json` and `trades.jsonl` off
-the same host — no broker call — and collects the order ids the bots claim. An
-id nobody claims is manual.
+`attribution.py` reads each run's own files off the same host — no broker call —
+using three sources, in descending order of certainty:
+
+1. **Live claims** — order ids a run currently has working, from `state.json`.
+2. **Sticky claims** — every id we have ever seen claimed, kept in
+   `accounts/<user>/reports/agent_claims.json`.
+3. **Configured symbol** — a run trades one symbol with one product type, both
+   in its `config.json`. An order matching that pair is almost certainly its.
+
+Sticky claims exist because a bot order **cancelled without filling disappears
+from both of the bot's own records**: `_clear_pro_oids` empties the live list,
+and `trades.jsonl` is written only on a fill (`generic_runner.py:667`). After the
+EOD cancel, every unfilled bot order of the day would otherwise read as manual —
+which is exactly what the first live run showed.
+
+The third source is an **inference, not a claim**: the same symbol traded by
+hand, in the same account, on the same product would look identical. So the
+label carries `matched_by` (`order_id` or `symbol`) and the UI must distinguish
+them — and warn before acting either way. Product type has to agree, so buying
+RELIANCE as CNC by hand is not the MTF ladder's order. Two runs on the same
+symbol and product are not guessed between: a wrong run name is worse than none.
 
 A bot places an order and writes its state a moment later, so an order younger
 than 15 seconds that nobody has claimed yet is reported as `pending`, not
-`manual`, and settles on a later poll. Without that every bot order would flicker
-as manual for one tick.
+`manual`, and settles on a later poll.
 
 ## Running it
 

@@ -57,7 +57,9 @@ def main(argv=None) -> int:
 
     attribution = Attribution(os.path.join(args.accounts_dir, args.user))
     attribution.refresh(force=True)
-    print("bot runs claiming orders: %s" % (attribution.runs() or "none"))
+    print("bot runs configured: %s" % (attribution.runs() or "none"))
+    print("  (a '?' after a run name means inferred from its configured symbol,")
+    print("   not claimed by order id)")
     print()
 
     failures = 0
@@ -95,8 +97,11 @@ def main(argv=None) -> int:
             # means the state files were not found or the ids do not match.
             counts = {}
             for row in result:
-                kind = attribution.label(row["order_id"], None)["source"]
-                counts[kind] = counts.get(kind, 0) + 1
+                label = attribution.label(row)
+                key = label["source"]
+                if label["matched_by"]:
+                    key += " (by %s)" % label["matched_by"]
+                counts[key] = counts.get(key, 0) + 1
             print("           attribution: %s"
                   % (", ".join("%s=%d" % kv for kv in sorted(counts.items())) or "none"))
 
@@ -111,11 +116,13 @@ def main(argv=None) -> int:
                       % (row["symbol"], row["qty"], row["cost_price"], row["ltp"],
                          row["unrealised"]))
             elif name == "orders":
-                label = attribution.label(row["order_id"], None)
+                label = attribution.label(row)
+                who = label["run"] or label["source"]
+                if label["matched_by"] == "symbol":
+                    who += "?"     # inferred from the run's configured symbol
                 print("    %-12s %-22s %-4s %6.0f/%-6.0f %-9s %-10s %s"
                       % (row["order_id"], row["symbol"], row["side"], row["filled_qty"],
-                         row["qty"], row["status"], row["product_type"],
-                         label["run"] or label["source"]))
+                         row["qty"], row["status"], row["product_type"], who))
             else:
                 print("    %-12s %-22s %-4s %6.0f @ %.2f  [%s]"
                       % (row["order_id"], row["symbol"], row["side"], row["qty"],
