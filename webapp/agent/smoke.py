@@ -34,6 +34,10 @@ def main(argv=None) -> int:
     parser.add_argument("--user-key", default=None)
     parser.add_argument("--auth-file", default=str(REPO / "fyers_auth.json"))
     parser.add_argument("--accounts-dir", default=str(REPO / "accounts"))
+    parser.add_argument("--limit", type=int, default=5,
+                        help="rows to print per section (0 for all)")
+    parser.add_argument("--symbol", default=None,
+                        help="only show rows whose symbol contains this, e.g. RELIANCE")
     args = parser.parse_args(argv)
 
     user_key = args.user_key or os.getenv("FYERS_USER_KEY") or ""
@@ -76,12 +80,32 @@ def main(argv=None) -> int:
                   % (name, result["available"], result["utilised"], result["realised_pnl"]))
             continue
 
-        print("%-10s %d row(s)" % (name, len(result)))
-        for row in result[:5]:
+        if args.symbol:
+            needle = args.symbol.upper()
+            shown = [r for r in result if needle in str(r.get("symbol", "")).upper()]
+            print("%-10s %d row(s), %d matching %s"
+                  % (name, len(result), len(shown), args.symbol))
+        else:
+            shown = result
+            print("%-10s %d row(s)" % (name, len(result)))
+
+        if name == "orders":
+            # The question this answers: are bot orders actually being
+            # recognised? Every order showing "manual" when a bot is running
+            # means the state files were not found or the ids do not match.
+            counts = {}
+            for row in result:
+                kind = attribution.label(row["order_id"], None)["source"]
+                counts[kind] = counts.get(kind, 0) + 1
+            print("           attribution: %s"
+                  % (", ".join("%s=%d" % kv for kv in sorted(counts.items())) or "none"))
+
+        limit = len(shown) if args.limit <= 0 else args.limit
+        for row in shown[:limit]:
             if name == "positions":
-                print("    %-22s %-9s %8.0f @ %-10.2f ltp %-10.2f unreal %10.2f  [%s]"
+                print("    %-22s %-9s %8.0f @ %-10.2f ltp %-10.2f unreal %10.2f real %10.2f  [%s]"
                       % (row["symbol"], row["direction"], row["net_qty"], row["avg_price"],
-                         row["ltp"], row["unrealised"], row["kind"]))
+                         row["ltp"], row["unrealised"], row["realised"], row["kind"]))
             elif name == "holdings":
                 print("    %-22s %8.0f @ %-10.2f ltp %-10.2f unreal %10.2f"
                       % (row["symbol"], row["qty"], row["cost_price"], row["ltp"],
@@ -96,8 +120,8 @@ def main(argv=None) -> int:
                 print("    %-12s %-22s %-4s %6.0f @ %.2f  [%s]"
                       % (row["order_id"], row["symbol"], row["side"], row["qty"],
                          row["price"], row["kind"]))
-        if len(result) > 5:
-            print("    ... %d more" % (len(result) - 5))
+        if len(shown) > limit:
+            print("    ... %d more (use --limit 0 to see all)" % (len(shown) - limit))
 
     print()
     print("FAILED (%d section(s))" % failures if failures else "OK — all five sections read")
