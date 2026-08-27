@@ -74,3 +74,13 @@ artifacts/
 
 # BTST paper-bot runtime state
 state/btst_paper/
+
+# dashboard agent secret (see webapp/agent.env.example)
+webapp/agent.env
+
+# dashboard API secrets (see webapp/dashboard.env.example)
+webapp/dashboard.env
+webapp/web/node_modules/
+webapp/web/dist/
+webapp/api/.venv/
+webapp/web/tsconfig.tsbuildinfo

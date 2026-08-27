@@ -1,0 +1,70 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Colour roles, not raw hex, so light and dark swap in one place.
+   Values come from the validated reference palette; the gain/loss pair sits in
+   the CVD floor band, which is legal only with secondary encoding — hence the
+   explicit +/- sign on every P&L figure in the UI. */
+:root {
+  color-scheme: light;
+  --surface: #fcfcfb;
+  --plane: #f9f9f7;
+  --ink: #0b0b0b;
+  --ink-secondary: #52514e;
+  --ink-muted: #898781;
+  --hairline: #e1e0d9;
+  --border: rgba(11, 11, 11, 0.1);
+  --gain: #006300;
+  --loss: #d03b3b;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+  --accent: #2a78d6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --surface: #1a1a19;
+    --plane: #0d0d0d;
+    --ink: #ffffff;
+    --ink-secondary: #c3c2b7;
+    --ink-muted: #898781;
+    --hairline: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.1);
+    --gain: #0ca30c;
+    --loss: #e66767;
+    --accent: #3987e5;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #1a1a19;
+  --plane: #0d0d0d;
+  --ink: #ffffff;
+  --ink-secondary: #c3c2b7;
+  --ink-muted: #898781;
+  --hairline: #2c2c2a;
+  --border: rgba(255, 255, 255, 0.1);
+  --gain: #0ca30c;
+  --loss: #e66767;
+  --accent: #3987e5;
+}
+
+body {
+  background: var(--plane);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Money columns must line up vertically; standalone figures keep proportional
+   figures, per the palette's typography rule. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* Masked figures: the shape stays so the layout does not jump. */
+.masked {
+  filter: blur(6px);
+  user-select: none;
+}
