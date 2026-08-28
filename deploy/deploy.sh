@@ -88,6 +88,7 @@ fi
 step "Units"
 run "$PY" deploy/gen_systemd_units.py
 agents_changed=0
+units_changed=0
 for f in deploy/systemd/generated/agent-*.service; do
   [ -f "$f" ] || continue
   installed="/etc/systemd/system/$(basename "$f")"
@@ -95,6 +96,7 @@ for f in deploy/systemd/generated/agent-*.service; do
     warn "$(basename "$f") differs from what is installed"
     run cp "$f" "$installed"
     agents_changed=1
+    units_changed=1
   fi
 done
 # Bot units are copied so the files stay current, but their enable state is
@@ -105,10 +107,13 @@ for f in deploy/systemd/generated/bot-*.service; do
   if [ -f "$installed" ] && ! cmp -s "$f" "$installed"; then
     warn "$(basename "$f") differs from what is installed (copying; enable state untouched)"
     run cp "$f" "$installed"
+    units_changed=1
   fi
 done
-[ "$agents_changed" = "1" ] && run systemctl daemon-reload
-[ "$agents_changed" = "1" ] || say "installed units already match"
+# Reload for ANY unit change, not just an agent's: a copied bot unit that
+# systemd has not re-read is still the old one as far as it is concerned.
+[ "$units_changed" = "1" ] && run systemctl daemon-reload
+[ "$units_changed" = "1" ] || say "installed units already match"
 
 # ── 4. restart what changed ──────────────────────────────────────────────────
 step "Agents"
