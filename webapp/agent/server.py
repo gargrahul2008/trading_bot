@@ -62,6 +62,16 @@ class Agent:
         health = self.book.health()
         health["poller"] = self.poller.status()
         health["allow_trading"] = self.allow_trading
+        credentials = getattr(self.gateway, "credentials", None)
+        if credentials is not None:
+            health["credentials"] = credentials.status()
+        # An expired token makes every section fail identically. Saying so once,
+        # at the top, is the difference between "the broker is unreachable" and
+        # "run the auth unit" — they need different responses.
+        health["auth_ok"] = not any(
+            section.get("error") and "authenticate" in section["error"].lower()
+            for section in health.get("sections", {}).values()
+        )
         return health
 
     def snapshot(self) -> Dict[str, Any]:

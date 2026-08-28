@@ -10,10 +10,14 @@ field it did not recognise is worse than one that shows it unparsed.
 """
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, List, Optional
 
 from common.broker.interfaces import PlaceOrderRequest, to_decimal
+from webapp.agent.credentials import is_auth_error
+
+LOG = logging.getLogger("agent.gateway")
 
 # Fyers order status codes, as used in generic_runner.py:2460.
 STATUS_CANCELLED = 1
@@ -231,44 +235,65 @@ def summarise_funds(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 class FyersGateway:
     """Thin adapter over FyersClient. One instance per agent process, so one
-    account, so one whitelisted IP."""
+    account, so one whitelisted IP.
 
-    def __init__(self, client: Any) -> None:
-        self._client = client
+    Every call goes through `_call`, which reloads the access token and retries
+    once when the broker rejects it. Tokens expire daily, and an agent that ran
+    on for a day and a half against a dead token — reporting every section
+    stale and nothing else — is exactly what this prevents.
+    """
+
+    def __init__(self, credentials: Any) -> None:
+        self._credentials = credentials
+
+    @property
+    def credentials(self) -> Any:
+        return self._credentials
+
+    def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        client = self._credentials.client()
+        try:
+            return getattr(client, method)(*args, **kwargs)
+        except Exception as exc:
+            if not is_auth_error(exc):
+                raise
+            LOG.warning("auth rejected on %s — reloading the token and retrying", method)
+            client = self._credentials.invalidate()
+            return getattr(client, method)(*args, **kwargs)
 
     # ── reads ───────────────────────────────────────────────────────────────
     def positions(self) -> List[Dict[str, Any]]:
-        return [normalise_position(p.raw or {}) for p in self._client.positions()]
+        return [normalise_position(p.raw or {}) for p in self._call("positions")]
 
     def holdings(self) -> List[Dict[str, Any]]:
-        return [normalise_holding(h.raw or {}) for h in self._client.holdings()]
+        return [normalise_holding(h.raw or {}) for h in self._call("holdings")]
 
     def orders(self) -> List[Dict[str, Any]]:
-        payload = self._client.orderbook()
+        payload = self._call("orderbook")
         rows = payload.get("orderBook") or payload.get("orders") or payload.get("data") or []
         now = time.time()
         return [normalise_order(r, now=now) for r in rows if isinstance(r, dict)]
 
     def trades(self) -> List[Dict[str, Any]]:
-        payload = self._client.tradebook()
+        payload = self._call("tradebook")
         rows = payload.get("tradeBook") or payload.get("trades") or payload.get("data") or []
         return [normalise_trade(r) for r in rows if isinstance(r, dict)]
 
     def funds(self) -> Dict[str, Any]:
-        return summarise_funds(self._client.funds_raw())
+        return summarise_funds(self._call("funds_raw"))
 
     # ── writes ──────────────────────────────────────────────────────────────
     def place_order(self, req: PlaceOrderRequest) -> str:
-        return self._client.place_order(req)
+        return self._call("place_order", req)
 
     def modify_order(self, order_id: str, **kwargs: Any) -> Dict[str, Any]:
-        return self._client.modify_order(order_id, **kwargs)
+        return self._call("modify_order", order_id, **kwargs)
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
-        return self._client.cancel_order(order_id)
+        return self._call("cancel_order", order_id)
 
     def exit_position(self, position_id: str) -> Dict[str, Any]:
-        return self._client.exit_position(position_id)
+        return self._call("exit_position", position_id)
 
 
 def build_order_request(payload: Dict[str, Any]) -> PlaceOrderRequest:

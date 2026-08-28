@@ -39,6 +39,19 @@ export function AccountStatus({ row }: { row: AccountRow }) {
     return <Chip tone="critical" label="unreachable" title={row.error ?? undefined} />;
   }
 
+  // A dead token fails every section at once, so "stale positions" would be
+  // both true and useless. Name the actual cause, because the fix is specific:
+  // refresh the account's token.
+  if (row.auth_ok === false) {
+    return (
+      <Chip
+        tone="critical"
+        label="token expired"
+        title="The broker is rejecting this account's access token — run its fyers-auth unit."
+      />
+    );
+  }
+
   const stalest = Object.entries(row.sections)
     .filter(([, meta]) => meta.stale)
     .sort((a, b) => (b[1].age_s ?? 0) - (a[1].age_s ?? 0))[0];

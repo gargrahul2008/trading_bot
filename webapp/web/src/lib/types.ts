@@ -47,6 +47,9 @@ export interface AccountRow {
   account: string;
   reachable: boolean;
   live: boolean;
+  /** False when the broker is rejecting the access token. Distinct from
+   *  unreachable: the agent is fine, its credentials are not. */
+  auth_ok?: boolean;
   phase?: string | null;
   allow_trading?: boolean;
   error: string | null;

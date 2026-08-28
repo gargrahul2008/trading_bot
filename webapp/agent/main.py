@@ -25,9 +25,9 @@ REPO = Path(__file__).resolve().parents[2]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from common.broker.auth_json import get_fyers_creds_from_json
 from common.broker.fyers_client import FyersClient
 from webapp.agent.attribution import Attribution
+from webapp.agent.credentials import CredentialSource
 from webapp.agent.book import Book
 from webapp.agent.budget import DEFAULT_PER_MIN, Budget
 from webapp.agent.gateway import FyersGateway
@@ -79,8 +79,14 @@ def build_agent(args: argparse.Namespace) -> Agent:
         args.user, user_key, proxy or "host IP (no proxy set)",
     )
 
-    client_id, access_token = get_fyers_creds_from_json(args.auth_file, user_key=user_key)
-    gateway = FyersGateway(FyersClient(client_id=client_id, access_token=access_token))
+    # Read through a CredentialSource rather than once at startup: the token
+    # expires daily and fyers_auto_auth rewrites the file each morning.
+    credentials = CredentialSource(
+        auth_file=args.auth_file,
+        user_key=user_key,
+        build=lambda client_id, token: FyersClient(client_id=client_id, access_token=token),
+    )
+    gateway = FyersGateway(credentials)
 
     book = Book(args.user)
     poller = Poller(
