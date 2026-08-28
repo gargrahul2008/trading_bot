@@ -1,29 +1,53 @@
 #!/usr/bin/env bash
-# Daily one-shot Fyers token refresh, PER USER and IP-bound. Cron: 08:30 IST (03:00 UTC),
-# 25 min before the 08:55 bot start so the bots load a fresh token.
+# Daily one-shot Fyers token refresh, PER ACCOUNT and IP-bound. Cron: 08:30 IST
+# (03:00 UTC), 25 min before the 08:55 bot start so the bots load a fresh token.
 #
-# Replaces the always-on fyers-auth-* systemd units and the legacy `--enabled-only` cron.
-# Per-user (never --enabled-only) so each account's login exits from ITS whitelisted IP:
-#   user1 (Rahul)    -> no proxy: the master host IP is his whitelisted IP.
-#   user2 (Pratibha) -> her proxy 157.245.108.24 (from accounts/pratibha/account.env).
-#   user3 (Piyush)   -> his EC2 proxy 15.252.102.31 (from accounts/piyush/account.env).
-# (user4 unused: auto_refresh=false, no token.)
-# Then sync user1's fresh token to the FyersFire app (preserves the old cron's behaviour).
+# Replaces the always-on fyers-auth-* systemd units and the legacy
+# `--enabled-only` cron. Per-account (never --enabled-only) so each login exits
+# from ITS whitelisted IP.
+#
+# The account list comes from deploy/accounts.py, which reads fyers_auth.json —
+# the same register deploy/onboard.py and deploy/preflight.sh use. It used to be
+# three hardcoded blocks, which meant a newly added account would silently never
+# get a token and its agent would simply die at the next expiry.
+#
+# Then sync user1's fresh token to the FyersFire app (preserves the old cron's
+# behaviour).
 set -u
 cd /root/trading_bot || exit 1
 PY=/root/trading_bot/env/bin/python
 
-echo "$(date -u +%FT%TZ) refreshing user1 (rahul, direct)"
-env $(grep -v '^#' accounts/rahul/account.env | xargs) \
-  "$PY" scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user1 --once
+failed=0
+count=0
 
-echo "$(date -u +%FT%TZ) refreshing user2 (pratibha, via proxy)"
-env $(grep -v '^#' accounts/pratibha/account.env | xargs) \
-  "$PY" scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user2 --once
+while read -r account user_key; do
+  [ -n "$account" ] || continue
+  count=$((count + 1))
+  env_file="accounts/$account/account.env"
+  proxy=$(sed -n 's/^HTTPS_PROXY=//p' "$env_file" | head -1)
+  echo "$(date -u +%FT%TZ) refreshing $account ($user_key, ${proxy:-direct})"
 
-echo "$(date -u +%FT%TZ) refreshing user3 (piyush, via EC2 proxy)"
-env $(grep -v '^#' accounts/piyush/account.env | xargs) \
-  "$PY" scripts/fyers_auto_auth.py --auth-file fyers_auth.json --user-key user3 --once
+  # Each login runs under its own account.env, so it leaves by that account's
+  # whitelisted IP. Doing them in one process would share whichever proxy the
+  # environment happened to hold.
+  if ! env $(grep -v '^#' "$env_file" | xargs) \
+        "$PY" scripts/fyers_auto_auth.py --auth-file fyers_auth.json \
+              --user-key "$user_key" --once; then
+    echo "$(date -u +%FT%TZ) FAILED to refresh $account ($user_key)"
+    failed=$((failed + 1))
+  fi
+done < <("$PY" deploy/accounts.py --refreshable)
+
+if [ "$count" -eq 0 ]; then
+  # Silence here would look identical to success, and the first anyone would
+  # know is every agent failing authentication the next morning.
+  echo "$(date -u +%FT%TZ) ERROR: no refreshable accounts found — check fyers_auth.json"
+  exit 1
+fi
 
 echo "$(date -u +%FT%TZ) syncing FyersFire auth"
 "$PY" scripts/sync_fyersfire_auth.py
+
+echo "$(date -u +%FT%TZ) refreshed $((count - failed))/$count account(s)"
+[ "$failed" -gt 0 ] && exit 1
+exit 0
