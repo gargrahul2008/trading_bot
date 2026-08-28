@@ -217,3 +217,30 @@ sudo systemctl daemon-reload && sudo systemctl restart agent-pratibha agent-rahu
 `/health` will then show `"allow_trading": true`. Every place/modify/cancel/exit
 is logged at WARNING with account, side, symbol and quantity **before** the call,
 so `journalctl -u agent-<user>` is the record even if the broker call fails.
+
+## 8. Preflight — check the host is in the state it should be in
+
+```bash
+deploy/preflight.sh            # everything, including egress IPs
+deploy/preflight.sh --quick    # skip the checks that leave the machine
+```
+
+Exits non-zero if anything FAILs, so it can gate a deploy. It checks:
+
+| | |
+|---|---|
+| **Units** | bot units **disabled** (cron owns their lifecycle), agent units enabled and active, no `fyers-auth-*` installed |
+| **Cron** | `refresh_tokens.sh`, `start_equity_bots.sh`, `stop_equity_bots.sh` all present |
+| **Tokens** | every `auto_refresh` user refreshed today, with its age |
+| **Agents** | reachable, `auth_ok`, never rate limited, no stale sections |
+| **Egress** | each account leaves by its own proxy's IP — self-validating, nothing hardcoded |
+| **Secrets** | `agent.env` and `dashboard.env` present, no placeholders, mode 0600 |
+
+An **enabled bot unit is a FAIL, not a warning.** The bots are started at 08:55
+IST and stopped at 15:31 by `deploy/cron/start_equity_bots.sh`, because a Fyers
+SDK session left idling overnight wedges at HTTP 429 on the open-bell burst and
+never recovers. That script is also where individual bots are held down. An
+enabled unit starts on boot regardless of any of that.
+
+Run it after any deploy, and whenever something looks wrong — it names the cause
+faster than reading logs.
