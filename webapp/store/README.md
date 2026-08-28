@@ -63,6 +63,17 @@ Three agents write while the API reads:
   fresh one per request, since `sqlite3` handles are not thread-safe and FastAPI
   serves on many.
 
+## Is it filling?
+
+```bash
+env/bin/python -m webapp.store.status
+```
+
+Read-only. Per account: when the agent was last heard from, how old each
+snapshot is, and how many orders and fills are recorded. The last line is the
+one that matters — if nothing has been written for over five minutes, the agents
+are not running, because status alone is written every ~15 seconds.
+
 ## Layout
 
 | | |
