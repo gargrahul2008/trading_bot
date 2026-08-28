@@ -71,6 +71,17 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def persistence_disabled(db: Optional[str]) -> bool:
+    """True only when the operator asked for no store, with `--db none`.
+
+    Not `str(db).lower() == "none"`: argparse's default for --db is Python's
+    None, and str(None) is the string "none" — so the default silently disabled
+    the store it was meant to enable, and the agent ran with persistence off
+    while reporting itself perfectly healthy.
+    """
+    return db is not None and str(db).strip().lower() == "none"
+
+
 def build_agent(args: argparse.Namespace) -> Agent:
     user_key = args.user_key or os.getenv("FYERS_USER_KEY") or ""
     if not user_key:
@@ -95,7 +106,7 @@ def build_agent(args: argparse.Namespace) -> Agent:
     gateway = FyersGateway(credentials)
 
     writer = None
-    if str(args.db).lower() != "none":
+    if not persistence_disabled(args.db):
         try:
             conn = connect(args.db)
             migrate(conn)

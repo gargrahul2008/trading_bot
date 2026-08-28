@@ -136,3 +136,22 @@ def test_a_fill_seen_twice_is_stored_once(db):
     writer.fills(fill)
     writer.fills(fill)
     assert conn.execute("SELECT COUNT(*) FROM fills").fetchone()[0] == 1
+
+
+def test_the_default_db_argument_does_not_disable_the_store():
+    """`--db none` turns persistence off. The default must not.
+
+    argparse's default for --db is Python's None, and `str(None).lower()` is the
+    string "none" — so the original check disabled the store whenever the flag
+    was omitted, which is every time. The agents ran for a day writing nothing
+    and reporting themselves healthy.
+    """
+    from webapp.agent.main import persistence_disabled
+
+    assert persistence_disabled(None) is False, "the default must keep the store on"
+    assert persistence_disabled("") is False
+    assert persistence_disabled("/var/lib/dashboard.db") is False
+
+    assert persistence_disabled("none") is True
+    assert persistence_disabled("NONE") is True
+    assert persistence_disabled(" none ") is True
