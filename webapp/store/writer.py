@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -52,23 +53,32 @@ class Writer:
         self.errors = 0
         self.writes = 0
         self._digests: Dict[str, str] = {}
+        # The connection is opened with check_same_thread=False so the poller
+        # thread can use one made on the main thread; this lock is what makes
+        # that safe rather than merely permitted.
+        self._lock = threading.Lock()
 
     # ── plumbing ────────────────────────────────────────────────────────────
     def _safe(self, what: str, fn, *args) -> bool:
-        try:
-            fn(*args)
-            self.conn.commit()
-            self.writes += 1
-            return True
-        except Exception as exc:
-            self.errors += 1
+        with self._lock:
             try:
-                self.conn.rollback()
-            except Exception:
-                pass
-            # Deliberately not re-raised: the poller must keep polling.
-            LOG.warning("%s: could not persist %s: %s", self.account, what, exc)
-            return False
+                fn(*args)
+                self.conn.commit()
+                self.writes += 1
+                return True
+            except Exception as exc:
+                self.errors += 1
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                # Deliberately not re-raised: the poller must keep polling.
+                # That is right, but it is also why this class counts its
+                # errors — a silent failure that never stops anything is one
+                # nobody notices. `stats()` is surfaced on /health for exactly
+                # this reason.
+                LOG.warning("%s: could not persist %s: %s", self.account, what, exc)
+                return False
 
     def seen(self) -> None:
         now = time.time()

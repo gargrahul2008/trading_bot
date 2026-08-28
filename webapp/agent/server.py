@@ -65,6 +65,12 @@ class Agent:
         credentials = getattr(self.gateway, "credentials", None)
         if credentials is not None:
             health["credentials"] = credentials.status()
+
+        # Persistence failures are swallowed so the poller survives them, which
+        # means nothing else would ever show them. A rising error count here is
+        # the only signal that history is being lost.
+        writer = getattr(self.poller, "writer", None)
+        health["store"] = writer.stats() if writer is not None else {"enabled": False}
         # An expired token makes every section fail identically. Saying so once,
         # at the top, is the difference between "the broker is unreachable" and
         # "run the auth unit" — they need different responses.

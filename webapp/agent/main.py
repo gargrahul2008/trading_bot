@@ -100,6 +100,10 @@ def build_agent(args: argparse.Namespace) -> Agent:
             conn = connect(args.db)
             migrate(conn)
             writer = Writer(conn, args.user)
+            # Logged at INFO because the alternative — running with persistence
+            # silently off — looks identical from the outside.
+            LOG.info("%s: store ready at %s", args.user,
+                     args.db or os.getenv("DASHBOARD_DB") or "the default path")
         except Exception as exc:
             # History is worth having, but not at the cost of the live view: an
             # agent that cannot open the store still polls and still serves.

@@ -108,6 +108,11 @@ def main(argv=None) -> int:
         print("\norders by trading day: " +
               ", ".join("%s=%d" % (d[0], d[1]) for d in days))
 
+    print("\nIf this looks empty while the agents are running, ask them directly —"
+          "\n  curl -s -H \"Authorization: Bearer $AGENT_TOKEN\" localhost:9102/health"
+          "\n  | python3 -c \"import json,sys; print(json.load(sys.stdin)['store'])\""
+          "\nA rising 'errors' there means writes are being attempted and failing.")
+
     latest = conn.execute("SELECT MAX(taken_at) FROM snapshots").fetchone()[0]
     if latest:
         # The single most useful line: is it filling right now, or did it stop.

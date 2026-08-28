@@ -9,6 +9,12 @@ connection settings matter as much as the tables:
   raise, because losing a fill to a lock is losing it for good.
 * **foreign_keys** — off by default in SQLite, which quietly turns a declared
   reference into a comment.
+* **check_same_thread=False** — an agent opens its connection on the main thread
+  and then writes from the poller's thread. sqlite3 refuses that by default, and
+  because the writer swallows its own errors the refusal was invisible: the agent
+  ran normally and stored nothing at all. Access is serialised by `Writer`'s lock
+  on the write side, and the API opens a fresh connection per request on the read
+  side, so the check is not protecting anything here.
 """
 from __future__ import annotations
 
@@ -122,9 +128,14 @@ def connect(path: Optional[str] = None, *, read_only: bool = False) -> sqlite3.C
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     if read_only and os.path.exists(path):
-        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=BUSY_TIMEOUT_MS / 1000)
+        conn = sqlite3.connect(
+            "file:%s?mode=ro" % path, uri=True,
+            timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=False,
+        )
     else:
-        conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
+        conn = sqlite3.connect(
+            path, timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=False,
+        )
 
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = %d" % BUSY_TIMEOUT_MS)
