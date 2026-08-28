@@ -6,6 +6,12 @@ Emits into deploy/systemd/generated/ (review, then copy to /etc/systemd/system/)
   - bot-<user>-<strategy>.service   : one live bot per strategy run.
       Reads accounts/<user>/account.env (identity + this account's IP/proxy — single source),
       runs run_strategy.py against that run's config.
+      DELIBERATELY NOT ENABLE-ABLE: no [Install] section, so `systemctl enable` refuses.
+      deploy/cron/start_equity_bots.sh starts these at 08:55 IST and stop_equity_bots.sh
+      stops them at 15:31. A Fyers SDK session left idling overnight wedges at HTTP 429 on
+      the open-bell burst and never recovers, so a fresh session each morning is the design,
+      not an accident — and that script is also where bots are held down. Enabling these
+      would start every bot on boot, including any that is deliberately held down.
   - agent-<user>.service            : the dashboard's per-account Fyers agent, IP-bound
       (same account.env again). Polls positions/orders/funds/holdings for the dashboard
       and is the only path by which the dashboard reaches a broker.
@@ -60,8 +66,12 @@ Restart=always
 RestartSec=5
 SyslogIdentifier=bot-{user}-{strat}
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section, on purpose: `systemctl enable` refuses a unit without one.
+# These are started and stopped daily by deploy/cron/start_equity_bots.sh and
+# stop_equity_bots.sh — a fresh SDK session each morning, because one left idling
+# overnight wedges at HTTP 429 on the open-bell burst and never recovers. That
+# script is also where individual bots are held down; enabling this unit would
+# start it on boot regardless, held down or not.
 """
 
 def load_agent_ports() -> dict:
@@ -115,6 +125,7 @@ def main() -> None:
     # Trading routes are opt-in: without ALLOW_TRADING=1 the generated agents are
     # read-only and cannot place an order however they are called.
     allow_trading = os.environ.get("ALLOW_TRADING", "").strip() in ("1", "true", "yes")
+    emit_auth = os.environ.get("EMIT_AUTH_UNITS", "").strip() in ("1", "true", "yes")
     ports = load_agent_ports()
     known = dict(ports)
 
@@ -142,7 +153,12 @@ def main() -> None:
             (OUT / f"bot-{user}-{strat}.service").write_text(
                 BOT_UNIT.format(user=user, strat=strat, install=INSTALL_DIR, python=PYTHON)
             )
-            print(f"  bot-{user}-{strat}.service")
+            print(f"  bot-{user}-{strat}.service (started by cron, not enable-able)")
+
+    if not emit_auth:
+        print("\n  fyers-auth-*.service not emitted: deploy/cron/refresh_tokens.sh"
+              " already refreshes tokens daily.")
+        print("  Set EMIT_AUTH_UNITS=1 only on a host without that cron.")
 
     if ports != known:
         with open(AGENT_PORTS, "w", encoding="utf-8") as fh:

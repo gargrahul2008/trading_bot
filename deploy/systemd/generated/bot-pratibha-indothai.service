@@ -12,5 +12,9 @@ Restart=always
 RestartSec=5
 SyslogIdentifier=bot-pratibha-indothai
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section, on purpose: `systemctl enable` refuses a unit without one.
+# These are started and stopped daily by deploy/cron/start_equity_bots.sh and
+# stop_equity_bots.sh — a fresh SDK session each morning, because one left idling
+# overnight wedges at HTTP 429 on the open-bell burst and never recovers. That
+# script is also where individual bots are held down; enabling this unit would
+# start it on boot regardless, held down or not.
