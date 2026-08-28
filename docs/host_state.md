@@ -867,3 +867,212 @@ deliberate daily-restart design and would start held-down bots. It is a
 9. **Should `fyers-pca-engine` fire again?** Its timer is a spent one-shot dated
    2026-08-10; whether that is "done" or "needs re-dating each time" is not recorded
    anywhere on the host.
+
+---
+
+## 11. Token server — who is pulling Pratibha's tokens
+
+**No bot is trading Pratibha's account. Nothing on the old VPS is placing orders with her
+token.** Every order in her account today was placed by a **human in the Fyers web
+terminal** — Fyers stamps them `source: W1` with web-UI tags (`2:Exit`, `2:Charts`), and
+neither is on any of her four held-down symbols. The hold-down is holding.
+
+**But there is trading in her account that this host did not place**, and per the brief
+that is where I stop: two filled BUY orders today, and a steady stream of discretionary
+trades since 2026-08-17. They look like a person trading by hand, not a rogue process —
+but whether that is expected is an operator decision, not mine, and I have taken no action
+on it.
+
+Two things I got wrong in §5 of this document, corrected below: the token server has
+**not** served a token "as recently as today" — I read that from a file mtime that had
+been touched by the crontab accident (§9), not by a request. And the client is not
+necessarily a live bot.
+
+### The decisive evidence: Fyers labels the order channel, and our own bot is the control
+
+The agent's `/orders` carries the raw broker payload, which includes a `source` field.
+Rahul's account today gives a clean control group — the same field, the same day, both
+kinds of order side by side:
+
+| Account | Symbol | Side / product | Status | `raw.source` | `orderTag` | Agent attribution |
+|---|---|---|---|---|---|---|
+| rahul | `NSE:RELIANCE-EQ` | BUY MTF 140 | PENDING | **`API`** | `2:Untagged` | `bot`, `matched_by: order_id`, `run: rahul/reliance` |
+| rahul | `NSE:RELIANCE-EQ` | SELL MTF 140 | PENDING | **`API`** | `2:Untagged` | `bot`, `matched_by: order_id`, `run: rahul/reliance` |
+| rahul | `NSE:OFSS-EQ` | SELL CNC 11 | FILLED | `W` | `2:Charts` | `manual` |
+| rahul | `NSE:RVNL26SEPFUT` | BUY MARGIN 1925 | FILLED | `W1` | `2:Exit` | `manual` |
+| **pratibha** | `NSE:CROMPTON26SEPFUT` | BUY MARGIN 2150 @ ₹235.65 | FILLED | **`W1`** | `2:Exit` | `manual` |
+| **pratibha** | `NSE:TORNTPHARM-EQ` | BUY CNC 40 @ ₹5,002.10 | FILLED | **`W1`** | `2:Charts` | `manual` |
+
+Our own API bot orders are stamped `API`. Human web-terminal orders are stamped `W`/`W1`
+and carry a tag naming the UI control that fired them. This is not read off Fyers'
+documentation — it is observed on this host, today, from both accounts at once.
+
+**Pratibha's account contains no `source: API` order today.** If a surviving bot on the
+old VPS were using her token, its orders would be stamped `API` like ours. There are none.
+
+Her two orders: `26082800047050` at 09:43:05 IST (CROMPTON Sep futures, 2,150, MARGIN) and
+`26082800076010` at 10:14:20 IST (TORNTPHARM, 40, CNC). Both filled, both `clientId
+XP12698`, half an hour apart, two unrelated instruments — discretionary trading, not a
+grid.
+
+### And it is not new — nothing has touched her bot symbols since the hold-down
+
+`accounts/pratibha/reports/trades_all.jsonl` (seeded 2026-08-01, 147 trades) by date and
+symbol:
+
+```
+2026-08-03  BSE:SHISHIND-X          6      ← bot era
+2026-08-10  BSE:SHISHIND-X         14      ← bot era
+2026-08-10  NSE:POLYSIL-SM          1
+2026-08-11  BSE:SHISHIND-X          7      ← bot era
+2026-08-12  BSE:SHISHIND-X         23      ← bot era, last day shishind ran
+─────────────────────────────── hold-down begins 2026-08-17 ───────────────────────────────
+2026-08-17  NSE:AEGISLOG-EQ         1        NSE:JINDALSAW-EQ        1
+2026-08-18  NSE:ABCAPITAL-EQ        5        NSE:AEGISLOG-EQ         1
+2026-08-19  NSE:AARTIDRUGS-EQ      24
+2026-08-21  NSE:ABCAPITAL-EQ        5        NSE:JINDALSAW-EQ       16
+            NSE:SHRINGARMS-EQ      11        NSE:WABAG-EQ            4
+2026-08-25  NSE:TATAELXSI26SEPFUT   1
+2026-08-26  NSE:CROMPTON26SEPFUT    1        NSE:SHRINGARMS-EQ      25
+            NSE:TATAELXSI26SEPFUT   1
+```
+
+The last trade on any of her four bot symbols (`BSE:SHISHIND-X`, `NSE:INDOTHAI-EQ`,
+`NSE:COOLCAPS-ST`, `BSE:ARL-B`) is **2026-08-12** — the day `bot-pratibha-shishind` was
+stopped mid-session. Everything after the hold-down is a different, unrelated set of
+names, including two Sep futures contracts. Her grids have been genuinely idle for the
+whole 7 trading days.
+
+(This file does not carry the `source` field — only date, symbol, side, qty, price,
+order_id — so the API-vs-web split above cannot be extended backwards through it. The
+symbol evidence is what carries the historical claim.)
+
+### So what *is* fetching the tokens
+
+The client is her **pre-migration config**, which still lives in this repo:
+
+```
+strategies/pct_ladder/config.{shishind,indothai,coolcaps,arl}.json
+  "auth_mode":  "http"
+  "token_url":  "http://64.227.135.117:8502/token"
+  "token_secret": <redacted — see the security note below>
+  "user_key":   "user2"
+```
+
+`run_strategy.py:69-87` implements that path: with `auth_mode: http` it GETs `token_url`
+once at startup and logs `auth_mode=http: fetched token for user=%s from %s`. Those four
+files are the *originals* the old VPS ran; the migrated `accounts/pratibha/*/config.json`
+all use `auth_mode: json` and read `fyers_auth.json` directly.
+
+**Nothing on this host has ever used that path.** `grep -r "auth_mode=http" logs/` returns
+nothing across every log on the box. So the requests are genuinely off-host.
+
+I also ruled out the one non-obvious local explanation: a process here with
+`HTTP_PROXY=http://157.245.108.24:3128` requesting our own `:8502` would egress to squid
+and come *back* to us, and the token server would log the source as `157.245.108.24` even
+though the caller was local. That is not happening — no local process uses `auth_mode:
+http`, and the only live connection involving that address is outbound and ours:
+
+```
+ESTAB  64.227.135.117:38910 → 157.245.108.24:3128   users:(("python",pid=953324))   ← agent-pratibha
+```
+
+There is **no established inbound connection to :8502** at all.
+
+### What the token server records, and why the timing is unanswerable
+
+`scripts/token_server.py` overrides `log_message` to suppress the access log, then prints
+one line per outcome:
+
+```python
+print(f"[token_server] served token for user='{user_key}' to {self.client_address[0]}")
+print(f"[token_server] 403 bad secret from {self.client_address[0]}")
+```
+
+That is **the client IP and nothing else — no timestamp, no user agent, no path, no
+request headers.** A Python bot and a person with `curl` are indistinguishable in this
+log, and neither can be placed in time. `BaseHTTPRequestHandler` has the user agent and a
+timestamp available; the handler discards both.
+
+The whole log is 137 lines since 2026-05-05 17:30:
+
+| | |
+|---|---|
+| `served … user='user1'` | 1 (to `127.0.0.1`, at setup) |
+| `served … user='user2'` | **127**, all to `157.245.108.24` |
+| `served … user='user3'` | 0 |
+| `403 bad secret` | 5 — one from `127.0.0.1`, four from `157.245.108.24`, all in the first 10 lines (setup fumbling on day one) |
+
+**Line 137 — the last line in the file — is `-bash: */5: No such file or directory`, the
+crontab-executed-as-a-shell accident from 06:05:21 UTC today (§9).** It is not a token
+request. Nothing has been appended after it, which gives one hard bound:
+
+> **No token has been served since 2026-08-28 06:05:21 UTC.**
+
+Before that bound the log cannot be dated at all. 127 requests over 115 days is ~1.1/day
+averaged, or ~1.5 per trading day — but that average is meaningless if the requests
+stopped at the 2026-07-28 cutover, which the count is equally consistent with. **I could
+not settle when the last fetch happened, and no read-only method on this host can.**
+
+What would settle it, cheaply: the next line the server writes will now land *after* a
+known timestamp, so a single request appearing below line 137 dates itself. Better, add
+`time.strftime` to those two `print`s — a one-line change that makes this log answer the
+question by itself next time.
+
+### Is the old VPS a host we deploy to?
+
+No. It is a proxy to us and nothing more.
+
+- `~/.ssh/config` does not exist. `known_hosts` holds 4 entries, all hashed.
+- `last -20`: every login for the past 11 days is from Rahul's home addresses
+  (`122.172.53.245`, `49.36.235.122`, `49.36.233.244`). **No session has ever originated
+  from `157.245.108.24`.**
+- Every reference to that address in the repo describes it as Pratibha's squid proxy /
+  whitelisted IP — `deploy/proxy/README.md`, `deploy/cron/refresh_tokens.sh`,
+  `docs/master_host_runbook.md`, `docs/dashboard_agent_setup.md`. Nothing treats it as a
+  deploy target: no rsync, no ssh, no remote systemctl.
+
+So this host has no way to see what runs over there, and no mechanism by which it ever
+pushed anything there.
+
+### Security note — the token server's secret is committed to the repo
+
+The `token_secret` in those four `strategies/pct_ladder/config.*.json` files is the **same
+secret** passed on the token server's command line (§2 of this document), and those four
+files are **tracked in git**. Anyone with a clone of this repository has the credential
+that exchanges for Pratibha's live Fyers access token.
+
+The only thing preventing that from being remotely exploitable is ufw:
+
+```
+8502   ALLOW IN   157.245.108.24        ← and nothing else
+```
+
+The server itself binds `0.0.0.0` and has no other access control. That is one firewall
+rule between a committed secret and a live trading identity.
+
+Given that **nothing on this host needs the token server** — all six bots and all three
+agents read `fyers_auth.json` directly — the cleanest fix is to stop serving it at all.
+If it is still needed for something on the old VPS, the secret should be rotated out of
+git into a file like the other secrets, and the log given timestamps.
+
+### Answers to two open questions from §10
+
+**Q4 — "What is still pulling tokens from `157.245.108.24`?"** Something on that box that
+runs one of Pratibha's four pre-migration configs and fetches a token at startup. It is
+**not placing orders** — her account has contained no API-sourced order today and no trade
+on any bot symbol since 2026-08-12. Whether the fetching still happens at all is
+undated and unresolved. The trading-risk half of the question is closed; the hygiene half
+is not.
+
+**"Does Rahul's account still hold any VIKASECO?"** — **Confirmed: it does not.**
+`agent-rahul` reports 7 holdings, **none of them VIKASECO**. The §3 reading was right, the
+bot's own `net_sold DRIFT=-66184` warning was right, and holding `bot-rahul-vikaseco` down
+(commit `073e463`) was the correct call. The run cannot trade and should stay down until
+someone decides whether to re-fund it or retire it.
+
+### What I did not do
+
+Per the brief I did not connect to `157.245.108.24`, made no broker call of my own, opened
+no new Fyers session, and changed nothing. Every figure above comes from local files, the
+already-running agents' cached order books, and this host's own network state.
