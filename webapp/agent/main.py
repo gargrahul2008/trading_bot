@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -111,6 +112,13 @@ def main(argv: Optional[list] = None) -> int:
         level=getattr(logging, str(args.log_level).upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # common.utils.logger.setup_logger attaches its own handler to the "fyers"
+    # logger, and propagation then carries every record up to the root handler
+    # basicConfig just added — so each line was written twice, in two formats,
+    # filling the journal ring buffer at double rate. The bots rely on that
+    # handler (they configure no root logger), so silence the duplicate here
+    # rather than changing shared code.
+    logging.getLogger("fyers").propagate = False
 
     token = os.getenv("AGENT_TOKEN") or ""
     if not token:
@@ -129,9 +137,14 @@ def main(argv: Optional[list] = None) -> int:
     )
 
     def shutdown(signum, _frame):
+        # httpd.shutdown() blocks until serve_forever() returns, and a signal
+        # handler runs on the main thread — the same thread sitting inside
+        # serve_forever(). Calling it here deadlocks, systemd waits out its
+        # 90s TimeoutStopSec and SIGKILLs, and every restart is recorded as a
+        # failure. Hand it to another thread and return immediately.
         LOG.info("%s: signal %s — shutting down", args.user, signum)
         agent.poller.stop()
-        httpd.shutdown()
+        threading.Thread(target=httpd.shutdown, name="agent-shutdown", daemon=True).start()
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)

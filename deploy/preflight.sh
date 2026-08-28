@@ -113,17 +113,20 @@ else
   for user in $(accounts); do
     for run in $(runs_for "$user"); do
       unit="bot-$user-$run.service"
-      # is-enabled writes a sentence to stderr when the unit is absent; keep the
-      # word, drop the sentence.
-      state="$(systemctl is-enabled "$unit" 2>/dev/null)" || state="not-installed"
-      case "${state:-not-installed}" in
+      # NB: is-enabled exits 1 for a disabled unit, so its exit code says nothing
+      # about whether the unit exists — only empty output does. Reading the code
+      # instead had this check warning "not installed" about six units that were
+      # installed, two of them trading at the time.
+      state="$(systemctl is-enabled "$unit" 2>/dev/null)"
+      active="$(systemctl is-active "$unit" 2>/dev/null)"
+      case "${state:-missing}" in
         disabled|static)
-          ok "$unit $state" ;;
+          # Disabled is correct: deploy/cron/start_equity_bots.sh owns the daily
+          # lifecycle. Whether it is running right now depends on the hour and on
+          # whether the run is held down, so report that separately.
+          ok "$unit $state, currently ${active:-unknown}" ;;
         enabled)
-          # The failure this script exists for. deploy/cron/start_equity_bots.sh
-          # owns the lifecycle, including which bots are held down; an enabled
-          # unit starts on boot regardless of that.
-          bad "$unit is ENABLED — it must not start on boot. Run: systemctl disable $unit" ;;
+          bad "$unit is ENABLED — it must not start on boot (cron owns it, and holds bots down). Run: systemctl disable $unit" ;;
         *)
           warn "$unit not installed" ;;
       esac
@@ -132,13 +135,22 @@ else
 
   for user in $(accounts); do
     unit="agent-$user.service"
-    state="$(systemctl is-enabled "$unit" 2>/dev/null)" || state="not-installed"
+    state="$(systemctl is-enabled "$unit" 2>/dev/null)"
     if [ "$state" = "enabled" ]; then
       active="$(systemctl is-active "$unit" 2>&1)"
       if [ "$active" = "active" ]; then ok "$unit enabled and active"
       else bad "$unit enabled but $active"; fi
     else
-      warn "$unit is ${state:-not-installed} — the dashboard has no data for $user without it"
+      warn "$unit is ${state:-not installed} — the dashboard has no data for $user without it"
+    fi
+  done
+
+  for f in "$REPO"/deploy/systemd/generated/*.service; do
+    [ -f "$f" ] || continue
+    installed="/etc/systemd/system/$(basename "$f")"
+    [ -f "$installed" ] || continue
+    if ! cmp -s "$f" "$installed"; then
+      warn "$(basename "$f") in /etc/systemd/system differs from the generated one — cp it in a non-trading window"
     fi
   done
 
