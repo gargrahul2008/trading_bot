@@ -117,11 +117,21 @@ function AccountRowView({ row }: { row: AccountRow }) {
           <Money>{signed(holdings.unrealised)}</Money>
         </span>
       </Cell>
+      {/* The count is of OPEN orders; the breakdown is of every order today.
+          Showing "2 open orders (2 bot / 2 manual)" put two different scopes
+          side by side and read as a contradiction. */}
       <Cell align="left">
-        <span className="text-sm">{plural(orders.open, "open order")}</span>
-        <span className="ml-1 text-xs text-[var(--ink-muted)]">
-          ({bots} bot / {manual} manual)
-        </span>
+        {orders.total === 0 ? (
+          <span className="text-[var(--ink-muted)]">—</span>
+        ) : (
+          <>
+            <span className="text-sm">{count(orders.open)} open</span>
+            <span className="ml-1 text-xs text-[var(--ink-muted)]">
+              of {count(orders.total)} today · {bots} bot / {manual} manual
+              {orders.rejected > 0 && ` · ${orders.rejected} rejected`}
+            </span>
+          </>
+        )}
       </Cell>
     </tr>
   );
@@ -229,7 +239,7 @@ export function OverviewPage() {
               <Header>Positions</Header>
               <Header>Holdings value</Header>
               <Header>Holdings P&amp;L</Header>
-              <Header>Orders</Header>
+              <Header>Orders today</Header>
             </tr>
           </thead>
           <tbody>
