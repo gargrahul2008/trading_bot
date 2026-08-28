@@ -45,10 +45,15 @@ def main(repo: str, token: str) -> int:
                   % (account, account))
             continue
 
+        # `rate_limited` is a lifetime counter, so treating any non-zero value
+        # as a failure meant one transient -429 at the open made this FAIL for
+        # the rest of the agent's uptime. What matters is whether it is being
+        # limited *now*; the history is context.
         budget = (health.get("poller") or {}).get("budget") or {}
-        if budget.get("rate_limited"):
-            print("FAIL|%s: rate limited %d time(s) — it is competing with the bots, lower --per-min"
-                  % (account, budget["rate_limited"]))
+        limited = int(budget.get("rate_limited") or 0)
+        if budget.get("cooling_down") or budget.get("throttled"):
+            print("FAIL|%s: rate limited right now (%d total) — it is competing with the "
+                  "bots, lower --per-min" % (account, limited))
             continue
 
         phase = (health.get("poller") or {}).get("phase")
@@ -59,10 +64,21 @@ def main(repo: str, token: str) -> int:
         )
         trading = ", TRADING ENABLED" if health.get("allow_trading") else ""
 
+        hours = float(health.get("uptime_s") or 0) / 3600.0
+        note = ""
+        if limited:
+            # Backing off is the agent working as designed; the number is only
+            # worth acting on if it is climbing.
+            note = ", backed off %d time(s) in %.1fh" % (limited, hours)
+
         if stale:
             # The tolerance scales with the cadence, so a stale section outside
             # market hours is still a genuine problem, not just a slow poll.
-            print("WARN|%s: stale sections %s (phase %s)" % (account, ",".join(stale), phase))
+            print("WARN|%s: stale sections %s (phase %s)%s"
+                  % (account, ",".join(stale), phase, note))
+        elif limited:
+            print("WARN|%s: live, phase %s, token reloads %s%s%s"
+                  % (account, phase, reloads, note, trading))
         else:
             print("PASS|%s: live, phase %s, token reloads %s%s"
                   % (account, phase, reloads, trading))
