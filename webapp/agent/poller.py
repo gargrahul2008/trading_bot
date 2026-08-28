@@ -32,6 +32,11 @@ TRADES_SWEEP_SECONDS = 60.0
 
 TICK_SECONDS = 0.5
 
+# How often the agent records its own health to the store. At a 0.5s tick this
+# is every 15 seconds — often enough that a restart loses very little, rare
+# enough to be invisible next to the polling itself.
+STATUS_EVERY_TICKS = 30
+
 
 class Poller:
     def __init__(
@@ -42,10 +47,14 @@ class Poller:
         budget: Optional[Budget] = None,
         session: Optional[Session] = None,
         attribution: Optional[Attribution] = None,
+        writer: Optional[Any] = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.gateway = gateway
         self.book = book
+        # Optional so the poller can be tested, and run, without a store. It is
+        # never allowed to be the reason a poll fails — see Writer._safe.
+        self.writer = writer
         self.budget = budget or Budget()
         self.session = session or Session()
         self.attribution = attribution
@@ -61,17 +70,35 @@ class Poller:
     # ── fetchers ────────────────────────────────────────────────────────────
     def _fetch(self, name: str) -> None:
         if name == "positions":
-            self.book.set("positions", self.gateway.positions())
+            data = self.gateway.positions()
+            self.book.set("positions", data)
+            self._persist_snapshot("positions", data)
         elif name == "orders":
-            self.book.set("orders", self._orders_with_attribution())
+            data = self._orders_with_attribution()
+            self.book.set("orders", data)
+            if self.writer is not None:
+                self.writer.orders(data)
         elif name == "holdings":
-            self.book.set("holdings", self.gateway.holdings())
+            data = self.gateway.holdings()
+            self.book.set("holdings", data)
+            self._persist_snapshot("holdings", data)
         elif name == "funds":
-            self.book.set("funds", self.gateway.funds())
+            data = self.gateway.funds()
+            self.book.set("funds", data)
+            self._persist_snapshot("funds", data)
         elif name == "trades":
-            self.book.set("trades", self.gateway.trades())
+            data = self.gateway.trades()
+            self.book.set("trades", data)
+            if self.writer is not None:
+                self.writer.fills(data)
         else:  # pragma: no cover - PRIORITY is the only caller
             raise KeyError(name)
+
+    def _persist_snapshot(self, kind: str, data: Any) -> None:
+        """Positions are read every 3s and change a few times an hour, so only
+        changes are stored — the same information at a fraction of the rows."""
+        if self.writer is not None:
+            self.writer.snapshot(kind, data)
 
     def _orders_with_attribution(self) -> List[Dict[str, Any]]:
         orders = self.gateway.orders()
@@ -117,6 +144,9 @@ class Poller:
         # which changes with the session.
         self.book.set_tolerances(intervals)
 
+        if self.writer is not None and (self.ticks % STATUS_EVERY_TICKS == 1):
+            self._persist_status(self.status_health())
+
         for name in PRIORITY:
             if now < self._due.get(name, 0.0):
                 continue
@@ -150,6 +180,17 @@ class Poller:
 
             self._due[name] = self._clock() + interval
 
+    def _persist_status(self, health: Dict[str, Any]) -> None:
+        """The agent's last word about itself, so the API can still describe this
+        account while the agent is restarting.
+
+        Registering the account happens here rather than at startup, so the
+        accounts table can never fall out of step with the status beside it.
+        """
+        if self.writer is not None:
+            self.writer.seen()
+            self.writer.status(health)
+
     def run(self) -> None:
         LOG.info("%s: poller started", self.book.user)
         while not self._stop.is_set():
@@ -181,6 +222,14 @@ class Poller:
         """
         if name in self._due:
             self._due[name] = 0.0
+
+    def status_health(self) -> Dict[str, Any]:
+        """What gets written to the store: the book's own health plus this
+        poller's state. Deliberately the same shape the HTTP /health returns, so
+        a stored status and a live one are interchangeable to the API."""
+        health = self.book.health()
+        health["poller"] = self.status()
+        return health
 
     def status(self) -> Dict[str, Any]:
         now = self._clock()

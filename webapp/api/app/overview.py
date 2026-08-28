@@ -91,14 +91,20 @@ def account_summary(
 
     An unreachable account still produces a row — named, flagged, with whatever
     is known. Dropping it would make a broken agent look like a closed account.
+
+    `error` describes the *agent*, not the data: when the agent is unreachable
+    but the store has its last book, the row is populated from that and the
+    error rides along. Treating any error as "no data" threw away the fallback
+    the store exists to provide.
     """
-    if error or book is None:
+    if book is None:
         return {
             "account": account,
             "reachable": False,
             "live": False,
             "error": error or "no data from agent",
             "auth_ok": True,
+            "from_store": False,
             "funds": None,
             "positions": None,
             "holdings": None,
@@ -111,10 +117,17 @@ def account_summary(
     orders = _rows(book, "orders")
     funds = _section_meta(book, "funds").get("data") or {}
 
+    # Reachable means the agent answered. A row rebuilt from the store has data
+    # but no live agent, and the screen must not imply otherwise.
+    from_store = str((book or {}).get("source")) == "store"
+
     return {
         "account": account,
-        "reachable": True,
-        "live": bool((health or {}).get("live")),
+        "reachable": not from_store,
+        # Always present, never optional: the UI decides how to render a row on
+        # this, and a key that is sometimes absent is a branch someone forgets.
+        "from_store": from_store,
+        "live": bool((health or {}).get("live")) and not from_store,
         # An expired token makes every section fail identically. It needs its
         # own signal, because the fix is "refresh the token", not "wait".
         "auth_ok": bool((health or {}).get("auth_ok", True)),
@@ -150,11 +163,17 @@ def totals(accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
     quietly omits an unreachable account is a wrong number presented as a right
     one.
     """
-    live = [row for row in accounts if row.get("reachable") and row.get("funds")]
+    # Keyed on having figures rather than on the agent being up: a row rebuilt
+    # from the store has real numbers and belongs in the total. Only an account
+    # we know nothing at all about is missing from it.
+    live = [row for row in accounts if row.get("funds")]
     return {
         "accounts": len(accounts),
         "accounts_reporting": len(live),
-        "accounts_missing": [row["account"] for row in accounts if not row.get("reachable")],
+        "accounts_missing": [row["account"] for row in accounts if not row.get("funds")],
+        "accounts_from_store": [
+            row["account"] for row in accounts if row.get("from_store")
+        ],
         "available": round(sum(row["funds"]["available"] for row in live), 2),
         "utilised": round(sum(row["funds"]["utilised"] for row in live), 2),
         "realised_today": round(sum(row["funds"]["realised_today"] for row in live), 2),

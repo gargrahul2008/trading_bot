@@ -50,6 +50,10 @@ export interface AccountRow {
   /** False when the broker is rejecting the access token. Distinct from
    *  unreachable: the agent is fine, its credentials are not. */
   auth_ok?: boolean;
+  /** True when this row was rebuilt from the store because the agent could not
+   *  be reached. The figures are real but not current. */
+  from_store: boolean;
+  agent_error?: string;
   phase?: string | null;
   allow_trading?: boolean;
   error: string | null;
@@ -64,6 +68,7 @@ export interface Totals {
   accounts: number;
   accounts_reporting: number;
   accounts_missing: string[];
+  accounts_from_store: string[];
   available: number;
   utilised: number;
   realised_today: number;

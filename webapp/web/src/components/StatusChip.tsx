@@ -35,6 +35,21 @@ export function Chip({ tone, label, title }: { tone: Tone; label: string; title?
  *  are older than they should be, live means act on them.
  */
 export function AccountStatus({ row }: { row: AccountRow }) {
+  // Rebuilt from the store because the agent could not be reached. The figures
+  // are real, but they are not now — the row must never pass for live.
+  if (row.from_store) {
+    const oldest = Object.values(row.sections)
+      .map((meta) => meta.age_s ?? 0)
+      .reduce((a, b) => Math.max(a, b), 0);
+    return (
+      <Chip
+        tone="warning"
+        label={`last seen ${age(oldest)}`}
+        title={row.agent_error ?? "agent unreachable — showing what it last recorded"}
+      />
+    );
+  }
+
   if (!row.reachable) {
     return <Chip tone="critical" label="unreachable" title={row.error ?? undefined} />;
   }

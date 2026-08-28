@@ -153,6 +153,16 @@ def test_a_slow_agent_times_out_rather_than_hanging_the_page(monkeypatch):
 
 
 def test_health_is_reachable_without_signing_in(client):
+    """It is unauthenticated so a monitor can poll it, which means it must
+    describe the wiring and never the money."""
     payload = client.get("/api/health").json()
     assert "accounts" in payload and "problems" in payload
-    assert "available" not in str(payload), "health must leak no account figures"
+
+    # Account names are fine — they are in the repo. Balances, positions and
+    # P&L are not, in any nesting.
+    for forbidden in ("funds", "positions", "holdings", "totals",
+                      "realised", "unrealised", "utilised"):
+        assert forbidden not in str(payload), "health leaked %r" % forbidden
+
+    # It does report whether the store is readable, which is wiring, not money.
+    assert "store" in payload

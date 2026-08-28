@@ -35,6 +35,8 @@ from webapp.agent.gateway import FyersGateway
 from webapp.agent.poller import Poller
 from webapp.agent.server import Agent, serve
 from webapp.agent.session import Session
+from webapp.store import connect, migrate
+from webapp.store.writer import Writer
 
 LOG = logging.getLogger("agent")
 
@@ -62,6 +64,9 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         action="store_true",
         help="expose place/modify/cancel/exit. Read-only without it.",
     )
+    parser.add_argument("--db", default=None,
+                        help="SQLite store (default webapp/data/dashboard.db); "
+                             "'none' disables persistence")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -89,6 +94,18 @@ def build_agent(args: argparse.Namespace) -> Agent:
     )
     gateway = FyersGateway(credentials)
 
+    writer = None
+    if str(args.db).lower() != "none":
+        try:
+            conn = connect(args.db)
+            migrate(conn)
+            writer = Writer(conn, args.user)
+        except Exception as exc:
+            # History is worth having, but not at the cost of the live view: an
+            # agent that cannot open the store still polls and still serves.
+            LOG.error("%s: store unavailable, running without persistence: %s",
+                      args.user, exc)
+
     book = Book(args.user)
     poller = Poller(
         gateway,
@@ -96,6 +113,7 @@ def build_agent(args: argparse.Namespace) -> Agent:
         budget=Budget(per_min=args.per_min),
         session=Session(),
         attribution=Attribution(os.path.join(args.accounts_dir, args.user)),
+        writer=writer,
     )
     return Agent(
         user=args.user,

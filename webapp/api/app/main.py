@@ -27,6 +27,7 @@ from app.auth import (
     verify_password,
 )
 from app.config import REPO, agent_ports, get_settings, known_accounts
+from app.store import store_book, store_counts, store_status
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger("api")
@@ -98,14 +99,23 @@ def get_overview(_: str = Session) -> Dict[str, Any]:
     for name in names:
         book = books.get(name)
         health = healths.get(name)
-        rows.append(
-            overview_mod.account_summary(
-                name,
-                book.data if book and book.ok else None,
-                health.data if health and health.ok else None,
-                error=(book.error if book else "no agent"),
-            )
+
+        if book and book.ok:
+            rows.append(overview_mod.account_summary(name, book.data, health.data if health and health.ok else None))
+            continue
+
+        # The agent is down or restarting. Rather than an empty row, serve what
+        # it last wrote — clearly marked as from the store and visibly ageing.
+        # "We cannot reach this account" and "here is what it was four minutes
+        # ago" are very different answers to look at.
+        stored = store_book(name)
+        summary = overview_mod.account_summary(
+            name, stored, store_status(name),
+            error=(book.error if book else "no agent"),
         )
+        if stored is not None:
+            summary["agent_error"] = book.error if book else "no agent"
+        rows.append(summary)
 
     return {"accounts": rows, "totals": overview_mod.totals(rows), "configured": True}
 
@@ -138,6 +148,9 @@ def health() -> Dict[str, Any]:
         "problems": problems,
         "accounts": known_accounts(),
         "cookie_secure": cookie_secure(),
+        # Distinguishes "the dashboard is empty" from "nothing has been written
+        # to the store yet", which look identical from the outside.
+        "store": store_counts(),
     }
 
 

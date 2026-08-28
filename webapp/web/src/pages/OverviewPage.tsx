@@ -65,7 +65,10 @@ function AccountRowView({ row }: { row: AccountRow }) {
   const manual = orders.by_source.manual ?? 0;
 
   return (
-    <tr className="border-t" style={{ borderColor: "var(--hairline)" }}>
+    <tr
+      className="border-t"
+      style={{ borderColor: "var(--hairline)", opacity: row.from_store ? 0.62 : 1 }}
+    >
       <Cell align="left">
         <span className="font-medium">{row.account}</span>
         {row.allow_trading && (
@@ -137,6 +140,7 @@ export function OverviewPage() {
 
   const { totals, accounts } = data;
   const missing = totals.accounts_missing;
+  const stored = totals.accounts_from_store ?? [];
 
   return (
     <>
@@ -162,6 +166,17 @@ export function OverviewPage() {
 
       {/* A total that quietly omits an unreachable account is a wrong number
           presented as a right one. Say so, above the numbers it affects. */}
+      {stored.length > 0 && (
+        <div
+          className="mb-4 rounded border px-3 py-2 text-sm"
+          style={{ borderColor: "var(--status-warning)", color: "var(--ink)" }}
+        >
+          <strong>{stored.join(", ")}</strong>{" "}
+          {stored.length === 1 ? "is" : "are"} showing their last recorded figures — their
+          agent is not answering. Included in the totals, but not current.
+        </div>
+      )}
+
       {missing.length > 0 && (
         <div
           className="mb-4 rounded border px-3 py-2 text-sm"
