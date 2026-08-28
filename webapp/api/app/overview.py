@@ -98,6 +98,7 @@ def account_summary(
             "reachable": False,
             "live": False,
             "error": error or "no data from agent",
+            "auth_ok": True,
             "funds": None,
             "positions": None,
             "holdings": None,
@@ -114,6 +115,9 @@ def account_summary(
         "account": account,
         "reachable": True,
         "live": bool((health or {}).get("live")),
+        # An expired token makes every section fail identically. It needs its
+        # own signal, because the fix is "refresh the token", not "wait".
+        "auth_ok": bool((health or {}).get("auth_ok", True)),
         "phase": ((health or {}).get("poller") or {}).get("phase"),
         "allow_trading": bool((health or {}).get("allow_trading")),
         "error": None,

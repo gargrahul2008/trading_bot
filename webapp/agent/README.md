@@ -86,6 +86,25 @@ a short.** You cannot short on delivery, so it is stock sold out of the holdings
 book and awaiting settlement. Rendering it as SHORT would read as open risk that
 has to be bought back, so the agent flags it `delivery_sale`.
 
+## The access token expires daily
+
+`scripts/fyers_auto_auth.py` rewrites `fyers_auth.json` each morning, so a
+long-lived process cannot read the token once at startup — within a day it is
+worthless.
+
+The bots get this for free: they crash on the auth error and `Restart=always`
+restarts them into the fresh file. The agent deliberately survives broker errors
+so one bad poll does not blank the dashboard, which means it must handle this
+itself. `credentials.py` rebuilds the client when the auth file's mtime changes,
+and immediately when the broker answers `-16 Could not authenticate the user` —
+reloading and retrying that same call once.
+
+This was found by a two-day soak, not by testing: all three agents polled for 34
+hours against a token that had expired overnight, reporting every section stale
+and never recovering. `/health` now carries `auth_ok`, and the dashboard shows
+"token expired" rather than three identical "stale" chips — the fix is specific
+and the status should say so.
+
 ## Staleness
 
 Every section is served with `as_of`, `age_s` and `stale`. A failed refresh keeps
