@@ -155,3 +155,67 @@ def test_the_default_db_argument_does_not_disable_the_store():
     assert persistence_disabled("none") is True
     assert persistence_disabled("NONE") is True
     assert persistence_disabled(" none ") is True
+
+
+def test_a_price_tick_is_not_a_change(db):
+    """The regression: the digest covered ltp and unrealised, which move on
+    every tick, so 'write on change' wrote on every poll — measured at 116 MB a
+    day on a host already short of disk."""
+    _, conn = db
+    writer = Writer(conn, "rahul")
+
+    def positions(ltp, qty=1808):
+        return [{"symbol": "NSE:RELIANCE-EQ", "net_qty": qty, "avg_price": 1308.8,
+                 "ltp": ltp, "unrealised": (ltp - 1308.8) * qty, "raw": {"ltp": ltp}}]
+
+    assert writer.snapshot("positions", positions(1288.2)) is True
+    assert writer.snapshot("positions", positions(1288.3)) is False
+    assert writer.snapshot("positions", positions(1305.0)) is False
+
+    # A real change to the position still writes immediately.
+    assert writer.snapshot("positions", positions(1305.0, qty=1948)) is True
+    assert conn.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0] == 2
+
+
+def test_the_stored_snapshot_still_contains_the_marks(db):
+    """Excluded from the comparison, not from the payload — the dashboard's
+    fallback view needs the marks."""
+    path, conn = db
+    writer = Writer(conn, "rahul")
+    writer.snapshot("positions", [{"symbol": "NSE:X-EQ", "net_qty": 1, "ltp": 99.5,
+                                   "unrealised": 12.5}])
+
+    stored = Reader(connect(path, read_only=True)).latest_snapshot("rahul", "positions")
+    assert stored["data"][0]["ltp"] == 99.5
+    assert stored["data"][0]["unrealised"] == 12.5
+
+
+def test_marks_are_refreshed_periodically_even_when_nothing_changes(db):
+    """Otherwise a position held all day would keep its opening mark, and the
+    fallback view would show a price hours old as if it were the last one."""
+    from webapp.store.writer import REFRESH_SECONDS
+
+    _, conn = db
+    writer = Writer(conn, "rahul")
+    payload = [{"symbol": "NSE:X-EQ", "net_qty": 1, "ltp": 100.0}]
+
+    assert writer.snapshot("positions", payload) is True
+    assert writer.snapshot("positions", payload) is False
+
+    writer._written_at["positions"] -= REFRESH_SECONDS + 1
+    assert writer.snapshot("positions", payload) is True
+
+
+def test_holdings_ignore_their_own_volatile_fields(db):
+    _, conn = db
+    writer = Writer(conn, "rahul")
+
+    def holding(ltp):
+        return [{"symbol": "NSE:HFCL-EQ", "qty": 900, "cost_price": 228.92, "ltp": ltp,
+                 "market_value": 900 * ltp, "unrealised": 900 * (ltp - 228.92)}]
+
+    assert writer.snapshot("holdings", holding(235.89)) is True
+    assert writer.snapshot("holdings", holding(236.40)) is False
+    assert writer.snapshot("holdings", [{"symbol": "NSE:HFCL-EQ", "qty": 800,
+                                         "cost_price": 228.92, "ltp": 236.40,
+                                         "market_value": 0, "unrealised": 0}]) is True

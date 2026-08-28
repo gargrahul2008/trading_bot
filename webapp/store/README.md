@@ -36,6 +36,17 @@ read would be 20 near-identical rows a minute per account; storing the changes i
 the same information. `Writer.snapshot` hashes the payload and skips a write when
 it matches the last one.
 
+**"Change" means the position, not the price.** The first version hashed the
+whole payload — and since `ltp` and `unrealised` move on every tick, it wrote on
+every poll after all. Measured on the live host at 116 MB/day, 28 GB/year, on a
+box already short of disk. The digest now ignores the mark-to-market fields
+(`VOLATILE_FIELDS`), so a row is written when quantity, average price or the set
+of symbols changes: about **1.3 MB/day** instead.
+
+The marks are still *stored*, just not compared — the fallback view needs them.
+A snapshot is also written every `REFRESH_SECONDS` (5 minutes) regardless, so a
+position held all day does not keep its opening mark.
+
 Orders are upserted — one row per order whose status moves, not a row per poll.
 Fills are insert-once, since a trade never changes and the broker keeps returning
 it all session.

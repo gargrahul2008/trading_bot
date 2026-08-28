@@ -10,6 +10,13 @@ counts them.
 **Write on change, not on poll.** Positions are read every 3 seconds and change
 a few times an hour. Storing each read would be 20 rows a minute per account of
 almost entirely identical data; storing the changes is the same information.
+
+"Change" has to mean the *position*, not the price. The first version hashed the
+whole payload, and since `ltp` and `unrealised` move on every tick it wrote on
+every poll after all — measured at 116 MB/day, 28 GB/year, on a host already
+short of disk. The digest now ignores the mark-to-market fields, so a row is
+written when quantity, average or the set of symbols changes. A periodic refresh
+keeps the stored marks from going too stale for the dashboard's fallback view.
 """
 from __future__ import annotations
 
@@ -28,15 +35,42 @@ LOG = logging.getLogger("store.writer")
 # the market's, not UTC's.
 IST_OFFSET = dt.timedelta(hours=5, minutes=30)
 
+# Fields that move with the market rather than with the account. Excluded from
+# the change comparison, but still stored — the dashboard needs the marks, it
+# just does not need a copy of them every three seconds.
+VOLATILE_FIELDS = {
+    "positions": ("ltp", "unrealised", "total_pnl", "raw"),
+    "holdings": ("ltp", "market_value", "unrealised", "raw"),
+    "funds": (),
+}
+
+# Write a snapshot even when nothing structural changed, if the last one is
+# older than this. Keeps the marks in the fallback view roughly current without
+# storing a row per tick.
+REFRESH_SECONDS = 300.0
+
 
 def trading_day(when: Optional[float] = None) -> str:
     stamp = dt.datetime.utcfromtimestamp(time.time() if when is None else when) + IST_OFFSET
     return stamp.date().isoformat()
 
 
-def _digest(payload: Any) -> str:
+def _strip(payload: Any, volatile: Iterable[str]) -> Any:
+    """The payload with its mark-to-market fields removed, for comparison only."""
+    volatile = set(volatile)
+    if isinstance(payload, list):
+        return [
+            {k: v for k, v in row.items() if k not in volatile} if isinstance(row, dict) else row
+            for row in payload
+        ]
+    if isinstance(payload, dict):
+        return {k: v for k, v in payload.items() if k not in volatile}
+    return payload
+
+
+def _digest(payload: Any, volatile: Iterable[str] = ()) -> str:
     return hashlib.sha256(
-        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        json.dumps(_strip(payload, volatile), sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
 
 
@@ -53,6 +87,7 @@ class Writer:
         self.errors = 0
         self.writes = 0
         self._digests: Dict[str, str] = {}
+        self._written_at: Dict[str, float] = {}
         # The connection is opened with check_same_thread=False so the poller
         # thread can use one made on the main thread; this lock is what makes
         # that safe rather than merely permitted.
@@ -167,16 +202,21 @@ class Writer:
 
     # ── snapshots ───────────────────────────────────────────────────────────
     def snapshot(self, kind: str, payload: Any) -> bool:
-        """Store `payload` only if it differs from the last one stored.
+        """Store `payload` when the account has changed, or periodically.
 
-        Returns whether a row was written, which is what makes "changed" a thing
-        the caller can act on rather than a hidden detail.
+        The comparison ignores mark-to-market fields (see VOLATILE_FIELDS), so a
+        price tick is not a change — otherwise this writes on every poll, which
+        is what it did before and cost 116 MB a day.
+
+        Returns whether a row was written, so "changed" is something the caller
+        can act on rather than a hidden detail.
         """
-        digest = _digest(payload)
-        if self._digests.get(kind) == digest:
-            return False
-
         now = time.time()
+        digest = _digest(payload, VOLATILE_FIELDS.get(kind, ()))
+        unchanged = self._digests.get(kind) == digest
+        fresh = (now - self._written_at.get(kind, 0.0)) < REFRESH_SECONDS
+        if unchanged and fresh:
+            return False
 
         def write():
             self.conn.execute(
@@ -188,6 +228,7 @@ class Writer:
 
         if self._safe("%s snapshot" % kind, write):
             self._digests[kind] = digest
+            self._written_at[kind] = now
             return True
         return False
 
