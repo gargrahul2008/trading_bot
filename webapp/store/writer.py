@@ -55,6 +55,18 @@ def trading_day(when: Optional[float] = None) -> str:
     return stamp.date().isoformat()
 
 
+def day_of(row: Dict[str, Any], default: str) -> str:
+    """The day a row belongs to.
+
+    Live polling only ever sees today's book, so `default` (now) is right for it.
+    But a row that carries its own day must keep it — otherwise a backfill of
+    last week's trades would all be stamped today, and every one of them would
+    be classified intraday because its entry and exit share a date.
+    """
+    day = str(row.get("trading_day") or "").strip()
+    return day if day else default
+
+
 def _strip(payload: Any, volatile: Iterable[str]) -> Any:
     """The payload with its mark-to-market fields removed, for comparison only."""
     volatile = set(volatile)
@@ -163,7 +175,7 @@ class Writer:
                         r.get("product_type", ""), r.get("kind", ""), r.get("status", ""),
                         r.get("status_code"), 1 if r.get("is_open") else 0,
                         r.get("source"), r.get("run"), r.get("matched_by"),
-                        r.get("placed_at"), day, now, now, _compact(r),
+                        r.get("placed_at"), day_of(r, day), now, now, _compact(r),
                     )
                     for r in rows
                 ],
@@ -192,7 +204,7 @@ class Writer:
                         r.get("symbol", ""), r.get("side", ""), float(r.get("qty") or 0),
                         float(r.get("price") or 0), float(r.get("value") or 0),
                         r.get("product_type", ""), r.get("kind", ""), r.get("traded_at"),
-                        day, now, _compact(r),
+                        day_of(r, day), now, _compact(r),
                     )
                     for r in rows
                 ],

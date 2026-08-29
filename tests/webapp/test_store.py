@@ -219,3 +219,27 @@ def test_holdings_ignore_their_own_volatile_fields(db):
     assert writer.snapshot("holdings", [{"symbol": "NSE:HFCL-EQ", "qty": 800,
                                          "cost_price": 228.92, "ltp": 236.40,
                                          "market_value": 0, "unrealised": 0}]) is True
+
+
+def test_a_fill_keeps_its_own_trading_day(db):
+    """Live polling only sees today's book, so stamping 'now' is right for it —
+    but a row that carries its own day must keep it. Otherwise a backfill of
+    last week's trades lands stamped today, and every one is then classified
+    intraday because its entry and exit share a date."""
+    path, conn = db
+    writer = Writer(conn, "rahul")
+    writer.fills([{"trade_id": "old", "symbol": "NSE:X-EQ", "side": "BUY",
+                   "qty": 1, "price": 10.0, "trading_day": "2026-08-27"}])
+    writer.fills([{"trade_id": "new", "symbol": "NSE:X-EQ", "side": "SELL",
+                   "qty": 1, "price": 12.0}])
+
+    days = dict(conn.execute("SELECT trade_id, trading_day FROM fills"))
+    assert days["old"] == "2026-08-27"
+    assert days["new"] != "2026-08-27", "no day given, so today"
+
+
+def test_an_order_keeps_its_own_trading_day(db):
+    _, conn = db
+    Writer(conn, "rahul").orders([{"order_id": "1", "symbol": "NSE:X-EQ",
+                                   "side": "BUY", "trading_day": "2026-08-27"}])
+    assert conn.execute("SELECT trading_day FROM orders").fetchone()[0] == "2026-08-27"
