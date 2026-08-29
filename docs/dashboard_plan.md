@@ -1,0 +1,129 @@
+# The dashboard: what we are building
+
+Agreed 2026-08-29. This is the shared understanding — if something here is wrong,
+fix this file before writing code against it.
+
+## What it is for
+
+Rahul runs **several Fyers accounts** (three today, one being set up, growing).
+The dashboard answers, per account and for all of them together:
+
+- how much capital went in
+- how much is deployed, and how much is free
+- what has been made or lost — realised and unrealised
+- how the bots are performing, separately from what was traded by hand
+
+and lets orders be placed from the same screen.
+
+The consolidated view is the point. Anyone can read one account in the broker's
+own app; nobody can read six at once.
+
+## Definitions
+
+Most dashboards go wrong here rather than in the arithmetic, so these are fixed:
+
+| Term | Means | Source |
+|---|---|---|
+| **Capital in** | net money transferred into the account | `/ledger-history` |
+| **Free** | cash available to trade now | `funds` → Available Balance |
+| **Deployed** | cost basis of everything open — positions and holdings, at what was paid, not at market | matched lots + holdings |
+| **Market value** | the same at today's marks | positions/holdings `ltp` |
+| **Realised** | closed round trips, **net of charges** | matcher + charges |
+| **Unrealised** | (mark − cost) × qty on what is still open | positions/holdings |
+| **Intraday / positional** | opened and closed on the same day, or not | matcher, from the days |
+| **Long / short** | the sign of the position | matcher, signed lots |
+
+Two figures that look alike and are not, and must never share a column:
+
+- A **position's realised** covers the whole life of the trade.
+- The **account's realised** from `funds` is *today's* mark-to-market from the
+  previous close. For anything carried overnight these differ — a TATAELXSI
+  short showed −9,275 and −3,750, and both were right.
+
+## History
+
+Starting point: **1 April 2026**, the financial year.
+
+| What | How | Granularity |
+|---|---|---|
+| Capital in/out | `/ledger-history` | per transaction |
+| Realised P&L | `/realised-pnl-history` | per symbol (shape to confirm) |
+| Charges | `/charges-history` | per day, or per segment |
+| Per-trade fills | the store | **from 2026-08-28 only** |
+| Positions open before 1 Apr | one-time manual entry | per symbol |
+
+Fyers' tradebook is day-only, so per-trade detail before we started collecting
+cannot be recovered from the API. Two consequences, both acceptable:
+
+- **FY-to-date totals are exact** — they come from the broker's own realised and
+  charges history.
+- **Per-trade P&L exists from 28 Aug onward**, and older trades appear at symbol
+  level. The dashboard says which is which rather than blurring them.
+
+If a tradebook export for the earlier months is available, an importer can fill
+the gap — the store's `fills` table already keeps each row's own trading day.
+
+## Charges
+
+Per **round trip**, not per fill: buy 1000 TCS and sell 1000 TCS is one trade,
+and its charges are one number.
+
+The broker reports charges per day and segment, so they are apportioned to fills
+by turnover share, and a match takes a pro-rata slice of its entry and its exit.
+Every net figure is therefore marked **estimated** where it came from
+apportionment, and the exact day-level total is always available beside it. A
+number that is exact and one that is apportioned must never be added without
+saying so.
+
+## Pages
+
+In build order.
+
+1. **Portfolio** — the primary screen. Per account and consolidated: capital in,
+   free, deployed, market value, realised FY, unrealised, return. Scales to
+   twenty accounts, not just three.
+2. **Positions** — everything open now, long and short, intraday and positional,
+   with the delivery-sale distinction.
+3. **Trades** — every closed round trip with its own P&L, net of charges, tagged
+   bot or manual, filterable by account, symbol, day, FY.
+4. **Orders** — full order book including cancelled and rejected, with parsed
+   reject reasons.
+5. **Holdings** — the delivery book with cost, mark and days held.
+6. **Bots** — per run: its trades, its P&L, whether it is running, its state.
+7. **Order pad** — place, modify, cancel, exit. Market, limit, SL, SL-M, and
+   orders carrying a target and stop-loss.
+
+Out of scope for now: MEXC, and the old Streamlit pages other than Fyers auth.
+
+## Order placement
+
+Required from the start, not bolted on later. Beyond the plain types, orders
+must be able to carry a **target and a stop-loss**.
+
+The safety rules already agreed:
+
+- Off unless the agent runs with `--allow-trading`.
+- Bot-owned orders are marked, and touching one warns and offers to pause the
+  run first.
+- Every action is logged before the call is made, so the record survives a
+  failure.
+- The account is chosen explicitly, never defaulted.
+
+## What has to be true before each phase
+
+- **History** needs the real shapes of the three endpoints. They are undocumented
+  here and guessing at field names has already cost a day —
+  `docs/probe_history_api.md` fetches and records them first.
+- **Charges per trade** needs the charges shape and a decision on segment
+  granularity.
+- **Order pad** needs `place_order` extended for SL/SL-M and the target/stop-loss
+  fields, and a confirm flow.
+- **Anything relied on daily** needs the API under systemd with TLS. It runs in
+  an SSH foreground today.
+
+## Non-goals
+
+- Not a backtester, not a research tool. Those live elsewhere in this repo.
+- Not a replacement for the broker's terminal for charting or market depth.
+- Not multi-user: one operator, one password. Roles can come later if that
+  changes.
