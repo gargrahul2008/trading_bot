@@ -243,3 +243,47 @@ def test_an_order_keeps_its_own_trading_day(db):
     Writer(conn, "rahul").orders([{"order_id": "1", "symbol": "NSE:X-EQ",
                                    "side": "BUY", "trading_day": "2026-08-27"}])
     assert conn.execute("SELECT trading_day FROM orders").fetchone()[0] == "2026-08-27"
+
+
+def test_capital_is_idempotent_on_its_reference(db):
+    """Re-importing an overlapping date range is the normal case, not an edge
+    one: the same ledger row must not be counted twice, or every return figure
+    on the page is wrong."""
+    path, conn = db
+    writer = Writer(conn, "rahul")
+    row = {"on_date": "2026-04-05", "amount": 500000, "source": "ledger",
+           "reference": "LED-1", "note": "opening transfer"}
+
+    assert writer.capital([row]) == 1
+    assert writer.capital([row]) == 0, "same reference, already recorded"
+    assert writer.capital([dict(row, reference="LED-2", amount=250000)]) == 1
+
+    reader = Reader(connect(path, read_only=True))
+    assert reader.capital_in("rahul") == "750000.0"
+    reader.conn.close()
+
+
+def test_a_withdrawal_reduces_capital_in(db):
+    path, conn = db
+    writer = Writer(conn, "rahul")
+    writer.capital([{"on_date": "2026-04-05", "amount": 500000,
+                     "source": "ledger", "reference": "IN"},
+                    {"on_date": "2026-06-01", "amount": -125000,
+                     "source": "ledger", "reference": "OUT"}])
+    reader = Reader(connect(path, read_only=True))
+    assert reader.capital_in("rahul") == "375000.0"
+    reader.conn.close()
+
+
+def test_capital_can_be_asked_as_at_a_date(db):
+    """So a financial-year view measures against the capital that was in at the
+    time, not against money added since."""
+    path, conn = db
+    Writer(conn, "rahul").capital([
+        {"on_date": "2026-04-05", "amount": 500000, "source": "ledger", "reference": "A"},
+        {"on_date": "2026-09-01", "amount": 300000, "source": "ledger", "reference": "B"},
+    ])
+    reader = Reader(connect(path, read_only=True))
+    assert reader.capital_in("rahul", upto="2026-08-31") == "500000.0"
+    assert reader.capital_in("rahul") == "800000.0"
+    reader.conn.close()

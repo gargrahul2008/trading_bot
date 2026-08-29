@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -104,6 +104,27 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE INDEX IF NOT EXISTS ix_snapshots_latest ON snapshots (account, kind, taken_at DESC);
 CREATE INDEX IF NOT EXISTS ix_snapshots_day ON snapshots (trading_day, account, kind);
+
+-- Money into and out of an account. The broker's balances say what is there
+-- now; only this says what was put in, which is what every return figure is
+-- measured against.
+--
+-- `reference` is the ledger row's own id, so re-importing a date range that
+-- overlaps one already imported cannot double-count. Manual entries — capital
+-- from before the ledger range, or an opening position's cost — carry a
+-- reference the operator chooses, for the same reason.
+CREATE TABLE IF NOT EXISTS capital (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account      TEXT NOT NULL,
+    on_date      TEXT NOT NULL,          -- YYYY-MM-DD
+    amount       REAL NOT NULL,          -- positive in, negative out
+    source       TEXT NOT NULL,          -- ledger | manual
+    reference    TEXT NOT NULL,
+    note         TEXT,
+    recorded_at  REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_capital ON capital (account, source, reference);
+CREATE INDEX IF NOT EXISTS ix_capital_date ON capital (account, on_date);
 
 -- The agent's own last word on each account: what the API falls back to when the
 -- agent itself cannot be reached.

@@ -174,10 +174,32 @@ class Reader:
             for r in self.conn.execute(sql, params)
         ]
 
+    def capital_in(self, account: str, upto: Optional[str] = None) -> str:
+        """Net money put into an account, as a decimal string.
+
+        Returned as a string rather than a float: it is the denominator of every
+        return figure on the page, and SQLite's SUM over REAL would introduce an
+        error the rest of the pipeline is careful to avoid.
+        """
+        sql = "SELECT amount FROM capital WHERE account = ?"
+        params: List[Any] = [account]
+        if upto:
+            sql += " AND on_date <= ?"
+            params.append(upto)
+        from decimal import Decimal
+        total = sum((Decimal(str(row[0])) for row in self.conn.execute(sql, params)),
+                    Decimal("0"))
+        return str(total)
+
+    def capital_entries(self, account: str) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT on_date, amount, source, reference, note FROM capital"
+            " WHERE account = ? ORDER BY on_date, id", (account,))]
+
     def counts(self) -> Dict[str, int]:
         """What the store actually holds — for /api/health, so 'the dashboard is
         empty' can be told apart from 'nothing has been written yet'."""
         out = {}
-        for table in ("accounts", "orders", "fills", "snapshots"):
+        for table in ("accounts", "orders", "fills", "snapshots", "capital"):
             out[table] = self.conn.execute("SELECT COUNT(*) FROM %s" % table).fetchone()[0]
         return out

@@ -244,6 +244,37 @@ class Writer:
             return True
         return False
 
+    # ── capital ─────────────────────────────────────────────────────────────
+    def capital(self, entries: Iterable[Dict[str, Any]]) -> int:
+        """Record money in or out. Idempotent on (account, source, reference).
+
+        Re-importing an overlapping date range is the normal case, not an edge
+        one — so a repeated ledger row must not be counted twice. Returns how
+        many rows were new.
+        """
+        entries = [e for e in entries if e.get("reference") and e.get("on_date")]
+        if not entries:
+            return 0
+        now = time.time()
+        before = self.conn.execute("SELECT COUNT(*) FROM capital").fetchone()[0]
+
+        def write():
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO capital"
+                " (account, on_date, amount, source, reference, note, recorded_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                [
+                    (self.account, str(e["on_date"]), float(e.get("amount") or 0),
+                     str(e.get("source") or "manual"), str(e["reference"]),
+                     e.get("note"), now)
+                    for e in entries
+                ],
+            )
+
+        if not self._safe("capital", write):
+            return 0
+        return self.conn.execute("SELECT COUNT(*) FROM capital").fetchone()[0] - before
+
     # ── agent status ────────────────────────────────────────────────────────
     def status(self, health: Dict[str, Any]) -> None:
         """The agent's last word about itself.
