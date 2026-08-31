@@ -51,7 +51,10 @@ REFRESH_SECONDS = 300.0
 
 
 def trading_day(when: Optional[float] = None) -> str:
-    stamp = dt.datetime.utcfromtimestamp(time.time() if when is None else when) + IST_OFFSET
+    seconds = time.time() if when is None else when
+    # Timezone-aware: utcfromtimestamp is deprecated on the host's Python 3.12,
+    # and datetime.UTC does not exist on 3.9.
+    stamp = dt.datetime.fromtimestamp(seconds, dt.timezone.utc) + IST_OFFSET
     return stamp.date().isoformat()
 
 

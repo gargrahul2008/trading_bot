@@ -130,3 +130,18 @@ def test_nothing_to_import_is_not_an_error(db):
     assert import_realised(db, "rahul", []) == 0
     assert import_charges(db, "rahul", {"rows": []}) == 0
     assert realised_total(db, "rahul")["net"] == "0"
+
+
+def test_epoch_conversion_is_timezone_aware():
+    """The host runs Python 3.12, where utcfromtimestamp is deprecated and will
+    eventually be removed; local runs 3.9, where datetime.UTC does not exist.
+    timezone.utc is the one that works on both."""
+    import warnings
+
+    from webapp.history.client import epoch_ms_to_date
+    from webapp.store.writer import trading_day
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        assert epoch_ms_to_date(1787875200000) == "2026-08-28"
+        assert len(trading_day()) == 10

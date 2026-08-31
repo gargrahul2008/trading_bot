@@ -48,8 +48,13 @@ LOG = logging.getLogger("fetch_history")
 FY_START = "2026-04-01"
 
 
+#: The market's day, not UTC's. Timezone-aware rather than utcnow(), which is
+#: deprecated on the host's Python 3.12; datetime.UTC would not work on 3.9.
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
 def today() -> str:
-    return (dt.datetime.utcnow() + dt.timedelta(hours=5, minutes=30)).date().isoformat()
+    return dt.datetime.now(IST).date().isoformat()
 
 
 def main(argv=None) -> int:

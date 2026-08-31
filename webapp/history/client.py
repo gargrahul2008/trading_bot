@@ -59,7 +59,9 @@ def epoch_ms_to_date(value: Any) -> Optional[str]:
         seconds = int(value) / 1000.0
     except (TypeError, ValueError):
         return None
-    return dt.datetime.utcfromtimestamp(seconds).date().isoformat()
+    # Timezone-aware: utcfromtimestamp is deprecated on the host's Python 3.12,
+    # and datetime.UTC does not exist on 3.9. timezone.utc works on both.
+    return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).date().isoformat()
 
 
 def days_between(from_date: str, to_date: str) -> Iterator[str]:
