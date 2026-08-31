@@ -397,8 +397,14 @@ class FyersClient(Broker):
         return with_retries(_call, max_retries=3, base_sleep=0.5, max_sleep=4.0, logger=LOG)
 
     def charges_history(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Charges (brokerage/STT/exchange/GST/stamp) over a date range. See SDK for
-        the `data` fields (from_date, to_date, segment_type, exchange_type, report_type)."""
+        """Charges (brokerage/STT/exchange/GST/stamp) over a date range.
+
+        DEPRECATED — use webapp.history.client.HistoryClient instead. This method
+        only exists on fyers-apiv3 3.1.11+; the control host runs 3.1.10, where
+        this raises AttributeError on the first call. Upgrading the SDK the live
+        bots trade through, for a reporting feature, is the wrong risk — so the
+        dashboard calls the REST endpoint directly.
+        """
         def _call():
             try:
                 resp = self._fyers.charges_history(data=data)
@@ -410,7 +416,11 @@ class FyersClient(Broker):
         return with_retries(_call, max_retries=3, base_sleep=0.6, max_sleep=5.0, logger=LOG)
 
     def realised_profit_history(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Broker-computed realized profit over a date range (per-symbol)."""
+        """Broker-computed realized profit over a date range (per-symbol).
+
+        DEPRECATED for the same reason as charges_history above: absent on the
+        host's SDK version. Use webapp.history.client.HistoryClient.
+        """
         def _call():
             try:
                 resp = self._fyers.realised_profit_history(data=data)
