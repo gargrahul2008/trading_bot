@@ -8,7 +8,7 @@ import type { MatrixRow, TotalRow } from "../components/Matrix";
 import { api } from "../lib/api";
 import { money, num, pnlClass, qty as fmtQty, signed } from "../lib/format";
 import { Money, usePrivacy } from "../lib/privacy";
-import type { Trade, TradesPayload } from "../lib/types";
+import type { RealisedPayload, RealisedScrip, Trade, TradesPayload } from "../lib/types";
 
 function Row({ trade }: { trade: Trade }) {
   const gross = num(trade.gross);
@@ -139,23 +139,86 @@ function toMatrix(trades: Trade[], accounts: string[]) {
   return { rows, totals };
 }
 
+/** Realised P&L per scrip for the year, from the broker's own history.
+ *
+ *  Complete where matched trades are not: it includes shares bought years ago
+ *  and sold in May, and everything bought and sold within the year. Our FIFO
+ *  matching is the other view — per-trade detail the broker never provides,
+ *  but only from the day the agents started recording.
+ */
+function realisedMatrix(scrips: RealisedScrip[], accounts: string[]) {
+  const bySymbol = new Map<string, RealisedScrip[]>();
+  for (const scrip of scrips) {
+    const list = bySymbol.get(scrip.symbol) ?? [];
+    list.push(scrip);
+    bySymbol.set(scrip.symbol, list);
+  }
+  const figure = (s: RealisedScrip) => num(s.net) ?? num(s.gross) ?? 0;
+
+  const rows: MatrixRow[] = [];
+  for (const [symbol, entries] of bySymbol) {
+    const cells: Record<string, number | null | undefined> = {};
+    for (const entry of entries) cells[entry.account] = figure(entry);
+    const uncosted = entries.filter((e) => e.net === null).length;
+    rows.push({
+      key: symbol,
+      label: symbol,
+      note: uncosted ? "gross" : undefined,
+      cells,
+      total: entries.reduce((sum, e) => sum + figure(e), 0),
+      title: entries
+        .map((e) => `${e.account}: traded on ${e.days} day${e.days === 1 ? "" : "s"}`)
+        .join("\n"),
+    });
+  }
+
+  const per = (pick: (s: RealisedScrip) => number, onlyCosted = false) =>
+    Object.fromEntries(accounts.map((account) => {
+      const mine = scrips.filter(
+        (s) => s.account === account && (!onlyCosted || s.charges !== null));
+      return [account, mine.length ? mine.reduce((sum, s) => sum + pick(s), 0) : null];
+    }));
+
+  const totals: TotalRow[] = [
+    { label: "Gross", values: per((s) => num(s.gross) ?? 0),
+      total: scrips.reduce((t, s) => t + (num(s.gross) ?? 0), 0), tone: true },
+    { label: "Charges", hint: "estimated",
+      values: per((s) => num(s.charges) ?? 0, true),
+      total: scrips.reduce((t, s) => t + (num(s.charges) ?? 0), 0) },
+    { label: "Net", values: per(figure),
+      total: scrips.reduce((t, s) => t + figure(s), 0), tone: true },
+  ];
+
+  return { rows, totals };
+}
+
 export function TradesPage() {
   const { hidden, toggle } = usePrivacy();
   const [kind, setKind] = useState<"all" | "intraday" | "positional">("all");
   const [detail, setDetail] = useState(false);
+  const [source, setSource] = useState<"year" | "matched">("year");
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trades"],
     queryFn: () => api.get<TradesPayload>("/trades"),
     refetchInterval: 15000,
   });
+  const year = useQuery({
+    queryKey: ["realised"],
+    queryFn: () => api.get<RealisedPayload>("/realised"),
+    refetchInterval: 60000,
+  });
 
   if (isError) return <ErrorNote error={error} />;
-  if (isLoading || !data) return <Loading what="trades" />;
+  if (isLoading || !data || year.isLoading) return <Loading what="trades" />;
 
   const shown = data.trades.filter((t) => kind === "all" || t.kind === kind);
-  const accounts = data.accounts;
-  const matrix = toMatrix(shown, accounts);
-  const t = data.totals;
+  const yearData = year.data;
+  const showYear = source === "year" && !!yearData?.available;
+  const accounts = showYear ? (yearData?.accounts ?? data.accounts) : data.accounts;
+  const matrix = showYear
+    ? realisedMatrix(yearData!.scrips, accounts)
+    : toMatrix(shown, accounts);
+  const t = showYear ? yearData!.totals : data.totals;
 
   return (
     <>
@@ -163,7 +226,10 @@ export function TradesPage() {
         title="Trades"
         subtitle={
           <>
-            {t.trades} closed round trips · gross{" "}
+            {showYear
+              ? `${yearData!.totals.scrips} scrips since ${yearData!.fy_start}`
+              : `${data.totals.trades} closed round trips`}{" "}
+            · gross{" "}
             <span className={pnlClass(num(t.gross))}>{signed(num(t.gross))}</span> · net{" "}
             <span className={pnlClass(num(t.net))}>{signed(num(t.net))}</span>
           </>
@@ -171,6 +237,31 @@ export function TradesPage() {
         actions={
           <div className="flex gap-2">
             <div className="flex rounded border" style={{ borderColor: "var(--border)" }}>
+              {([["year to date", "year"], ["matched trades", "matched"]] as const).map(
+                ([label, value]) => (
+                  <button
+                    key={value}
+                    onClick={() => setSource(value)}
+                    className={`px-3 py-1.5 text-sm ${
+                      source === value
+                        ? "bg-black/5 font-medium dark:bg-white/10"
+                        : "text-[var(--ink-secondary)]"
+                    }`}
+                    title={
+                      value === "year"
+                        ? "The broker's own realised P&L per scrip — complete from the start of the year"
+                        : "Our FIFO matching of recorded fills — per-trade detail, from the day the agents started"
+                    }
+                  >
+                    {label}
+                  </button>
+                ),
+              )}
+            </div>
+            <div
+              className="flex rounded border"
+              style={{ borderColor: "var(--border)", opacity: showYear ? 0.4 : 1 }}
+            >
               {([["grid", false], ["detail", true]] as const).map(([label, on]) => (
                 <button
                   key={label}
@@ -211,20 +302,32 @@ export function TradesPage() {
 
       {/* A net total that silently omits the trades it could not cost is a
           smaller number pretending to be a complete one. */}
-      {t.trades_without_charges > 0 && (
+      {showYear && (
+        <div
+          className="mb-4 rounded border px-3 py-2 text-sm"
+          style={{ borderColor: "var(--border)", color: "var(--ink-secondary)" }}
+        >
+          The broker's own realised P&amp;L per scrip since {yearData!.fy_start} — complete,
+          including shares bought before the dashboard existed and sold this year. Switch
+          to <strong>matched trades</strong> for entry and exit prices, holding period and
+          the long/short split, which exist from the day the agents started recording.
+        </div>
+      )}
+
+      {!showYear && (t as TradesPayload["totals"]).trades_without_charges > 0 && (
         <div
           className="mb-4 rounded border px-3 py-2 text-sm"
           style={{ borderColor: "var(--status-warning)", color: "var(--ink)" }}
         >
-          {t.trades_without_charges} of {t.trades} trades have no charges recorded for the
-          days they touched, so they are shown gross and excluded from the net total.
-          Import them with <code>scripts/fetch_history.py</code>.
+          {data.totals.trades_without_charges} of {data.totals.trades} trades have no
+          charges recorded for the days they touched, so they are shown gross and excluded
+          from the net total. Import them with <code>scripts/fetch_history.py</code>.
         </div>
       )}
 
-      {!detail && (
+      {(showYear || !detail) && (
         <Card>
-          {shown.length === 0 ? (
+          {matrix.rows.length === 0 ? (
             <MatrixEmpty>
               No {kind === "all" ? "closed trades yet" : `${kind} trades`}.
             </MatrixEmpty>
@@ -239,7 +342,7 @@ export function TradesPage() {
         </Card>
       )}
 
-      {detail && (
+      {!showYear && detail && (
       <Card className="overflow-x-auto">
         {shown.length === 0 ? (
           <Empty what={kind === "all" ? "closed trades yet" : `${kind} trades`} />

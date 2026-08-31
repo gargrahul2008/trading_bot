@@ -216,3 +216,29 @@ export interface TradesPayload {
   shown?: number;
   available: boolean;
 }
+
+export interface RealisedScrip {
+  account: string;
+  symbol: string;
+  gross: string;
+  /** null when a day's charges are unknown — never a confident zero. */
+  charges: string | null;
+  net: string | null;
+  days: number;
+  charges_estimated: boolean;
+}
+
+export interface RealisedPayload {
+  scrips: RealisedScrip[];
+  totals: {
+    scrips: number;
+    gross: string;
+    charges: string;
+    net: string;
+    scrips_without_charges: number;
+    days_without_charges: number;
+  };
+  accounts: string[];
+  fy_start: string;
+  available: boolean;
+}

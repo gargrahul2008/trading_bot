@@ -29,7 +29,7 @@ from app.auth import (
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
-    store_status, store_trades,
+    store_status, store_realised_scrips, store_trades,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -287,6 +287,20 @@ def get_trades(account: Optional[str] = None, day: Optional[str] = None,
     payload = store_trades(account, day, limit)
     # As with positions: an account that has closed nothing still gets a column.
     payload["accounts"] = [account] if account else known_accounts()
+    return payload
+
+
+@app.get("/api/realised")
+def get_realised(account: Optional[str] = None, fy_start: str = FY_START,
+                 _: str = Session) -> Dict[str, Any]:
+    """Realised P&L per scrip for the financial year, net of charges.
+
+    The broker's own figures, so this is complete from 1 April — including
+    shares bought years ago and sold in May, which our own matching cannot see.
+    """
+    payload = store_realised_scrips(account, from_date=fy_start)
+    payload["accounts"] = [account] if account else known_accounts()
+    payload["fy_start"] = fy_start
     return payload
 
 

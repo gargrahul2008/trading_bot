@@ -22,6 +22,7 @@ try:
     from webapp.history.importer import realised_total
     from webapp.pnl import charges as charges_mod
     from webapp.pnl import portfolio as portfolio_mod
+    from webapp.pnl.realised import by_scrip as realised_by_scrip
     from webapp.pnl.service import matches as matched_trades
     from webapp.store.reader import Reader
     from webapp.store.schema import connect
@@ -31,6 +32,7 @@ except Exception as exc:  # pragma: no cover - only if the tree is broken
     portfolio_mod = None  # type: ignore
     charges_mod = None  # type: ignore
     matched_trades = None  # type: ignore
+    realised_by_scrip = None  # type: ignore
     LOG.warning("store unavailable: %s", exc)
 
 
@@ -153,5 +155,24 @@ def store_trades(account: Optional[str] = None, day: Optional[str] = None,
     except Exception as exc:
         LOG.warning("trade read failed: %s", exc)
         return empty
+    finally:
+        reader.conn.close()
+
+
+def store_realised_scrips(account: Optional[str] = None,
+                          from_date: Optional[str] = None) -> Dict[str, Any]:
+    """Realised P&L per scrip for the year, from the broker's own history.
+
+    Complete where our matched trades are not: it covers shares bought years ago
+    and sold in May, and everything bought and sold within the year.
+    """
+    reader = _reader()
+    if reader is None or realised_by_scrip is None:
+        return {"scrips": [], "totals": {}, "available": False}
+    try:
+        return realised_by_scrip(reader.conn, account, from_date=from_date)
+    except Exception as exc:
+        LOG.warning("realised-by-scrip read failed: %s", exc)
+        return {"scrips": [], "totals": {}, "available": False}
     finally:
         reader.conn.close()
