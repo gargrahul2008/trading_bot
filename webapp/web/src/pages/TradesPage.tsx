@@ -153,7 +153,7 @@ export function TradesPage() {
   if (isLoading || !data) return <Loading what="trades" />;
 
   const shown = data.trades.filter((t) => kind === "all" || t.kind === kind);
-  const accounts = Array.from(new Set(data.trades.map((t) => t.account))).sort();
+  const accounts = data.accounts;
   const matrix = toMatrix(shown, accounts);
   const t = data.totals;
 

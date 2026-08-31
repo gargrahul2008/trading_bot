@@ -224,14 +224,20 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
     # Biggest mover first — the row you would act on is the one furthest from
     # where you wanted it, in either direction.
     rows.sort(key=lambda r: abs(float(r.get("unrealised") or 0)), reverse=True)
-    return {"positions": rows, "accounts_missing": missing}
+    # Every account queried, not just those with something open. Letting the
+    # client infer the columns from the rows makes an account with nothing open
+    # vanish, which is indistinguishable from one that could not be read.
+    return {"positions": rows, "accounts": names, "accounts_missing": missing}
 
 
 @app.get("/api/trades")
 def get_trades(account: Optional[str] = None, day: Optional[str] = None,
                limit: int = 500, _: str = Session) -> Dict[str, Any]:
     """Closed round trips with their own P&L, net of apportioned charges."""
-    return store_trades(account, day, limit)
+    payload = store_trades(account, day, limit)
+    # As with positions: an account that has closed nothing still gets a column.
+    payload["accounts"] = [account] if account else known_accounts()
+    return payload
 
 
 @app.get("/api/accounts/{account}/{section}")

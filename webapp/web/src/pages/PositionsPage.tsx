@@ -159,7 +159,9 @@ export function PositionsPage() {
   if (isLoading || !data) return <Loading what="positions" />;
 
   const rows = data.positions;
-  const accounts = Array.from(new Set(rows.map((p) => p.account))).sort();
+  // From the server, not from the rows: an account holding nothing must still
+  // appear, as a column of dots.
+  const accounts = data.accounts;
   const matrix = toMatrix(rows, accounts);
   const total = rows.reduce((sum, p) => sum + p.unrealised, 0);
   const longs = rows.filter((p) => p.net_qty > 0 && !p.delivery_sale).length;

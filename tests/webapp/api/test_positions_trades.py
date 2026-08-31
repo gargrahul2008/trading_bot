@@ -177,3 +177,27 @@ def test_both_endpoints_require_a_session(client):
     anonymous = TestClient(app)
     assert anonymous.get("/api/positions").status_code == 401
     assert anonymous.get("/api/trades").status_code == 401
+
+
+def test_an_account_holding_nothing_still_gets_a_column(client, monkeypatch):
+    """Letting the page infer its columns from the rows makes an account with
+    nothing open vanish — indistinguishable from one that could not be read.
+    The server knows who exists."""
+    from app import main as main_mod
+    monkeypatch.setattr(main_mod, "known_accounts", lambda: ["rahul", "pratibha", "piyush"])
+
+    payload = client.get("/api/positions").json()
+    assert payload["accounts"] == ["rahul", "pratibha", "piyush"]
+    # Only rahul actually holds anything in this fixture.
+    assert {p["account"] for p in payload["positions"]} == {"rahul"}
+
+
+def test_trades_also_name_every_account(client, monkeypatch):
+    from app import main as main_mod
+    monkeypatch.setattr(main_mod, "known_accounts", lambda: ["rahul", "pratibha", "piyush"])
+    assert client.get("/api/trades").json()["accounts"] == ["rahul", "pratibha", "piyush"]
+
+
+def test_filtering_trades_to_one_account_narrows_the_columns_too(client):
+    payload = client.get("/api/trades?account=rahul").json()
+    assert payload["accounts"] == ["rahul"]

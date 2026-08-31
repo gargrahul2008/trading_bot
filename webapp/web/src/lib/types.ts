@@ -166,6 +166,9 @@ export interface Position {
 
 export interface PositionsPayload {
   positions: Position[];
+  /** Every account queried — not only those holding something. An account with
+   *  nothing open still gets a column, or "empty" and "unread" look alike. */
+  accounts: string[];
   accounts_missing: string[];
 }
 
@@ -199,6 +202,7 @@ export interface TradeTotals {
 
 export interface TradesPayload {
   trades: Trade[];
+  accounts: string[];
   totals: TradeTotals;
   shown?: number;
   available: boolean;
