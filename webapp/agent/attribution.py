@@ -15,11 +15,15 @@ Three sources, in descending order of certainty:
    written on a fill (generic_runner.py:667). After the EOD cancel every
    unfilled bot order of the day would otherwise read as manual. Recording the
    claim while the order is still working makes it survive the cancel.
-3. **Configured symbol** — a run trades one symbol with one product type, both
-   named in its config.json. An order matching that pair is almost certainly
-   that run's. This is an *inference*, not a claim: the same symbol traded by
-   hand in the same account would match too. It is reported as such, so the UI
-   can distinguish it and warn either way before acting.
+3. **The broker's own channel** — Fyers stamps each order with how it was
+   placed. Our bots come back `API`; anything placed by hand in the web terminal
+   comes back `W`/`W1` with a tag naming the control. A web order is manual as a
+   matter of fact, not inference, whatever symbol it is on.
+4. **Configured symbol** — a run trades one symbol with one product type, both
+   named in its config.json. An API order matching that pair is almost certainly
+   that run's. This remains an *inference*, but the channel now rules out the
+   case that used to make it unsafe: a human buying the same symbol by hand no
+   longer matches, because their order is stamped `web`.
 
 The race this has to survive: a bot places an order and writes its state a
 moment later, so a poll landing in between sees an unclaimed id that is not
@@ -41,6 +45,7 @@ PENDING = "pending"
 
 BY_ORDER_ID = "order_id"
 BY_SYMBOL = "symbol"
+BY_CHANNEL = "channel"
 
 # Re-reading every run's state on each 3-second poll is wasteful; the files only
 # change when a bot acts.
@@ -261,10 +266,18 @@ class Attribution:
         if run:
             return {"source": BOT, "run": run, "matched_by": BY_ORDER_ID}
 
+        channel = str(order.get("channel") or "") if isinstance(order, dict) else ""
+
+        # The broker says a person placed this in the web terminal. No amount of
+        # symbol matching outranks that.
+        if channel == "web":
+            return {"source": MANUAL, "run": None, "matched_by": BY_CHANNEL}
+
         run = self.run_for_symbol(symbol, product)
         if run:
-            # Inferred, not claimed: a human trading the same symbol and product
-            # in this account would look identical. The UI must say so.
+            # Inferred from what the run is configured to trade. Safe now that a
+            # hand-placed order on the same symbol is excluded above — but still
+            # an inference, so the UI says which orders were claimed outright.
             return {"source": BOT, "run": run, "matched_by": BY_SYMBOL}
 
         if order_age_s is not None and order_age_s < GRACE_SECONDS:

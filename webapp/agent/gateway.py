@@ -35,6 +35,27 @@ STATUS_NAMES = {
     STATUS_PENDING: "PENDING",
 }
 
+# Fyers stamps every order with the channel that placed it. Observed on the live
+# host: our bots' orders come back "API", orders placed by hand in the web
+# terminal come back "W" or "W1" and carry an orderTag naming the control that
+# fired them ("2:Exit", "2:Charts"). This is broker truth about who placed an
+# order, and it beats any inference we can make from our own files.
+CHANNEL_API = "api"
+CHANNEL_WEB = "web"
+
+
+def order_channel(source: Any) -> str:
+    """api | web | "" — how the order reached the broker.
+
+    Anything that is not the API is a person at a screen, whatever letter Fyers
+    uses for which screen.
+    """
+    value = str(source or "").strip().upper()
+    if not value:
+        return ""
+    return CHANNEL_API if value == "API" else CHANNEL_WEB
+
+
 # Fyers productType strings, mapped to the distinction that actually matters on
 # the dashboard: does this position survive the close?
 POSITIONAL_PRODUCTS = ("CNC", "MARGIN", "MTF")
@@ -100,6 +121,10 @@ def normalise_order(row: Dict[str, Any], *, now: Optional[float] = None) -> Dict
         "status": STATUS_NAMES.get(status_code, str(status)),
         "is_open": status_code not in TERMINAL_STATUSES if status_code is not None else False,
         "placed_at": _first(row, "orderDateTime", "order_date_time"),
+        "channel": order_channel(_first(row, "source")),
+        "channel_raw": str(_first(row, "source") or ""),
+        # Names the web-terminal control that fired it, e.g. "2:Exit".
+        "order_tag": str(_first(row, "orderTag", "order_tag") or ""),
         "epoch": _f(_first(row, "orderNumStatus", "epoch"), default=0.0) or None,
         "message": str(_first(row, "message") or ""),
         "raw": row,
