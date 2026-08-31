@@ -133,6 +133,24 @@ else
     done
   done
 
+  state="$(systemctl is-enabled dashboard.service 2>/dev/null)"
+  if [ "$state" = "enabled" ]; then
+    active="$(systemctl is-active dashboard.service 2>/dev/null)"
+    if [ "$active" = "active" ]; then
+      # It must be on loopback. A dashboard that can place orders bound to
+      # 0.0.0.0 is one firewall rule from being public.
+      if ss -ltn 2>/dev/null | grep -qE '127\.0\.0\.1:(8000)\b'; then
+        ok "dashboard.service enabled and active on loopback"
+      else
+        bad "dashboard.service is active but not listening on 127.0.0.1 — it must not be public"
+      fi
+    else
+      bad "dashboard.service enabled but $active"
+    fi
+  else
+    warn "dashboard.service is ${state:-not installed} — see docs/dashboard_https.md"
+  fi
+
   for user in $(accounts); do
     unit="agent-$user.service"
     state="$(systemctl is-enabled "$unit" 2>/dev/null)"

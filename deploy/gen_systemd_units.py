@@ -12,6 +12,9 @@ Emits into deploy/systemd/generated/ (review, then copy to /etc/systemd/system/)
       the open-bell burst and never recovers, so a fresh session each morning is the design,
       not an accident — and that script is also where bots are held down. Enabling these
       would start every bot on boot, including any that is deliberately held down.
+  - dashboard.service               : the dashboard API + built UI, on loopback only.
+      Reaches the brokers only through the agents, holds no credentials of its own, and
+      is fronted by Tailscale Serve for TLS (see docs/dashboard_https.md).
   - agent-<user>.service            : the dashboard's per-account Fyers agent, IP-bound
       (same account.env again). Polls positions/orders/funds/holdings for the dashboard
       and is the only path by which the dashboard reaches a broker.
@@ -46,6 +49,9 @@ PYTHON = os.environ.get("PYTHON", f"{INSTALL_DIR}/env/bin/python")
 # wrong account.
 AGENT_BASE_PORT = int(os.environ.get("AGENT_BASE_PORT", "9101"))
 AGENT_PORTS = REPO / "deploy" / "agent_ports.json"
+
+# The dashboard's own port. Loopback only — Tailscale Serve fronts it.
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "8000"))
 
 # Requests per minute each agent may spend. The bots on the same app are already
 # spending roughly 24/min per run, and the app limit is shared, so this is set
@@ -95,6 +101,32 @@ def assign_agent_port(ports: dict, user: str) -> int:
     return port
 
 
+DASHBOARD_UNIT = """[Unit]
+Description=Trading dashboard (API + UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={install}
+# AGENT_TOKEN, to reach the agents; and the dashboard's own password hash and
+# session secret. No broker credentials — this process never calls a broker.
+EnvironmentFile={install}/webapp/agent.env
+EnvironmentFile={install}/webapp/dashboard.env
+# Loopback only, always. TLS and access control are Tailscale Serve's job, and
+# binding a port that can place orders to 0.0.0.0 would put it one firewall rule
+# away from the open internet.
+ExecStart={install}/webapp/api/.venv/bin/uvicorn app.main:app \\
+    --app-dir {install}/webapp/api --host 127.0.0.1 --port {port}
+Restart=always
+RestartSec=5
+SyslogIdentifier=dashboard
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 AGENT_UNIT = """[Unit]
 Description=Dashboard Fyers agent (IP-bound) for account {user}
 After=network-online.target
@@ -128,6 +160,11 @@ def main() -> None:
     emit_auth = os.environ.get("EMIT_AUTH_UNITS", "").strip() in ("1", "true", "yes")
     ports = load_agent_ports()
     known = dict(ports)
+
+    (OUT / "dashboard.service").write_text(
+        DASHBOARD_UNIT.format(install=INSTALL_DIR, port=DASHBOARD_PORT)
+    )
+    print(f"  dashboard.service (127.0.0.1:{DASHBOARD_PORT}, TLS via Tailscale Serve)")
 
     for user_dir in sorted(ACCOUNTS.iterdir()):
         if not user_dir.is_dir() or user_dir.name.startswith("_"):

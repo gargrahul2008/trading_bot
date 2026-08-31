@@ -1,0 +1,23 @@
+[Unit]
+Description=Trading dashboard (API + UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/trading_bot
+# AGENT_TOKEN, to reach the agents; and the dashboard's own password hash and
+# session secret. No broker credentials — this process never calls a broker.
+EnvironmentFile=/root/trading_bot/webapp/agent.env
+EnvironmentFile=/root/trading_bot/webapp/dashboard.env
+# Loopback only, always. TLS and access control are Tailscale Serve's job, and
+# binding a port that can place orders to 0.0.0.0 would put it one firewall rule
+# away from the open internet.
+ExecStart=/root/trading_bot/webapp/api/.venv/bin/uvicorn app.main:app \
+    --app-dir /root/trading_bot/webapp/api --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+SyslogIdentifier=dashboard
+
+[Install]
+WantedBy=multi-user.target
