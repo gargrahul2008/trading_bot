@@ -104,6 +104,20 @@ def main(argv=None) -> int:
           % (summary.get("funds_added"), summary.get("funds_withdrawn"),
              summary.get("closing_balance")))
 
+    # Which rows are transfers is the one thing here we have to classify, and
+    # getting it wrong is silent — the first run stored zero capital against a
+    # summary reporting 15 lakh added. So show the breakdown every time.
+    by_type: dict = {}
+    for row in ledger["transactions"]:
+        kind = str(row.get("transaction_type") or "?")
+        entry = by_type.setdefault(kind, {"n": 0, "credit": 0.0, "debit": 0.0})
+        entry["n"] += 1
+        entry["credit"] += float(row.get("credit") or 0)
+        entry["debit"] += float(row.get("debit") or 0)
+    for kind, e in sorted(by_type.items()):
+        print("            %-16s %4d rows  credit %14.2f  debit %14.2f"
+              % (kind, e["n"], e["credit"], e["debit"]))
+
     # ── realised ────────────────────────────────────────────────────────────
     if args.daily_realised:
         seen = []
@@ -148,6 +162,24 @@ def main(argv=None) -> int:
     print()
     print("stored    : %d new capital entr(ies), %d realised row(s), %d charge day(s)"
           % (added, realised_rows, charge_rows))
+
+    # Reconcile what we classified as capital against the broker's own totals.
+    # Deriving transfers from row types is the fragile step, and a silent zero
+    # is exactly how it fails — so check it against a number we did not compute.
+    expected = float(summary.get("funds_added") or 0) - float(summary.get("funds_withdrawn") or 0)
+    if expected:
+        from webapp.store.reader import Reader
+        stored_total = float(Reader(conn).capital_in(args.account,
+                                                     upto=to_date) or 0)
+        if abs(stored_total - expected) > 1:
+            print()
+            print("  WARNING: capital does not reconcile.")
+            print("    broker says net %+.2f over this window (added %s − withdrawn %s)"
+                  % (expected, summary.get("funds_added"), summary.get("funds_withdrawn")))
+            print("    stored capital to %s is %+.2f" % (to_date, stored_total))
+            print("    The transaction_type breakdown above says which rows carry")
+            print("    the transfers; webapp/history/importer.py::CAPITAL_TYPES lists")
+            print("    the ones counted. They do not agree.")
     totals = realised_total(conn, args.account)
     print("to date   : gross %s − charges %s = net %s"
           % (totals["gross"], totals["charges"], totals["net"]))
