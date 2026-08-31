@@ -21,24 +21,62 @@ LOG = logging.getLogger("history.importer")
 
 # Ledger rows that are money genuinely moving in or out of the account, rather
 # than the day's trading being settled against it. Observed types on the live
-# accounts: Trading, Non-trading, MTF, Funds added, Funds withdrawn.
+# accounts: Trading, Non-trading, MTF, Opening Balance, Funds added,
+# Funds withdrawn.
 CAPITAL_TYPES = ("funds added", "funds withdrawn")
+
+# What was already in the account when the window opens. Not a transfer, but it
+# is capital — and without it the base is wrong: pratibha's transfers alone net
+# to MINUS 496,676.62, which would make any return percentage nonsense. Her
+# opening balance of 2,204,655.11 is the money the year's P&L was actually
+# earned on.
+OPENING_TYPE = "opening balance"
 
 
 def import_capital(conn: sqlite3.Connection, account: str,
-                   ledger: Dict[str, Any]) -> int:
+                   ledger: Dict[str, Any],
+                   opening_for: Optional[str] = None) -> int:
     """Money in and out, from `/ledger-history`.
 
     Only genuine transfers are capital. A `Trading` row is the day's P&L being
     settled into the balance — counting it as capital would make every rupee
     earned look like a rupee deposited, and the return figure would collapse
     towards zero.
+
+    `opening_for` is the window's start date, and passing it also records the
+    opening balance as capital. **It is only correct when that date is the point
+    returns are measured from** — the financial year's start. The opening balance
+    is whatever was in the account when the window began, so importing it for a
+    seven-day window would record a balance that already contains the year's
+    profits as though it were money paid in.
+
+    Its reference is fixed to that date, so re-running the same backfill is
+    idempotent while a different start date would be a different, visible entry
+    rather than a silent addition.
     """
     from webapp.store.writer import Writer
 
     entries = []
     for row in ledger.get("transactions") or []:
         kind = str(row.get("transaction_type") or "").strip().lower()
+
+        if kind == OPENING_TYPE:
+            if not opening_for:
+                continue
+            amount = float(row.get("credit") or 0) - float(row.get("debit") or 0)
+            if amount:
+                entries.append({
+                    "on_date": opening_for,
+                    "amount": amount,
+                    "source": "ledger",
+                    # Fixed to the window start, and the description, so the two
+                    # segment rows Fyers returns stay distinct while a re-run of
+                    # the same backfill adds nothing.
+                    "reference": "opening|%s|%s" % (opening_for, row.get("description") or ""),
+                    "note": "opening balance at %s" % opening_for,
+                })
+            continue
+
         if kind not in CAPITAL_TYPES:
             continue
         amount = float(row.get("credit") or 0) - float(row.get("debit") or 0)

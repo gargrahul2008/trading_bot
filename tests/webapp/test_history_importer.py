@@ -145,3 +145,61 @@ def test_epoch_conversion_is_timezone_aware():
         warnings.simplefilter("error", DeprecationWarning)
         assert epoch_ms_to_date(1787875200000) == "2026-08-28"
         assert len(trading_day()) == 10
+
+
+PRATIBHA_LEDGER = {"transactions": [
+    {"date": "2026-04-01", "credit": 2204655.11, "debit": 0,
+     "transaction_type": "Opening Balance", "description": "Equity"},
+    {"date": "2026-04-17", "credit": 0, "debit": 1096676.62,
+     "transaction_type": "Funds withdrawn", "description": "Funds sent"},
+    {"date": "2026-04-29", "credit": 1000000, "debit": 0,
+     "transaction_type": "Funds added", "description": "Funds added"},
+    {"date": "2026-06-09", "credit": 0, "debit": 400000,
+     "transaction_type": "Funds withdrawn", "description": "to bank"},
+]}
+
+
+def test_transfers_alone_can_be_negative_which_is_a_useless_base(db):
+    """Pratibha's real ledger: her transfers net to minus 496,676.62 over the
+    year. Divide a P&L by that and the return figure is nonsense."""
+    import_capital(db, "pratibha", PRATIBHA_LEDGER)
+    assert Reader(db).capital_in("pratibha") == "-496676.62"
+
+
+def test_the_opening_balance_makes_the_base_the_money_actually_at_work(db):
+    """2,204,655.11 was in her account on 1 April. That is what the year's P&L
+    was earned on."""
+    assert import_capital(db, "pratibha", PRATIBHA_LEDGER, opening_for="2026-04-01") == 4
+    assert Reader(db).capital_in("pratibha") == "1707978.49"
+
+
+def test_reimporting_the_same_backfill_adds_no_opening_balance(db):
+    import_capital(db, "pratibha", PRATIBHA_LEDGER, opening_for="2026-04-01")
+    assert import_capital(db, "pratibha", PRATIBHA_LEDGER, opening_for="2026-04-01") == 0
+    assert Reader(db).capital_in("pratibha") == "1707978.49"
+
+
+def test_a_later_window_must_not_contribute_its_opening_balance(db):
+    """The opening balance of a seven-day window already contains the year's
+    profits. Counting it would record earnings as money paid in — the same
+    mistake as counting a Trading row, in a form that is harder to see."""
+    import_capital(db, "pratibha", PRATIBHA_LEDGER, opening_for="2026-04-01")
+    weekly = {"transactions": [
+        {"date": "2026-08-24", "credit": 58660.02, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Equity"},
+    ]}
+    assert import_capital(db, "pratibha", weekly) == 0
+    assert Reader(db).capital_in("pratibha") == "1707978.49"
+
+
+def test_both_segment_rows_of_an_opening_balance_are_kept(db):
+    """Fyers returns the opening balance split across segments — rahul's came
+    back as two rows summing to 205,401.08."""
+    ledger = {"transactions": [
+        {"date": "2026-04-01", "credit": 200000.00, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Equity"},
+        {"date": "2026-04-01", "credit": 5401.08, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Derivatives"},
+    ]}
+    assert import_capital(db, "rahul", ledger, opening_for="2026-04-01") == 2
+    assert Reader(db).capital_in("rahul") == "205401.08"

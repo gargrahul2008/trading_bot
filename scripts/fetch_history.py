@@ -150,7 +150,16 @@ def main(argv=None) -> int:
         print("\nDry run — nothing written. %d API call(s)." % api.calls)
         return 0
 
-    added = import_capital(conn, args.account, ledger)
+    # The opening balance is only capital when the window starts where returns
+    # are measured from. For any later start it already contains this year's
+    # profits, and counting it would inflate the base.
+    added = import_capital(
+        conn, args.account, ledger,
+        opening_for=from_date if from_date == FY_START else None,
+    )
+    if from_date != FY_START:
+        print("            (opening balance not counted — window does not start at %s)"
+              % FY_START)
     realised_rows = import_realised(conn, args.account, rows) if rows else 0
     charge_rows = import_charges(conn, args.account, charges)
 
