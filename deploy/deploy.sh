@@ -89,6 +89,7 @@ step "Units"
 run "$PY" deploy/gen_systemd_units.py
 agents_changed=0
 units_changed=0
+dashboard_changed=0
 for f in deploy/systemd/generated/agent-*.service; do
   [ -f "$f" ] || continue
   installed="/etc/systemd/system/$(basename "$f")"
@@ -99,6 +100,22 @@ for f in deploy/systemd/generated/agent-*.service; do
     units_changed=1
   fi
 done
+# The dashboard runs the same webapp/ code as the agents, so it is installed and
+# restarted on the same terms. Unlike the bots it is meant to be enabled.
+f="deploy/systemd/generated/dashboard.service"
+if [ -f "$f" ]; then
+  installed="/etc/systemd/system/dashboard.service"
+  if [ ! -f "$installed" ]; then
+    warn "dashboard.service not installed — see docs/dashboard_https.md"
+    run cp "$f" "$installed"
+    units_changed=1; dashboard_changed=1
+  elif ! cmp -s "$f" "$installed"; then
+    warn "dashboard.service differs from what is installed"
+    run cp "$f" "$installed"
+    units_changed=1; dashboard_changed=1
+  fi
+fi
+
 # Bot units are copied so the files stay current, but their enable state is
 # never touched — see the header.
 for f in deploy/systemd/generated/bot-*.service; do
@@ -125,6 +142,12 @@ else
              | xargs -n1 basename | sed 's/\.service$//' | tr '\n' ' ')"
     did "restarting: $units"
     run systemctl restart $units
+    if systemctl is-enabled dashboard.service >/dev/null 2>&1; then
+      did "restarting: dashboard"
+      run systemctl restart dashboard
+    elif [ "$dashboard_changed" = "1" ]; then
+      warn "dashboard.service installed but not enabled — systemctl enable --now dashboard"
+    fi
   else
     say "no change under webapp/ — agents left running"
   fi

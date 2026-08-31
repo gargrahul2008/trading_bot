@@ -15,8 +15,10 @@ Always dry-run first. The dry run prints every command it would execute.
 1. **Update** — refuses to pull onto uncommitted changes, and never force-pulls.
 2. **Accounts** — reconciles `accounts/` against `fyers_auth.json` (below).
 3. **Units** — regenerates, and installs only the ones that differ.
-4. **Agents** — restarts them *only* if something under `webapp/` changed or a
-   unit was reinstalled. An unchanged deploy leaves them alone.
+4. **Agents and the dashboard** — restarts them *only* if something under
+   `webapp/` changed or a unit was reinstalled. An unchanged deploy leaves them
+   alone. The dashboard is restarted on the same terms, since it runs the same
+   code; it is skipped with a warning if the unit is installed but not enabled.
 5. **Preflight** — `deploy/preflight.sh`, then a summary of the store.
 
 Its exit code is preflight's, so it can gate anything downstream.
