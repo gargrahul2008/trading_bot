@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -125,6 +125,56 @@ CREATE TABLE IF NOT EXISTS capital (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_capital ON capital (account, source, reference);
 CREATE INDEX IF NOT EXISTS ix_capital_date ON capital (account, on_date);
+
+-- Realised P&L as the broker computes it, per scrip per day.
+--
+-- The endpoint reports no date, but the window is a free parameter and it is
+-- additive over it, so asking one day at a time recovers this. It is the
+-- authoritative realised figure — our own matching supplies per-trade detail,
+-- never the headline total, so the two can never double-count.
+CREATE TABLE IF NOT EXISTS realised_history (
+    account     TEXT NOT NULL,
+    day         TEXT NOT NULL,
+    symbol      TEXT NOT NULL,      -- symbol_name; the exchange fields lie
+    realised    REAL NOT NULL DEFAULT 0,
+    buy_qty     REAL NOT NULL DEFAULT 0,
+    sell_qty    REAL NOT NULL DEFAULT 0,
+    buy_rate    REAL NOT NULL DEFAULT 0,
+    sell_rate   REAL NOT NULL DEFAULT 0,
+    fetched_at  REAL NOT NULL,
+    PRIMARY KEY (account, day, symbol)
+);
+CREATE INDEX IF NOT EXISTS ix_realised_day ON realised_history (account, day);
+
+-- Charges per day. The broker reports these per day and per segment, never per
+-- symbol, so this is the control total that per-trade charges are apportioned
+-- against rather than guessed at.
+CREATE TABLE IF NOT EXISTS charges_daily (
+    account              TEXT NOT NULL,
+    day                  TEXT NOT NULL,
+    total                REAL NOT NULL DEFAULT 0,
+    turnover             REAL NOT NULL DEFAULT 0,
+    brokerage            REAL NOT NULL DEFAULT 0,
+    stt                  REAL NOT NULL DEFAULT 0,
+    gst                  REAL NOT NULL DEFAULT 0,
+    stamp_duty           REAL NOT NULL DEFAULT 0,
+    transaction_charges  REAL NOT NULL DEFAULT 0,
+    sebi_toc             REAL NOT NULL DEFAULT 0,
+    ipft                 REAL NOT NULL DEFAULT 0,
+    fetched_at           REAL NOT NULL,
+    PRIMARY KEY (account, day)
+);
+
+-- How far each account's history has been fetched, so a re-run picks up where
+-- the last left off instead of replaying a hundred days of API calls.
+CREATE TABLE IF NOT EXISTS history_progress (
+    account     TEXT NOT NULL,
+    kind        TEXT NOT NULL,      -- ledger | realised | charges
+    from_date   TEXT NOT NULL,
+    to_date     TEXT NOT NULL,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (account, kind)
+);
 
 -- The agent's own last word on each account: what the API falls back to when the
 -- agent itself cannot be reached.
