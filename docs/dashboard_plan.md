@@ -24,7 +24,7 @@ Most dashboards go wrong here rather than in the arithmetic, so these are fixed:
 
 | Term | Means | Source |
 |---|---|---|
-| **Capital in** | net money transferred into the account | `/ledger-history` |
+| **Capital in** | opening cash + securities already held + net transfers | `/ledger-history` + a one-time manual entry |
 | **Free** | cash available to trade now | `funds` → Available Balance |
 | **Deployed** | cost basis of everything open — positions and holdings, at what was paid, not at market | matched lots + holdings |
 | **Market value** | the same at today's marks | positions/holdings `ltp` |
@@ -32,6 +32,18 @@ Most dashboards go wrong here rather than in the arithmetic, so these are fixed:
 | **Unrealised** | (mark − cost) × qty on what is still open | positions/holdings |
 | **Intraday / positional** | opened and closed on the same day, or not | matcher, from the days |
 | **Long / short** | the sign of the position | matcher, signed lots |
+
+**Capital needs one figure the API cannot give.** `/ledger-history` records the
+opening *cash* balance and every transfer since — but not the securities the
+account already owned on 1 April. That money went in during earlier years and
+nothing in this financial year records it. Without it the base is too small and
+every return measured against it is too large: pratibha showed 17,07,978 in
+against 50,07,446 deployed.
+
+`scripts/capital.py --set <account> <amount>` records it, once. The dashboard
+flags any account where deployed exceeds capital, because that is the visible
+symptom — though leverage causes it legitimately too, and rahul's 3x MTF ladder
+does.
 
 Two figures that look alike and are not, and must never share a column:
 

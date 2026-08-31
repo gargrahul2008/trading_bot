@@ -79,7 +79,17 @@ function AccountRow({ row }: { row: PortfolioRow }) {
           <Money>{signed(pnl)}</Money>
         </strong>
       </Cell>
-      <Cell tone={pnlClass(ret)}>{percent(ret)}</Cell>
+      <Cell tone={pnlClass(ret)}>
+        {percent(ret)}
+        {row.deployed_exceeds_capital && (
+          <span
+            className="ml-1 text-[var(--status-warning)]"
+            title="Deployed exceeds capital in — leverage, or a base missing the securities held at the year's start"
+          >
+            !
+          </span>
+        )}
+      </Cell>
       <Cell>
         <span className="text-xs text-[var(--ink-muted)]">
           {count(row.counts.positions)} pos
@@ -107,6 +117,7 @@ export function PortfolioPage() {
   const pnl = num(t.pnl);
   const ret = num(t.return_pct);
   const noCapital = data.accounts.filter((row) => num(row.capital_in) === 0);
+  const overDeployed = data.accounts.filter((row) => row.deployed_exceeds_capital);
 
   return (
     <>
@@ -131,6 +142,23 @@ export function PortfolioPage() {
 
       {/* A return computed against a base nobody imported would be wildly wrong
           and look precise. Say so rather than showing it. */}
+      {/* A base too small makes every return too large. Say which of the two
+          causes it could be rather than showing a confident percentage. */}
+      {overDeployed.length > 0 && (
+        <div
+          className="mb-4 rounded border px-3 py-2 text-sm"
+          style={{ borderColor: "var(--status-warning)", color: "var(--ink)" }}
+        >
+          <strong>{overDeployed.map((r) => r.account).join(", ")}</strong> deployed more
+          than the capital recorded for {overDeployed.length === 1 ? "it" : "them"}. That
+          is expected on a leveraged account (MTF is 3×) — otherwise the base is missing
+          the securities already held on {data.fy_start}, which the broker's ledger does
+          not record. Enter it with{" "}
+          <code>scripts/capital.py --set &lt;account&gt; &lt;amount&gt;</code> and the
+          returns become measurable.
+        </div>
+      )}
+
       {noCapital.length > 0 && (
         <div
           className="mb-4 rounded border px-3 py-2 text-sm"
@@ -184,7 +212,9 @@ export function PortfolioPage() {
               </Header>
               <Header help="Mark less cost on what is still open">Unrealised</Header>
               <Header>P&amp;L</Header>
-              <Header help="P&L over capital in">Return</Header>
+              <Header help="P&L over capital in. Unreliable where deployed exceeds capital.">
+                Return
+              </Header>
               <Header>Open</Header>
             </tr>
           </thead>

@@ -161,3 +161,26 @@ def test_a_delivery_sale_is_not_counted_as_unrealised():
     assert p["unrealised"] == Decimal("-37244.80"), "only the real position"
     assert p["counts"]["positions"] == 1
     assert p["short_exposure"] == Decimal("0"), "it is not a short"
+
+
+def test_deployed_exceeding_capital_is_flagged():
+    """The ledger records opening cash, never the securities already owned at
+    the start of the year. An account that began with 35 lakh of stock shows a
+    base 35 lakh too small, and every return measured against it is too large.
+    Leverage produces the same symptom legitimately, so the page names both."""
+    p = account_portfolio("pratibha", FUNDS, [], [holding(invested=5000000)],
+                          capital_in=1707978.49, realised=0)
+    assert p["deployed"] > p["capital_in"]
+    assert p["deployed_exceeds_capital"] is True
+
+
+def test_a_normal_account_is_not_flagged():
+    p = account_portfolio("rahul", FUNDS, [], [holding(invested=206028)],
+                          capital_in=680990.27, realised=0)
+    assert p["deployed_exceeds_capital"] is False
+
+
+def test_no_capital_recorded_is_not_treated_as_over_deployed():
+    """That case has its own banner; flagging it twice says nothing new."""
+    p = account_portfolio("piyush", FUNDS, [], [holding()], capital_in=0)
+    assert p["deployed_exceeds_capital"] is False

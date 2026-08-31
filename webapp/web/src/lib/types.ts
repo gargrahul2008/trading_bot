@@ -113,6 +113,9 @@ export interface PortfolioRow {
   /** null, not 0, when no capital has been imported — 0% reads as a fact and
    *  this is the absence of one. */
   return_pct: string | null;
+  /** Deployed exceeds capital in. Either leverage, or a base missing the
+   *  securities the account already held at the start of the year. */
+  deployed_exceeds_capital: boolean;
   counts: { positions: number; long: number; short: number; holdings: number };
   from_store: boolean;
   reachable: boolean;

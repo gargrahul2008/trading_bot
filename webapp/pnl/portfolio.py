@@ -127,6 +127,12 @@ def account_portfolio(
             (realised + unrealised) / capital_in * Decimal("100")
             if capital_in > 0 else None
         ),
+        # Deployed exceeding capital means one of two things, and the page has
+        # to say which is possible rather than show a return measured against a
+        # base that is too small. Either the account is leveraged — MTF is 3x —
+        # or its capital base is incomplete, because the ledger records opening
+        # *cash* and not the securities already owned at the start of the year.
+        "deployed_exceeds_capital": bool(capital_in > 0 and deployed > capital_in),
     }
 
 
