@@ -7,6 +7,8 @@ import { api, ApiError } from "./lib/api";
 import { LoginPage } from "./pages/LoginPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { PortfolioPage } from "./pages/PortfolioPage";
+import { PositionsPage } from "./pages/PositionsPage";
+import { TradesPage } from "./pages/TradesPage";
 
 function useSession() {
   const { isLoading, isError, error } = useQuery({
@@ -45,6 +47,8 @@ export function App() {
       >
         <Route index element={<Navigate to="/portfolio" replace />} />
         <Route path="/portfolio" element={<PortfolioPage />} />
+        <Route path="/positions" element={<PositionsPage />} />
+        <Route path="/trades" element={<TradesPage />} />
         <Route path="/overview" element={<OverviewPage />} />
         <Route path="*" element={<Navigate to="/portfolio" replace />} />
       </Route>

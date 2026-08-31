@@ -20,13 +20,17 @@ LOG = logging.getLogger("api.store")
 
 try:
     from webapp.history.importer import realised_total
+    from webapp.pnl import charges as charges_mod
     from webapp.pnl import portfolio as portfolio_mod
+    from webapp.pnl.service import matches as matched_trades
     from webapp.store.reader import Reader
     from webapp.store.schema import connect
 except Exception as exc:  # pragma: no cover - only if the tree is broken
     Reader = None  # type: ignore
     realised_total = None  # type: ignore
     portfolio_mod = None  # type: ignore
+    charges_mod = None  # type: ignore
+    matched_trades = None  # type: ignore
     LOG.warning("store unavailable: %s", exc)
 
 
@@ -116,5 +120,38 @@ def store_realised(account: str, from_date: Optional[str] = None) -> Dict[str, A
     except Exception as exc:
         LOG.warning("realised read failed for %s: %s", account, exc)
         return {"gross": "0", "charges": "0", "net": "0", "available": False}
+    finally:
+        reader.conn.close()
+
+
+def store_trades(account: Optional[str] = None, day: Optional[str] = None,
+                 limit: int = 500) -> Dict[str, Any]:
+    """Closed round trips with per-trade P&L, net of apportioned charges.
+
+    Matching always replays every fill and filters the result, so a position
+    opened last week and closed today is a today trade. `day` narrows what is
+    shown, never what is matched.
+    """
+    empty = {"trades": [], "totals": charges_mod.summarise_net([]) if charges_mod else {},
+             "available": False}
+    reader = _reader()
+    if reader is None or matched_trades is None or charges_mod is None:
+        return empty
+    try:
+        found = matched_trades(reader.conn, account, day)
+        by_day = charges_mod.load_day_charges(reader.conn, account)
+        rows = charges_mod.net_matches(found, by_day)
+        # Newest first: the trades someone wants are the recent ones.
+        rows.sort(key=lambda r: (r.get("closed_day") or "", r.get("closed_at") or ""),
+                  reverse=True)
+        return {
+            "trades": rows[:limit],
+            "totals": charges_mod.summarise_net(rows),
+            "shown": min(len(rows), limit),
+            "available": True,
+        }
+    except Exception as exc:
+        LOG.warning("trade read failed: %s", exc)
+        return empty
     finally:
         reader.conn.close()

@@ -5,6 +5,8 @@ import { api } from "../lib/api";
 
 const NAV = [
   { to: "/portfolio", label: "Portfolio" },
+  { to: "/positions", label: "Positions" },
+  { to: "/trades", label: "Trades" },
   { to: "/overview", label: "Accounts" },
 ];
 

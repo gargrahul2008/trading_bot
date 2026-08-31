@@ -142,3 +142,64 @@ export interface Portfolio {
   fy_start: string;
   configured: boolean;
 }
+
+export interface Position {
+  account: string;
+  symbol: string;
+  net_qty: number;
+  direction: string;
+  avg_price: number;
+  ltp: number;
+  unrealised: number;
+  realised: number;
+  product_type: string;
+  kind: string;
+  /** Stock sold out of holdings, awaiting settlement — not a short. */
+  delivery_sale?: boolean;
+  is_derivative?: boolean;
+  carried?: boolean;
+  opened_today?: boolean;
+  from_store: boolean;
+  stale: boolean;
+  age_s: number | null;
+}
+
+export interface PositionsPayload {
+  positions: Position[];
+  accounts_missing: string[];
+}
+
+export interface Trade {
+  account: string;
+  symbol: string;
+  direction: string;
+  kind: string;
+  qty: string;
+  entry_price: string;
+  exit_price: string;
+  opened_day: string;
+  closed_day: string;
+  product_type: string;
+  gross: string;
+  /** null when the day's charges are unknown — never a confident zero. */
+  charges: string | null;
+  net: string | null;
+  charges_estimated: boolean;
+}
+
+export interface TradeTotals {
+  trades: number;
+  gross: string;
+  charges: string;
+  net: string;
+  trades_costed: number;
+  trades_without_charges: number;
+  charges_estimated: boolean;
+}
+
+export interface TradesPayload {
+  trades: Trade[];
+  totals: TradeTotals;
+  shown?: number;
+  available: boolean;
+}

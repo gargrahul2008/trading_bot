@@ -10,6 +10,9 @@ const inr = new Intl.NumberFormat("en-IN", {
   maximumFractionDigits: 2,
 });
 const whole = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 });
+/** Quantities can be fractional for some instruments, but never to money's
+ *  precision — four places is generous and stops 1e-9 dust rendering. */
+const qtyFmt = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 4 });
 
 export const BLANK = "—";
 
@@ -22,6 +25,10 @@ function minus(text: string): string {
 
 export function money(value: number | null | undefined): string {
   return value === null || value === undefined ? BLANK : minus(inr.format(value));
+}
+
+export function qty(value: number | null | undefined): string {
+  return value === null || value === undefined ? BLANK : qtyFmt.format(value);
 }
 
 export function count(value: number | null | undefined): string {

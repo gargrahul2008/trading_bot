@@ -28,7 +28,8 @@ from app.auth import (
 )
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
-    portfolio_mod, store_book, store_capital, store_counts, store_realised, store_status,
+    portfolio_mod, store_book, store_capital, store_counts, store_realised,
+    store_status, store_trades,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -186,6 +187,51 @@ def get_portfolio(fy_start: str = FY_START, _: str = Session) -> Dict[str, Any]:
         "fy_start": fy_start,
         "configured": True,
     }
+
+
+@app.get("/api/positions")
+def get_positions(_: str = Session) -> Dict[str, Any]:
+    """Everything open right now, across every account, as one list.
+
+    Flattened deliberately: the point of this dashboard is to see six accounts
+    at once, and a per-account grouping would put that back behind six clicks.
+    """
+    client = AgentClient()
+    names = known_accounts()
+    books = {result.account: result for result in client.fan_out("/book", names)}
+
+    rows: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for name in names:
+        book = books.get(name)
+        data = book.data if book and book.ok else store_book(name)
+        if data is None:
+            missing.append(name)
+            continue
+        sections = data.get("sections") or {}
+        meta = sections.get("positions") or {}
+        from_store = data.get("source") == "store"
+        for position in (meta.get("data") or []):
+            if not isinstance(position, dict):
+                continue
+            if float(position.get("net_qty") or 0) == 0:
+                # A flat row is a position closed today. It belongs on the
+                # Trades page, not among what is currently at risk.
+                continue
+            rows.append(dict(position, account=name, from_store=from_store,
+                             age_s=meta.get("age_s"), stale=bool(meta.get("stale"))))
+
+    # Biggest mover first — the row you would act on is the one furthest from
+    # where you wanted it, in either direction.
+    rows.sort(key=lambda r: abs(float(r.get("unrealised") or 0)), reverse=True)
+    return {"positions": rows, "accounts_missing": missing}
+
+
+@app.get("/api/trades")
+def get_trades(account: Optional[str] = None, day: Optional[str] = None,
+               limit: int = 500, _: str = Session) -> Dict[str, Any]:
+    """Closed round trips with their own P&L, net of apportioned charges."""
+    return store_trades(account, day, limit)
 
 
 @app.get("/api/accounts/{account}/{section}")
