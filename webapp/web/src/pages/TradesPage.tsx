@@ -3,6 +3,8 @@ import { useQuery } from "@tanstack/react-query";
 
 import { Card, ErrorNote, Loading, PageHeader } from "../components/ui";
 import { Empty, Tag, Td, Th } from "../components/DataTable";
+import { Matrix, MatrixEmpty } from "../components/Matrix";
+import type { MatrixRow, TotalRow } from "../components/Matrix";
 import { api } from "../lib/api";
 import { money, num, pnlClass, qty as fmtQty, signed } from "../lib/format";
 import { Money, usePrivacy } from "../lib/privacy";
@@ -67,9 +69,80 @@ function Row({ trade }: { trade: Trade }) {
   );
 }
 
+/** Realised P&L by symbol and account.
+ *
+ *  Cells are net where the charges are known and gross where they are not — and
+ *  the totals row says how many of each, so a cell is never quietly a different
+ *  kind of number from its neighbour.
+ */
+function toMatrix(trades: Trade[], accounts: string[]) {
+  const bySymbol = new Map<string, Trade[]>();
+  for (const trade of trades) {
+    const list = bySymbol.get(trade.symbol) ?? [];
+    list.push(trade);
+    bySymbol.set(trade.symbol, list);
+  }
+  const figure = (trade: Trade) => num(trade.net) ?? num(trade.gross) ?? 0;
+
+  const rows: MatrixRow[] = [];
+  for (const [symbol, made] of bySymbol) {
+    const cells: Record<string, number | null | undefined> = {};
+    for (const trade of made) {
+      cells[trade.account] = (cells[trade.account] ?? 0) + figure(trade);
+    }
+    const uncosted = made.filter((t) => t.net === null).length;
+    rows.push({
+      key: symbol,
+      label: symbol,
+      note: uncosted ? "gross" : undefined,
+      cells,
+      total: made.reduce((sum, t) => sum + figure(t), 0),
+      title: `${made.length} trade${made.length === 1 ? "" : "s"}${
+        uncosted ? ` · ${uncosted} without charges, shown gross` : ""
+      }`,
+    });
+  }
+
+  const per = (pick: (t: Trade) => number) => {
+    const values: Record<string, number | null> = {};
+    for (const account of accounts) {
+      const mine = trades.filter((t) => t.account === account);
+      values[account] = mine.length ? mine.reduce((s, t) => s + pick(t), 0) : null;
+    }
+    return values;
+  };
+
+  const totals: TotalRow[] = [
+    {
+      label: "Gross", values: per((t) => num(t.gross) ?? 0),
+      total: trades.reduce((s, t) => s + (num(t.gross) ?? 0), 0), tone: true,
+    },
+    {
+      // An account with nothing costed shows a dash, not 0.00. A zero here
+      // would claim its trading was free — the same confident-zero mistake the
+      // apportioning code refuses to make.
+      label: "Charges", hint: "estimated",
+      values: Object.fromEntries(accounts.map((account) => {
+        const costed = trades.filter((t) => t.account === account && t.charges !== null);
+        return [account, costed.length
+          ? costed.reduce((sum, t) => sum + (num(t.charges) ?? 0), 0)
+          : null];
+      })),
+      total: trades.reduce((s, t) => s + (num(t.charges) ?? 0), 0),
+    },
+    {
+      label: "Net", values: per(figure),
+      total: trades.reduce((s, t) => s + figure(t), 0), tone: true,
+    },
+  ];
+
+  return { rows, totals };
+}
+
 export function TradesPage() {
   const { hidden, toggle } = usePrivacy();
   const [kind, setKind] = useState<"all" | "intraday" | "positional">("all");
+  const [detail, setDetail] = useState(false);
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trades"],
     queryFn: () => api.get<TradesPayload>("/trades"),
@@ -80,6 +153,8 @@ export function TradesPage() {
   if (isLoading || !data) return <Loading what="trades" />;
 
   const shown = data.trades.filter((t) => kind === "all" || t.kind === kind);
+  const accounts = Array.from(new Set(data.trades.map((t) => t.account))).sort();
+  const matrix = toMatrix(shown, accounts);
   const t = data.totals;
 
   return (
@@ -95,6 +170,21 @@ export function TradesPage() {
         }
         actions={
           <div className="flex gap-2">
+            <div className="flex rounded border" style={{ borderColor: "var(--border)" }}>
+              {([["grid", false], ["detail", true]] as const).map(([label, on]) => (
+                <button
+                  key={label}
+                  onClick={() => setDetail(on)}
+                  className={`px-3 py-1.5 text-sm capitalize ${
+                    detail === on
+                      ? "bg-black/5 font-medium dark:bg-white/10"
+                      : "text-[var(--ink-secondary)]"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
             <div className="flex rounded border" style={{ borderColor: "var(--border)" }}>
               {(["all", "intraday", "positional"] as const).map((option) => (
                 <button
@@ -132,6 +222,24 @@ export function TradesPage() {
         </div>
       )}
 
+      {!detail && (
+        <Card>
+          {shown.length === 0 ? (
+            <MatrixEmpty>
+              No {kind === "all" ? "closed trades yet" : `${kind} trades`}.
+            </MatrixEmpty>
+          ) : (
+            <Matrix
+              accounts={accounts}
+              rows={matrix.rows}
+              totals={matrix.totals}
+              labelHeader="Symbol"
+            />
+          )}
+        </Card>
+      )}
+
+      {detail && (
       <Card className="overflow-x-auto">
         {shown.length === 0 ? (
           <Empty what={kind === "all" ? "closed trades yet" : `${kind} trades`} />
@@ -163,8 +271,11 @@ export function TradesPage() {
           </table>
         )}
       </Card>
+      )}
 
       <p className="mt-3 text-xs text-[var(--ink-muted)]">
+        {!detail &&
+          "One row per symbol, one column per account. Cells are net where the charges are known and gross where they are not — the row is marked accordingly. "}
         Matched FIFO from the fills the agents recorded, so per-trade P&amp;L exists from 1
         August onward. Charges are <strong>estimated</strong>: the broker reports them per
         day and per segment, never per symbol, so each trade takes its share of the days it
