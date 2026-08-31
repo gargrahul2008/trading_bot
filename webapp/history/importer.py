@@ -96,6 +96,12 @@ def import_capital(conn: sqlite3.Connection, account: str,
             "reference": "%s|%s|%s" % (row["date"], amount, row.get("description") or ""),
             "note": row.get("description"),
         })
+    # Counted across the delete as well as the insert, so a re-run of the same
+    # backfill honestly reports nothing changed rather than counting the rows it
+    # replaced with identical ones.
+    before = conn.execute(
+        "SELECT COUNT(*) FROM capital WHERE account = ?", (account,)).fetchone()[0]
+
     if opening_for:
         # There is exactly one opening balance per account per date, so importing
         # it replaces rather than accumulates. That is the right semantic on its
@@ -109,7 +115,10 @@ def import_capital(conn: sqlite3.Connection, account: str,
         )
         conn.commit()
 
-    return Writer(conn, account).capital(entries)
+    Writer(conn, account).capital(entries)
+    after = conn.execute(
+        "SELECT COUNT(*) FROM capital WHERE account = ?", (account,)).fetchone()[0]
+    return after - before
 
 
 def import_realised(conn: sqlite3.Connection, account: str,
