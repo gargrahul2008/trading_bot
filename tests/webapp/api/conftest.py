@@ -6,6 +6,14 @@ from pathlib import Path
 
 import pytest
 
+# The API runs in its own virtualenv — deliberately, so the environment that
+# places real orders gains no web framework. Under the trading venv these tests
+# would error on every import; skipping says why instead.
+pytest.importorskip(
+    "fastapi",
+    reason="run these with webapp/api/.venv/bin/python -m pytest tests/webapp/api",
+)
+
 REPO = Path(__file__).resolve().parents[3]
 for path in (str(REPO), str(REPO / "webapp" / "api")):
     if path not in sys.path:
