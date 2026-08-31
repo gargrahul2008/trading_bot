@@ -176,6 +176,11 @@ def main(argv=None) -> int:
     # Deriving transfers from row types is the fragile step, and a silent zero
     # is exactly how it fails — so check it against a number we did not compute.
     expected = float(summary.get("funds_added") or 0) - float(summary.get("funds_withdrawn") or 0)
+    if from_date == FY_START:
+        # Compare like with like: when the opening balance is imported it is
+        # part of the stored capital, so it has to be part of the expectation
+        # too. Leaving it out made a correct import look broken.
+        expected += float(summary.get("opening_balance") or 0)
     if expected:
         from webapp.store.reader import Reader
         stored_total = float(Reader(conn).capital_in(args.account,
@@ -183,8 +188,9 @@ def main(argv=None) -> int:
         if abs(stored_total - expected) > 1:
             print()
             print("  WARNING: capital does not reconcile.")
-            print("    broker says net %+.2f over this window (added %s − withdrawn %s)"
-                  % (expected, summary.get("funds_added"), summary.get("funds_withdrawn")))
+            print("    broker says %+.2f over this window (opening %s + added %s − withdrawn %s)"
+                  % (expected, summary.get("opening_balance") if from_date == FY_START else 0,
+                     summary.get("funds_added"), summary.get("funds_withdrawn")))
             print("    stored capital to %s is %+.2f" % (to_date, stored_total))
             print("    The transaction_type breakdown above says which rows carry")
             print("    the transfers; webapp/history/importer.py::CAPITAL_TYPES lists")

@@ -69,10 +69,13 @@ def import_capital(conn: sqlite3.Connection, account: str,
                     "on_date": opening_for,
                     "amount": amount,
                     "source": "ledger",
-                    # Fixed to the window start, and the description, so the two
-                    # segment rows Fyers returns stay distinct while a re-run of
-                    # the same backfill adds nothing.
-                    "reference": "opening|%s|%s" % (opening_for, row.get("description") or ""),
+                    # Fixed to the window start, so a re-run of the same
+                    # backfill adds nothing — and including the amount, because
+                    # the segment rows share a description. Keying on the
+                    # description alone silently dropped rahul's second opening
+                    # row and 177,916.28 of his capital base with it.
+                    "reference": "opening|%s|%s|%s" % (
+                        opening_for, amount, row.get("description") or ""),
                     "note": "opening balance at %s" % opening_for,
                 })
             continue
@@ -93,6 +96,19 @@ def import_capital(conn: sqlite3.Connection, account: str,
             "reference": "%s|%s|%s" % (row["date"], amount, row.get("description") or ""),
             "note": row.get("description"),
         })
+    if opening_for:
+        # There is exactly one opening balance per account per date, so importing
+        # it replaces rather than accumulates. That is the right semantic on its
+        # own, and it also repairs a store that already holds an earlier, wrong
+        # attempt — which is the state a fix to the reference format leaves
+        # behind, and which would otherwise double-count on the next run.
+        conn.execute(
+            "DELETE FROM capital WHERE account = ? AND source = 'ledger'"
+            " AND reference LIKE ?",
+            (account, "opening|%s|%%" % opening_for),
+        )
+        conn.commit()
+
     return Writer(conn, account).capital(entries)
 
 

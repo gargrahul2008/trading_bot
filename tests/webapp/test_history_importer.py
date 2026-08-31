@@ -203,3 +203,50 @@ def test_both_segment_rows_of_an_opening_balance_are_kept(db):
     ]}
     assert import_capital(db, "rahul", ledger, opening_for="2026-04-01") == 2
     assert Reader(db).capital_in("rahul") == "205401.08"
+
+
+def test_opening_rows_sharing_a_description_are_both_kept(db):
+    """Rahul's opening balance came back as two segment rows with the same
+    description. Keying the dedupe on the description alone kept one and
+    silently dropped 177,916.28 of his capital base."""
+    ledger = {"transactions": [
+        {"date": "2026-04-01", "credit": 27484.80, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Opening Balance"},
+        {"date": "2026-04-01", "credit": 177916.28, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Opening Balance"},
+    ]}
+    assert import_capital(db, "rahul", ledger, opening_for="2026-04-01") == 2
+    assert Reader(db).capital_in("rahul") == "205401.08"
+
+    # And it is still idempotent.
+    assert import_capital(db, "rahul", ledger, opening_for="2026-04-01") == 0
+    assert Reader(db).capital_in("rahul") == "205401.08"
+
+
+def test_reimporting_an_opening_balance_replaces_an_earlier_wrong_one(db):
+    """A fix to the reference format leaves the old, wrong entry in the store.
+    Inserting alongside it would double-count; there is exactly one opening
+    balance per account per date, so importing it replaces."""
+    db.execute(
+        "INSERT INTO capital (account, on_date, amount, source, reference, recorded_at)"
+        " VALUES ('rahul', '2026-04-01', 27484.80, 'ledger',"
+        " 'opening|2026-04-01|Opening Balance', 0)")
+    db.commit()
+    assert Reader(db).capital_in("rahul") == "27484.8"
+
+    ledger = {"transactions": [
+        {"date": "2026-04-01", "credit": 27484.80, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Opening Balance"},
+        {"date": "2026-04-01", "credit": 177916.28, "debit": 0,
+         "transaction_type": "Opening Balance", "description": "Opening Balance"},
+    ]}
+    import_capital(db, "rahul", ledger, opening_for="2026-04-01")
+    assert Reader(db).capital_in("rahul") == "205401.08", "replaced, not added to"
+
+
+def test_replacing_the_opening_balance_leaves_transfers_alone(db):
+    import_capital(db, "pratibha", PRATIBHA_LEDGER, opening_for="2026-04-01")
+    before = Reader(db).capital_in("pratibha")
+    import_capital(db, "pratibha", PRATIBHA_LEDGER, opening_for="2026-04-01")
+    assert Reader(db).capital_in("pratibha") == before == "1707978.49"
+    assert len(Reader(db).capital_entries("pratibha")) == 4
