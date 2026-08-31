@@ -11,6 +11,7 @@ when the file changes, and immediately when the broker says the token is bad.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -55,6 +56,7 @@ class CredentialSource:
         self._lock = threading.Lock()
         self._client: Optional[Any] = None
         self._mtime: Optional[float] = None
+        self._token_digest = ""
         self._token_tail = ""
         self.reloads = 0
         self.last_error: Optional[str] = None
@@ -71,9 +73,14 @@ class CredentialSource:
         except OSError:
             return None
 
+    @staticmethod
+    def _digest(token: str) -> str:
+        return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
     def _load(self) -> Any:
         client_id, access_token = self._read_creds(self.auth_file, self.user_key)
         self._client = self._build(client_id, access_token)
+        self._token_digest = self._digest(access_token)
         self._mtime = self._file_mtime()
         # Enough to see in a log that the token actually changed, without ever
         # writing a usable credential to disk.
@@ -88,13 +95,29 @@ class CredentialSource:
             if self._client is None:
                 return self._load()
             mtime = self._file_mtime()
-            if mtime is not None and mtime != self._mtime:
-                LOG.info(
-                    "%s: auth file changed — reloading token (…%s -> new)",
-                    self.user_key, self._token_tail,
-                )
-                return self._load()
-            return self._client
+            if mtime is None or mtime == self._mtime:
+                return self._client
+
+            # The file was rewritten, but that does not mean this account's token
+            # changed — something on the host touches fyers_auth.json every few
+            # minutes, and rebuilding on mtime alone reloaded 800 times in three
+            # days instead of three. Each rebuild constructs a fresh SDK client
+            # and its logger, so the cost is not only noise.
+            self._mtime = mtime
+            try:
+                _, access_token = self._read_creds(self.auth_file, self.user_key)
+            except Exception as exc:
+                # A half-written file during an atomic replace, most likely.
+                # Keep the working client and look again next poll.
+                LOG.debug("%s: could not re-read auth file: %s", self.user_key, exc)
+                return self._client
+
+            if self._digest(access_token) == self._token_digest:
+                return self._client
+
+            LOG.info("%s: access token changed — rebuilding client (was …%s)",
+                     self.user_key, self._token_tail)
+            return self._load()
 
     def invalidate(self) -> Any:
         """Force a reload after the broker rejected the token.

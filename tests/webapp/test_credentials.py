@@ -133,3 +133,51 @@ def test_status_reports_reloads_without_leaking_the_token(auth_file):
     assert status["loaded"] is True
     assert "supersecrettoken" not in json.dumps(status), "the token must never be reported"
     assert status["token_tail"] == "ttoken", "a tail is enough to see that it changed"
+
+
+def test_the_file_being_touched_does_not_rebuild_the_client(auth_file):
+    """Something on the host rewrites fyers_auth.json every few minutes. Keying
+    the rebuild on mtime alone gave 805 reloads in 69 hours instead of three,
+    and each one constructs a fresh SDK client and logger."""
+    import os
+    import time as _time
+
+    tokens = ["day-one"]
+    credentials, built = source(auth_file, tokens)
+    assert credentials.client().token == "day-one"
+    assert len(built) == 1
+
+    # The file is rewritten, but this account's token is unchanged.
+    for _ in range(5):
+        later = _time.time() + 60
+        os.utime(auth_file, (later, later))
+        assert credentials.client().token == "day-one"
+    assert len(built) == 1, "the credential did not change, so nothing to rebuild"
+    assert credentials.reloads == 1
+
+    # A genuine refresh still rebuilds.
+    tokens.append("day-two")
+    later = _time.time() + 120
+    os.utime(auth_file, (later, later))
+    assert credentials.client().token == "day-two"
+    assert len(built) == 2
+
+
+def test_a_half_written_auth_file_keeps_the_working_client(auth_file, monkeypatch):
+    """An atomic replace has a window where a read can fail. Losing the client
+    over it would blank the account until the next poll."""
+    import os
+    import time as _time
+
+    credentials, built = source(auth_file, ["good"])
+    assert credentials.client().token == "good"
+
+    def explode(_path, _user_key):
+        raise ValueError("Expecting value: line 1 column 1")
+
+    credentials._read_creds = explode
+    later = _time.time() + 60
+    os.utime(auth_file, (later, later))
+
+    assert credentials.client().token == "good", "kept the working client"
+    assert len(built) == 1
