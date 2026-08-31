@@ -49,27 +49,40 @@ Starting point: **1 April 2026**, the financial year.
 | Capital in/out | `/ledger-history` | per transaction |
 | Realised P&L | `/realised-pnl-history` | per symbol (shape to confirm) |
 | Charges | `/charges-history` | per day, or per segment |
-| Per-trade fills | the store | **from 2026-08-28 only** |
+| Per-trade fills | the store + `reports/trades_all.jsonl` | **from 2026-08-01** |
+| Realised per scrip **per day** | `/realised-pnl-history`, one call per day | per scrip per day |
 | Positions open before 1 Apr | one-time manual entry | per symbol |
 
-Fyers' tradebook is day-only, so per-trade detail before we started collecting
-cannot be recovered from the API. Two consequences, both acceptable:
+Probed against the live accounts on 2026-08-31 — `docs/host_state.md` §12 has the
+field names, the traps and the reconciliations. What that established:
 
-- **FY-to-date totals are exact** — they come from the broker's own realised and
-  charges history.
-- **Per-trade P&L exists from 28 Aug onward**, and older trades appear at symbol
-  level. The dashboard says which is which rather than blurring them.
+- **FY-to-date totals are exact.** Capital comes from `/ledger-history`'s
+  `summary_data` in one call; realised and charges reconcile to the paisa across
+  two endpoints.
+- **Realised is recoverable per scrip *per day*.** The endpoint has no date field
+  and looks like one row per symbol for the whole window — but the window is a
+  free parameter and the endpoint is additive over it, so calling it once per day
+  gives per-day granularity. ~100 calls per account for the year.
+- **Per-trade P&L exists from 1 August**, from the store and the seeded
+  `reports/trades_all.jsonl`. Before that the finest truth available is
+  per-scrip-per-day, and no combination of these endpoints goes finer — two round
+  trips in one scrip on one day collapse into a single averaged row.
+- **Bot-versus-hand attribution cannot be reconstructed** for the back period. No
+  history endpoint carries an order id or a channel.
 
-If a tradebook export for the earlier months is available, an importer can fill
-the gap — the store's `fills` table already keeps each row's own trading day.
+So the dashboard shows per-trade detail from 1 August and day-level truth before
+it, and says which is which rather than blurring them. A Fyers back-office export
+is the only way to get per-round-trip detail for April–July, loaded once by hand.
 
 ## Charges
 
 Per **round trip**, not per fill: buy 1000 TCS and sell 1000 TCS is one trade,
 and its charges are one number.
 
-The broker reports charges per day and segment, so they are apportioned to fills
-by turnover share, and a match takes a pro-rata slice of its entry and its exit.
+The broker reports charges per day and per segment — never per symbol — so they
+are apportioned to fills by turnover share, and a match takes a pro-rata slice of
+its entry and its exit. Day-wise and segment-wise totals reconcile exactly, which
+gives a hard control total to apportion against rather than a guess.
 Every net figure is therefore marked **estimated** where it came from
 apportionment, and the exact day-level total is always available beside it. A
 number that is exact and one that is apportioned must never be added without
@@ -111,9 +124,12 @@ The safety rules already agreed:
 
 ## What has to be true before each phase
 
-- **History** needs the real shapes of the three endpoints. They are undocumented
-  here and guessing at field names has already cost a day —
-  `docs/probe_history_api.md` fetches and records them first.
+- **History** — done. `docs/host_state.md` §12 records the shapes. Three
+  constraints it found that any importer must respect: the installed SDK on the
+  host lacks all three methods (so call REST directly, do not upgrade the SDK the
+  bots trade through); `/ledger-history` paginates and **silently truncates** at
+  100 rows; and `exch_id` / `exchange_name` / `segment_name` disagree with
+  `symbol_name` on real rows — key on the symbol.
 - **Charges per trade** needs the charges shape and a decision on segment
   granularity.
 - **Order pad** needs `place_order` extended for SL/SL-M and the target/stop-loss
