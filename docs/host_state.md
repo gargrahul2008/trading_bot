@@ -1076,3 +1076,266 @@ someone decides whether to re-fund it or retire it.
 Per the brief I did not connect to `157.245.108.24`, made no broker call of my own, opened
 no new Fyers session, and changed nothing. Every figure above comes from local files, the
 already-running agents' cached order books, and this host's own network state.
+
+---
+
+## 12. History endpoints
+
+Probed **2026-08-31, 05:05–05:20 UTC** per `docs/probe_history_api.md`. Read-only: four
+GET calls per account over `from_date=2026-04-01, to_date=2026-08-29`, each run under its
+own `accounts/<user>/account.env` so it left by that account's whitelisted IP. No order,
+modify, cancel or exit. A short follow-up round on **rahul only** established pagination
+and date-slicing behaviour; that round ended on a `-429 Request limit reached`, so
+probing stopped there. No tokens below.
+
+### 12.0 The SDK does not have these methods — the repo's wrappers are dead code
+
+`docs/probe_history_api.md` says to call `fy.ledger_history(...)` etc. **None of the three
+exist on the installed SDK.** `fyers_apiv3 3.1.10` (`env/lib/python3.12/site-packages/`)
+exposes no `ledger_history`, no `realised_profit_history` and no `charges_history`; its
+`Config` class has no path constant for any of them.
+
+That means `common/broker/fyers_client.py` lines ~399 and ~412 —
+`FyersClient.charges_history()` and `FyersClient.realised_profit_history()` — **raise
+`AttributeError` on the first call.** They have evidently never been executed. Nothing
+live calls them today, so nothing is broken in production, but any importer written
+against those wrappers will fail immediately.
+
+The endpoints themselves are fine. They were probed directly over REST, using the SDK's
+own base URL and header format:
+
+```
+GET https://api-t1.fyers.in/api/v3/ledger-history
+GET https://api-t1.fyers.in/api/v3/realised-pnl-history
+GET https://api-t1.fyers.in/api/v3/charges-history
+headers: Authorization: "<client_id>:<access_token>", version: "3"
+```
+
+**All four calls returned HTTP 200 `"s":"ok"` for all three accounts.** No permission was
+missing on any account. The fix is either to pin a newer `fyers-apiv3` or to add three
+thin `requests` calls to `FyersClient` — not to change the plan.
+
+### 12.1 Did it work?
+
+| Account | `fy_id` | ledger | realised | charges (day) | charges (seg) |
+|---|---|---|---|---|---|
+| rahul | XR11308 | ok — 332 rows / 4 pages | ok — 25 rows | ok — 72 rows | ok — 3 rows |
+| pratibha | XP12698 | ok — ≥100 rows, **paged** | ok — 16 rows | ok — 72 rows | ok — 2 rows |
+| piyush | FAK31683 | ok — 12 rows (complete) | ok — 4 rows | ok — 6 rows | ok — 1 row |
+
+Every response is `{"code":200, "message":..., "s":"ok", "data":[...], "summary_data":{...}}`.
+`summary_data` is present on **all four** and is scoped to the **requested date range**,
+not to the page.
+
+### 12.2 Exact field names, with one real row each
+
+**`/ledger-history`** — `data[]`:
+
+```json
+{
+  "credit_amount": 134414.27,
+  "date": 1787875200000,
+  "debit_amount": 0,
+  "description": "Executed trades for the day in equity cash segment",
+  "running_balance": 568402.2499999998,
+  "transaction_type": "Trading"
+}
+```
+
+`summary_data`: `opening_balance`, `closing_balance`, `funds_added`, `funds_withdrawn`.
+Rahul, Apr 1 → Aug 29: `opening_balance 205401.08`, `closing_balance 677807.93`,
+`funds_added 1509420`, `funds_withdrawn 1033830.81`.
+
+`date` is **epoch milliseconds, UTC midnight** — day resolution only, no intraday time.
+`transaction_type` observed across the three accounts:
+`Trading`, `Non-trading`, `MTF`, `Funds added`, `Funds withdrawn`.
+
+**`/realised-pnl-history`** — `data[]`:
+
+```json
+{
+  "buy_qty": 1140,
+  "buy_rate": 180.7421,
+  "exch_id": 10,
+  "exchange_name": "NSE",
+  "is_symbol_active": true,
+  "realized_pnl": 5134.176,
+  "seg_id": 10,
+  "segment_name": "NSE_CASH",
+  "sell_qty": 1140,
+  "sell_rate": 185.2458,
+  "symbol_name": "NSE:CGCL-EQ"
+}
+```
+
+`summary_data`: `gross_pnl`, `charges`, `net_pnl` — e.g. rahul
+`gross_pnl 168296.239`, `charges 36509.41`, `net_pnl 131786.829`.
+
+**`/charges-history`, `report_type=1` (day-wise)** — `data[]`:
+
+```json
+{
+  "brokerage": 30, "gst": 7.99, "ipft": 0, "sebi_toc": 0.55,
+  "stamp_duty": 8, "stt": 135, "total": 195.37,
+  "trade_date": 1787875200000,
+  "transaction_charges": 13.83, "turnover": 142657.0002
+}
+```
+
+**`/charges-history`, `report_type=2` (segment-wise)** — identical fields except
+`trade_date` is replaced by `segment` (`"Equity"`, `"Derivatives"`, `"Commodity"`).
+
+Both charges reports carry the same `summary_data` keys: the eight above plus
+`ctt_only` and `stt_only`.
+
+### 12.3 Granularity — and the one that decides the plan
+
+| Endpoint | Granularity | Has a date? |
+|---|---|---|
+| `/ledger-history` | **per transaction**, day-stamped | yes, `date` (day) |
+| `/realised-pnl-history` | **per scrip, aggregated over the whole window** | **no** |
+| `/charges-history` rt=1 | per day, all segments pooled | yes, `trade_date` |
+| `/charges-history` rt=2 | per segment, whole window pooled | no |
+
+Realised P&L is **per scrip, not per trade** — one row per symbol for the entire window,
+with `buy_qty`/`sell_qty`/`buy_rate`/`sell_rate` as window averages. `buy_qty == sell_qty`
+on every row across all three accounts, so it reports only fully-matched quantity; open
+inventory is excluded.
+
+**But the window is a free parameter, and the endpoint is additive over it.** Verified on
+rahul:
+
+| Window | rows | `gross_pnl` |
+|---|---|---|
+| 2026-04-01 → 2026-06-30 | 12 | 182778.633 |
+| 2026-07-01 → 2026-08-29 | 14 | −14482.394 |
+| 2026-04-01 → 2026-08-29 | 25 | 168296.239 |
+| 2026-08-28 → 2026-08-28 | 2 | 12857 |
+
+182778.633 + (−14482.394) = 168296.239, exactly. So **per-day-per-scrip realised P&L is
+recoverable for any past date by calling the endpoint once per day.** That is ~100 calls
+per account for 1 April → today. It is not per-trade, and it never can be — but it is a
+great deal more than "one number per symbol for the year".
+
+### 12.4 Pagination
+
+- **`page_size` caps at 100.** `page_size=101` and `page_size=500` both return
+  `{"code":-50,"message":"Invalid input","s":"error"}` (HTTP 400). Default is 100.
+- **`/ledger-history` is paginated and silently truncates.** The plain call in
+  `probe_history_api.md` returns exactly 100 rows and *looks* complete. It is not: rahul's
+  page 1 spans only **2026-07-27 → 2026-08-28**, a month of the five requested. Paging
+  `page_no=1..4` gives 100 / 100 / 100 / 32 = **332 rows** reaching back to 2026-04-01.
+  Pratibha's page 1 likewise starts 2026-07-01 and is truncated. **Any importer must page
+  until a short page.** Rows come newest-first.
+- `/charges-history` accepts `page_no` and is subject to the same 100 cap. It did not bite
+  here (72 rows for rahul and pratibha, 6 for piyush) but **a full year exceeds 100
+  trading days and will be truncated** — page it too.
+- `/realised-pnl-history` pagination is **unconfirmed**: the `page_no=2` probe returned
+  `-429`. Row counts here (25 / 16 / 4) are far below 100, so it does not bite today. An
+  account holding more than 100 distinct scrips in a window would need this settled.
+
+**Volume for a full year**, extrapolating from Apr–Aug: rahul ≈ 800 ledger rows (8 pages),
+≈ 170 charge-days (2 pages), ≈ 40 realised rows. Small. The expensive shape is not the
+paging — it is the per-day loop in §12.3.
+
+### 12.5 Do the totals reconcile?
+
+**Yes, everywhere it was possible to check.**
+
+1. **Day-wise charges sum → segment-wise total.** Exact to the paisa on all three
+   accounts, on all eight fields, and both match their own `summary_data`:
+
+   | Account | Σ day-wise `total` | Σ segment `total` | `summary_data.total` |
+   |---|---|---|---|
+   | rahul | 36509.41 | 36509.41 | 36509.41 |
+   | pratibha | 30392.47 | 30392.47 | 30392.47 |
+   | piyush | 4705.24 | 4705.24 | 4705.24 |
+
+2. **Charges agree across endpoints.** `realised-pnl-history.summary_data.charges` equals
+   the charges total for the same window — rahul full range 36509.41 = 36509.41, and for
+   the single day 2026-08-28, realised `charges` 195.37 = that day's day-wise row `total`
+   195.37. The two endpoints share one charge ledger.
+
+3. **Realised agrees with what the repo already recorded.** `accounts/rahul/reports/broker_pnl.json`
+   (fetched 2026-08-28, `seed_date` 2026-08-01) matches the probe exactly on every symbol
+   whose trading began in August — ANTHEM 1750.85, DMART 2299.60, OFSS 4772.00,
+   RVNL26SEPFUT 8085.00. Symbols that differ differ *only* by window and in the right
+   direction: RELIANCE is +51352.00 for August alone against −69545.70 for Apr–Aug,
+   i.e. ≈ −120898 realised before 1 August; and NTPC, IRCTC, KAMDHENU, VIKASECO read 0.00
+   in the August-seeded file but non-zero over Apr–Aug. Nothing contradicts.
+
+4. **Not checked against live positions.** Today is Sunday 2026-08-31 and the market is
+   closed; the last trading day in range is Friday 2026-08-28. No fresh positions call was
+   made — it is outside the three endpoints this brief authorises.
+
+### 12.6 Two field-level traps
+
+**`exch_id` / `exchange_name` / `segment_name` on `/realised-pnl-history` are not
+trustworthy. `symbol_name` is.** Five rows across two accounts disagree with themselves:
+
+| Account | `symbol_name` | `exch_id` | `exchange_name` | `segment_name` |
+|---|---|---|---|---|
+| rahul | `BSE:MEERA-B` | 10 | NSE | NSE_CASH |
+| rahul | `NSE:SUYOG-EQ` | 12 | BSE | BSE_CASH |
+| pratibha | `BSE:MEERA-B` | 10 | NSE | NSE_CASH |
+| pratibha | `BSE:SHISHIND-X` | 10 | NSE | NSE_CASH |
+| pratibha | `NSE:RAJOOENG-BE` | 12 | BSE | BSE_CASH |
+
+`BSE:SHISHIND-X` settles it: the local trade store has **50 fills** of it at
+`"exchange": "12"` (BSE), and it is a BSE-only scrip the bot has always traded on BSE.
+The `symbol_name` prefix is right and the `exch_id` is wrong. **Key on `symbol_name`;
+do not join on `exch_id` or bucket by `segment_name`.** This is exactly the class of bug
+the brief warned about, found before an importer was written against it.
+
+**`is_symbol_active` is not a filter for "still held".** It is true on rows that are fully
+closed (`buy_qty == sell_qty` on all of them). Whatever it means, it is not position state.
+
+### 12.7 What can and cannot be reconstructed from 1 April 2026
+
+**Recoverable, exactly, from these three endpoints alone:**
+
+- **Capital in and out.** `/ledger-history` `summary_data` gives `funds_added`,
+  `funds_withdrawn`, `opening_balance` and `closing_balance` for any window in **one call**
+  — no paging needed for the totals. Per-transaction detail needs the paging in §12.4.
+  Apr 1 → Aug 29: rahul +1,509,420 / −1,033,830.81 (opening 205,401.08 → closing 677,807.93);
+  pratibha +1,000,000 / −1,496,676.62 (2,204,655.11 → 58,660.02); piyush +2,500,000 / −0
+  (0 → 632,573.06, a clean new account with no pre-history at all).
+- **Realised P&L, FY-to-date, per scrip** — one call, `gross_pnl` / `charges` / `net_pnl`
+  already netted.
+- **Realised P&L per scrip per day**, by looping the window one day at a time (~100 calls
+  per account). This is the finding that matters most: it is *not* what "per symbol,
+  no date field" first suggests.
+- **Charges per day and per segment**, reconciling exactly, so charges can be apportioned
+  across a day's round trips and checked against a hard total.
+
+**Not recoverable, at any granularity, before the local store begins:**
+
+- **Per-trade P&L.** `/realised-pnl-history` aggregates within the window and the window
+  cannot go below one day. Two round trips in the same scrip on the same day collapse into
+  one row with averaged rates. Per-*trade* history before the local store exists is gone
+  and no combination of these three endpoints brings it back.
+- **Which bot, or whether a bot at all.** No endpoint carries an order id, a client id or a
+  tag. Bot-versus-hand attribution for the back period cannot be reconstructed here — see
+  commit `877fc4c`, which solves this going forward only.
+- **Intraday timing.** Ledger `date` and charges `trade_date` are UTC-midnight day stamps.
+- **Unrealised, historically.** These endpoints report only closed quantity. Mark-to-market
+  on any past date needs positions/holdings history, which none of the three provides.
+- **Per-symbol charges.** Charges come per day and per segment only. `broker_pnl.json`'s
+  per-symbol `charges` must therefore be apportioned, not sourced — the §12.5 identity
+  gives an exact daily control total to apportion against, which is the right way to do it.
+
+**Correction to `docs/dashboard_plan.md`.** It records per-trade fills as available "from
+2026-08-28 only". The store is better than that: `accounts/rahul/reports/trades_all.jsonl`
+holds 173 fills from **2026-08-03** to 2026-08-28 and pratibha's holds 161 over the same
+span, with `broker_pnl.json` carrying `seed_date: 2026-08-01`. So the per-trade boundary is
+**1 August 2026**, not 28 August.
+
+**What still needs a manual entry or an export.** Only one thing, and it is narrow:
+**per-trade detail for 1 April → 31 July 2026.** For that period the finest available truth
+is per-scrip-per-day, which is enough for every headline number the dashboard defines
+(capital in, realised, charges, net) and not enough for a per-round-trip table. If a
+per-round-trip view of Apr–Jul is genuinely wanted, it has to come from a Fyers web
+back-office trade export (or the tradebook, if it retains that far), loaded once by hand —
+it is not in this API. Everything else the plan asks for is reachable from these three
+endpoints, provided the importer **pages the ledger**, **keys on `symbol_name`**, and does
+not call the SDK wrappers in §12.0 until they are fixed.
