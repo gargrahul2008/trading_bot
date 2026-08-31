@@ -34,6 +34,18 @@ def _sum(rows: Iterable[Dict[str, Any]], key: str) -> Decimal:
     return sum((_dec(row.get(key)) for row in rows), D0)
 
 
+def _basis(position: Dict[str, Any]) -> Decimal:
+    """What a position cost, falling back to its mark.
+
+    A missing average price would otherwise report an open short as having zero
+    exposure and an open long as having nothing deployed — understating risk,
+    which is the wrong direction to be wrong in. Valuing it at the mark is not
+    the cost basis, but it is the right order of magnitude.
+    """
+    cost = _dec(position.get("avg_price"))
+    return cost if cost else _dec(position.get("ltp"))
+
+
 def account_portfolio(
     account: str,
     funds: Optional[Dict[str, Any]],
@@ -61,7 +73,7 @@ def account_portfolio(
 
     # What was paid for what is owned. Holdings carry their cost price; a long
     # position carries its average.
-    position_cost = sum((_dec(p.get("net_qty")) * _dec(p.get("avg_price")) for p in longs), D0)
+    position_cost = sum((_dec(p.get("net_qty")) * _basis(p) for p in longs), D0)
     holdings_cost = _sum(held, "invested")
     deployed = position_cost + holdings_cost
 
@@ -72,9 +84,7 @@ def account_portfolio(
     market_value = position_value + holdings_value
 
     # Notional sold short. Not deployed capital — margin, and reported apart.
-    short_exposure = abs(sum(
-        (_dec(p.get("net_qty")) * _dec(p.get("avg_price")) for p in shorts), D0
-    ))
+    short_exposure = abs(sum((_dec(p.get("net_qty")) * _basis(p) for p in shorts), D0))
 
     # Taken from the broker's own per-row figures rather than recomputed, so the
     # dashboard agrees with what the broker's app shows.

@@ -6,6 +6,7 @@ import { Loading } from "./components/ui";
 import { api, ApiError } from "./lib/api";
 import { LoginPage } from "./pages/LoginPage";
 import { OverviewPage } from "./pages/OverviewPage";
+import { PortfolioPage } from "./pages/PortfolioPage";
 
 function useSession() {
   const { isLoading, isError, error } = useQuery({
@@ -42,9 +43,10 @@ export function App() {
           )
         }
       >
-        <Route index element={<Navigate to="/overview" replace />} />
+        <Route index element={<Navigate to="/portfolio" replace />} />
+        <Route path="/portfolio" element={<PortfolioPage />} />
         <Route path="/overview" element={<OverviewPage />} />
-        <Route path="*" element={<Navigate to="/overview" replace />} />
+        <Route path="*" element={<Navigate to="/portfolio" replace />} />
       </Route>
     </Routes>
   );

@@ -59,3 +59,28 @@ export function age(seconds: number | null | undefined): string {
 export function plural(n: number, one: string, many?: string): string {
   return `${count(n)} ${n === 1 ? one : (many ?? one + "s")}`;
 }
+
+/** Money arrives from the API as decimal strings. Parsing at the edge keeps the
+ *  exact value in the payload and confines the float to display. */
+export function num(value: string | null | undefined): number | null {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/** Lakh and crore, for figures too large to read digit by digit. Indian
+ *  grouping already helps, but a nine-digit number still needs a label. */
+export function compact(value: number | null | undefined): string {
+  if (value === null || value === undefined) return BLANK;
+  const abs = Math.abs(value);
+  const sign = value < 0 ? "\u2212" : "";
+  if (abs >= 1e7) return `${sign}${(abs / 1e7).toFixed(2)} Cr`;
+  if (abs >= 1e5) return `${sign}${(abs / 1e5).toFixed(2)} L`;
+  return money(value);
+}
+
+export function percent(value: number | null | undefined): string {
+  if (value === null || value === undefined) return BLANK;
+  const sign = value > 0 ? "+" : value < 0 ? "\u2212" : "";
+  return `${sign}${Math.abs(value).toFixed(2)}%`;
+}

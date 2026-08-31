@@ -126,3 +126,24 @@ def test_consolidating_nothing_does_not_divide_by_zero():
     assert total["accounts"] == 0
     assert total["return_pct"] is None
     assert total["pnl"] == Decimal("0")
+
+
+def test_a_position_without_an_average_price_is_not_reported_as_zero_exposure():
+    """A missing avg_price would report an open short as having no exposure and
+    an open long as nothing deployed — understating risk, which is the wrong
+    direction to be wrong in. The mark is not the cost basis, but it is the
+    right order of magnitude."""
+    no_avg_short = {"net_qty": -50, "ltp": 3633.0, "unrealised": -4.0}
+    p = account_portfolio("pratibha", FUNDS, [no_avg_short], [])
+    assert p["counts"]["short"] == 1
+    assert p["short_exposure"] == Decimal("50") * Decimal("3633.0")
+
+    no_avg_long = {"net_qty": 100, "ltp": 250.0, "unrealised": 0}
+    q = account_portfolio("rahul", FUNDS, [no_avg_long], [])
+    assert q["deployed"] == Decimal("100") * Decimal("250.0")
+
+
+def test_the_cost_basis_is_preferred_when_it_is_present():
+    with_avg = {"net_qty": -50, "avg_price": 3706.0, "ltp": 3633.0, "unrealised": 0}
+    p = account_portfolio("pratibha", FUNDS, [with_avg], [])
+    assert p["short_exposure"] == Decimal("50") * Decimal("3706.0")

@@ -17,7 +17,10 @@ export function LoginPage() {
       // authenticated session rather than the cached 401 that sent us here and
       // bouncing straight back to this screen.
       await queryClient.invalidateQueries();
-      navigate("/overview", { replace: true });
+      // "/" rather than a named page: the index route decides where the app
+      // lands, so adding or reordering pages does not leave sign-in pointing at
+      // yesterday's landing screen.
+      navigate("/", { replace: true });
     },
   });
 

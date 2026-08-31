@@ -19,10 +19,14 @@ if str(REPO) not in sys.path:
 LOG = logging.getLogger("api.store")
 
 try:
+    from webapp.history.importer import realised_total
+    from webapp.pnl import portfolio as portfolio_mod
     from webapp.store.reader import Reader
     from webapp.store.schema import connect
 except Exception as exc:  # pragma: no cover - only if the tree is broken
     Reader = None  # type: ignore
+    realised_total = None  # type: ignore
+    portfolio_mod = None  # type: ignore
     LOG.warning("store unavailable: %s", exc)
 
 
@@ -73,5 +77,44 @@ def store_counts() -> Dict[str, Any]:
         return counts
     except Exception as exc:
         return {"available": False, "error": str(exc)}
+    finally:
+        reader.conn.close()
+
+
+def store_capital(account: str) -> str:
+    """Net capital put into an account, as a decimal string.
+
+    Zero when nothing has been imported — which is different from an account
+    with no capital, so the caller decides how to render it. A return figure
+    computed against an unimported base would be wildly wrong and look precise.
+    """
+    reader = _reader()
+    if reader is None:
+        return "0"
+    try:
+        return reader.capital_in(account)
+    except Exception as exc:
+        LOG.warning("capital read failed for %s: %s", account, exc)
+        return "0"
+    finally:
+        reader.conn.close()
+
+
+def store_realised(account: str, from_date: Optional[str] = None) -> Dict[str, Any]:
+    """The broker's own realised P&L, net of charges.
+
+    This is the headline figure; our FIFO matching supplies per-trade detail and
+    is never added to it, so the two cannot double-count.
+    """
+    reader = _reader()
+    if reader is None or realised_total is None:
+        return {"gross": "0", "charges": "0", "net": "0", "available": False}
+    try:
+        totals = realised_total(reader.conn, account, from_date=from_date)
+        totals["available"] = True
+        return totals
+    except Exception as exc:
+        LOG.warning("realised read failed for %s: %s", account, exc)
+        return {"gross": "0", "charges": "0", "net": "0", "available": False}
     finally:
         reader.conn.close()

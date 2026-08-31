@@ -3,7 +3,10 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 
 import { api } from "../lib/api";
 
-const NAV = [{ to: "/overview", label: "Overview" }];
+const NAV = [
+  { to: "/portfolio", label: "Portfolio" },
+  { to: "/overview", label: "Accounts" },
+];
 
 export function Layout() {
   const navigate = useNavigate();

@@ -84,3 +84,61 @@ export interface Overview {
   totals: Totals;
   configured: boolean;
 }
+
+export interface RealisedDetail {
+  gross: string;
+  charges: string;
+  net: string;
+  available: boolean;
+}
+
+/** Money arrives as decimal strings, not JSON floats — these are computed
+ *  exactly and must not be rounded by the browser on the way in. */
+export interface PortfolioRow {
+  account: string;
+  capital_in: string;
+  free: string;
+  utilised: string;
+  /** Cost of what is open — what was paid, not what it is worth now. */
+  deployed: string;
+  market_value: string;
+  /** Notional sold short. Margin, not deployed capital, so reported apart. */
+  short_exposure: string;
+  unrealised: string;
+  realised: string;
+  realised_is_partial: boolean;
+  realised_detail: RealisedDetail;
+  net_worth: string;
+  pnl: string;
+  /** null, not 0, when no capital has been imported — 0% reads as a fact and
+   *  this is the absence of one. */
+  return_pct: string | null;
+  counts: { positions: number; long: number; short: number; holdings: number };
+  from_store: boolean;
+  reachable: boolean;
+  error: string | null;
+}
+
+export interface PortfolioTotals {
+  accounts: number;
+  capital_in: string;
+  free: string;
+  utilised: string;
+  deployed: string;
+  market_value: string;
+  short_exposure: string;
+  unrealised: string;
+  realised: string;
+  realised_is_partial: boolean;
+  net_worth: string;
+  pnl: string;
+  return_pct: string | null;
+  counts: { positions: number; long: number; short: number; holdings: number };
+}
+
+export interface Portfolio {
+  accounts: PortfolioRow[];
+  totals: PortfolioTotals | null;
+  fy_start: string;
+  configured: boolean;
+}

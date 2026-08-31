@@ -27,9 +27,14 @@ from app.auth import (
     verify_password,
 )
 from app.config import REPO, agent_ports, get_settings, known_accounts
-from app.store import store_book, store_counts, store_status
+from app.store import (
+    portfolio_mod, store_book, store_capital, store_counts, store_realised, store_status,
+)
 
 logging.basicConfig(level=logging.INFO)
+
+# The Indian financial year, and the point returns are measured from.
+FY_START = "2026-04-01"
 LOG = logging.getLogger("api")
 
 app = FastAPI(
@@ -118,6 +123,69 @@ def get_overview(_: str = Session) -> Dict[str, Any]:
         rows.append(summary)
 
     return {"accounts": rows, "totals": overview_mod.totals(rows), "configured": True}
+
+
+@app.get("/api/portfolio")
+def get_portfolio(fy_start: str = FY_START, _: str = Session) -> Dict[str, Any]:
+    """Capital, deployment and P&L — per account and as one book.
+
+    The consolidated figure is the reason this dashboard exists: anyone can read
+    one account in the broker's own app, nobody can read six at once.
+    """
+    client = AgentClient()
+    names = known_accounts()
+    if not names:
+        return {"accounts": [], "totals": None, "configured": False}
+
+    books = {result.account: result for result in client.fan_out("/book", names)}
+
+    computed = []
+    extras = {}
+    for name in names:
+        book = books.get(name)
+        # Live agent preferred; the store answers when one is down, so an
+        # account never disappears from a total just because its agent restarted.
+        data = book.data if book and book.ok else store_book(name)
+        sections = (data or {}).get("sections") or {}
+
+        def section(kind: str) -> Any:
+            return (sections.get(kind) or {}).get("data")
+
+        realised = store_realised(name, from_date=fy_start)
+        computed.append(portfolio_mod.account_portfolio(
+            name,
+            funds=section("funds"),
+            positions=section("positions"),
+            holdings=section("holdings"),
+            capital_in=store_capital(name),
+            # The broker's own realised figure, net of charges. Our matched
+            # trades supply per-trade detail and are never added to it.
+            realised=realised["net"],
+            realised_is_partial=not realised["available"],
+        ))
+        extras[name] = {
+            "realised_detail": realised,
+            "from_store": bool(data and data.get("source") == "store"),
+            "reachable": bool(book and book.ok),
+            "error": book.error if book and not book.ok else None,
+        }
+
+    # Consolidate on the Decimal figures, then convert once — summing strings
+    # would be a different and worse kind of wrong.
+    totals = portfolio_mod.consolidate(computed)
+
+    rows = []
+    for row in computed:
+        as_json = portfolio_mod.as_json(row)
+        as_json.update(extras[row["account"]])
+        rows.append(as_json)
+
+    return {
+        "accounts": rows,
+        "totals": portfolio_mod.as_json(totals),
+        "fy_start": fy_start,
+        "configured": True,
+    }
 
 
 @app.get("/api/accounts/{account}/{section}")
