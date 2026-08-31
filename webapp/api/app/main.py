@@ -229,6 +229,7 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
 
     rows: List[Dict[str, Any]] = []
     missing: List[str] = []
+    sold: List[Dict[str, Any]] = []
     for name in names:
         book = books.get(name)
         data = book.data if book and book.ok else store_book(name)
@@ -245,6 +246,15 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
             if float(position.get("net_qty") or 0) == 0:
                 # A flat row is a position closed today. It belongs on the
                 # Trades page, not among what is currently at risk.
+                continue
+            if position.get("delivery_sale"):
+                # Stock sold out of holdings, awaiting settlement. There is no
+                # open risk — and the broker's `unrealized_profit` on it is the
+                # mark-to-market of a short that does not exist, not the trade's
+                # P&L. SHRINGARMS showed +3,130 where the sale was a −6,660
+                # loss. It belongs on Trades, matched against what it cost.
+                sold.append({"account": name, "symbol": position.get("symbol", ""),
+                             "qty": abs(float(position.get("net_qty") or 0))})
                 continue
             rows.append(dict(position, account=name, book="position",
                              from_store=from_store, age_s=meta.get("age_s"),
@@ -266,7 +276,8 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
     # Every account queried, not just those with something open. Letting the
     # client infer the columns from the rows makes an account with nothing open
     # vanish, which is indistinguishable from one that could not be read.
-    return {"positions": rows, "accounts": names, "accounts_missing": missing}
+    return {"positions": rows, "accounts": names, "accounts_missing": missing,
+            "sold_today": sold}
 
 
 @app.get("/api/trades")

@@ -98,7 +98,8 @@ def test_a_flat_position_is_not_shown_as_open(client):
     it among what is at risk overstates the open book."""
     symbols = [p["symbol"] for p in client.get("/api/positions").json()["positions"]]
     assert "NSE:TATAELXSI26SEPFUT" not in symbols
-    assert len(symbols) == 3
+    # The delivery sale is excluded too, for the same reason.
+    assert symbols == ["NSE:RELIANCE-EQ", "NSE:CROMPTON26SEPFUT"]
 
 
 def test_positions_are_ordered_by_how_far_they_have_moved(client):
@@ -119,10 +120,22 @@ def test_every_position_carries_its_account_and_freshness(client):
     assert row["age_s"] == 2.0
 
 
-def test_the_delivery_sale_distinction_survives_to_the_api(client):
+def test_stock_sold_from_holdings_is_reported_apart_from_open_risk(client):
+    """The shares are gone and the trade is realised — and the broker's
+    unrealized_profit on such a row is the mark-to-market of a short that does
+    not exist. SHRINGARMS showed +3,130 where the sale was a −6,660 loss."""
+    payload = client.get("/api/positions").json()
+
+    assert "NSE:SHRINGARMS-EQ" not in {p["symbol"] for p in payload["positions"]}
+    assert payload["sold_today"] == [
+        {"account": "rahul", "symbol": "NSE:SHRINGARMS-EQ", "qty": 1000.0}
+    ]
+
+
+def test_a_real_short_is_still_shown_as_open(client):
+    """Only the delivery case is excluded; a short future is genuine risk."""
     rows = {p["symbol"]: p for p in client.get("/api/positions").json()["positions"]}
-    assert rows["NSE:SHRINGARMS-EQ"]["delivery_sale"] is True
-    assert rows["NSE:CROMPTON26SEPFUT"].get("delivery_sale") in (None, False)
+    assert rows["NSE:CROMPTON26SEPFUT"]["net_qty"] == -2150
 
 
 # ── trades ───────────────────────────────────────────────────────────────────

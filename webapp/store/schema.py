@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -163,6 +163,29 @@ CREATE TABLE IF NOT EXISTS charges_daily (
     ipft                 REAL NOT NULL DEFAULT 0,
     fetched_at           REAL NOT NULL,
     PRIMARY KEY (account, day)
+);
+
+-- What each account already held before our fill history begins.
+--
+-- Without this the matcher cannot close a delivery sale: shares bought years
+-- ago and sold today have no matching buy in the store, so a FIFO pass opens a
+-- short lot instead of closing a long one — and the trade's P&L, which is the
+-- sale against the holding's cost, never appears at all.
+--
+-- Seeded from the earliest holdings snapshot, or entered by hand for positions
+-- older than any snapshot. `as_of_day` dates the synthetic opening buy, and
+-- every recorded fill from that day onward applies on top of it.
+CREATE TABLE IF NOT EXISTS opening_positions (
+    account     TEXT NOT NULL,
+    symbol      TEXT NOT NULL,
+    product_type TEXT NOT NULL DEFAULT 'CNC',
+    qty         REAL NOT NULL,
+    cost_price  REAL NOT NULL,
+    as_of_day   TEXT NOT NULL,
+    source      TEXT NOT NULL,          -- holdings_snapshot | manual
+    note        TEXT,
+    recorded_at REAL NOT NULL,
+    PRIMARY KEY (account, symbol, product_type)
 );
 
 -- How far each account's history has been fetched, so a re-run picks up where

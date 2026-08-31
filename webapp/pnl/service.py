@@ -13,17 +13,25 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from webapp.pnl.matcher import Match, match_fills, open_position, summarise
+from webapp.pnl.opening import as_fills as opening_fills
 from webapp.store.reader import Reader
 
 
 def _fills(conn: sqlite3.Connection, account: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Recorded fills, preceded by whatever the account already held.
+
+    Without the opening positions a delivery sale has no buy to match against:
+    FIFO opens a short lot, the trade's real P&L never appears, and what the
+    screen shows instead is the broker's mark-to-market of a position that does
+    not exist.
+    """
     sql = ("SELECT account, trade_id, order_id, symbol, side, qty, price, product_type,"
            " traded_at, trading_day FROM fills")
     params: List[Any] = []
     if account:
         sql += " WHERE account = ?"
         params.append(account)
-    return [dict(row) for row in conn.execute(sql, params)]
+    return opening_fills(conn, account) + [dict(row) for row in conn.execute(sql, params)]
 
 
 def matches(conn: sqlite3.Connection, account: Optional[str] = None,

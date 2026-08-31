@@ -173,6 +173,9 @@ export interface PositionsPayload {
    *  nothing open still gets a column, or "empty" and "unread" look alike. */
   accounts: string[];
   accounts_missing: string[];
+  /** Sold out of holdings today, awaiting settlement. Not open risk — their
+   *  P&L is realised and appears on Trades. */
+  sold_today: { account: string; symbol: string; qty: number }[];
 }
 
 export interface Trade {

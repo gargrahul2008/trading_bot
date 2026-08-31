@@ -40,6 +40,7 @@ from webapp.history.client import HistoryClient  # noqa: E402
 from webapp.history.importer import (  # noqa: E402
     import_capital, import_charges, import_realised, realised_total, record_progress,
 )
+from webapp.pnl.opening import seed_from_holdings  # noqa: E402
 from webapp.store import connect, migrate  # noqa: E402
 
 LOG = logging.getLogger("fetch_history")
@@ -71,6 +72,8 @@ def main(argv=None) -> int:
     parser.add_argument("--db", default=None)
     parser.add_argument("--dry-run", action="store_true",
                         help="fetch and report, write nothing")
+    parser.add_argument("--no-seed-openings", action="store_true",
+                        help="skip recording what the account already held")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -162,6 +165,14 @@ def main(argv=None) -> int:
               % FY_START)
     realised_rows = import_realised(conn, args.account, rows) if rows else 0
     charge_rows = import_charges(conn, args.account, charges)
+
+    # What the account already held before our fills begin. Without it a
+    # delivery sale has no buy to match against, so its P&L never appears and
+    # the broker's mark-to-market of a phantom short shows up instead.
+    if not args.no_seed_openings:
+        seeded = seed_from_holdings(conn, args.account)
+        if seeded:
+            print("openings  : %d holding(s) recorded as opening positions" % seeded)
 
     record_progress(conn, args.account, "ledger", from_date, to_date)
     record_progress(conn, args.account, "charges", from_date, to_date)

@@ -66,7 +66,12 @@ def account_portfolio(
     positions = positions or []
     holdings = holdings or []
 
-    open_positions = [p for p in positions if _dec(p.get("net_qty")) != 0]
+    # A delivery sale is stock already sold, awaiting settlement — no open risk.
+    # Its `unrealised` from the broker is the mark-to-market of a short that does
+    # not exist, so including it would put a number in the unrealised column that
+    # is neither unrealised nor the right size.
+    open_positions = [p for p in positions
+                      if _dec(p.get("net_qty")) != 0 and not p.get("delivery_sale")]
     longs = [p for p in open_positions if _dec(p.get("net_qty")) > 0]
     shorts = [p for p in open_positions if _dec(p.get("net_qty")) < 0]
     held = [h for h in holdings if h.get("is_open")]

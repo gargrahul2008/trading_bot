@@ -34,6 +34,31 @@ the broker. Netting them would invent a round trip that never happened.
 `product_type`. A CNC buy sold the same afternoon was an intraday trade whatever
 it was booked as. `product_type` is reported alongside, not instead.
 
+## Opening positions
+
+A share bought two years ago and sold today has no matching buy in the store, so
+a FIFO pass opens a *short* lot rather than closing a long one — and the trade's
+real P&L never appears. Worse, the broker reports that phantom short's
+mark-to-market as `unrealized_profit`, which is neither the right number nor the
+right kind of number: pratibha's SHRINGARMS sale showed **+3,130 unrealised
+where the trade was a −6,660 realised loss**.
+
+`opening.py` gives the matcher one synthetic buy per holding, at the holding's
+cost, dated before the first fill we recorded. Every real fill from then applies
+on top. Seeded from the earliest holdings snapshot by
+`scripts/fetch_history.py`, or entered by hand for anything older than any
+snapshot — a manual entry outranks a re-seed, because whoever typed it knew
+something the snapshot did not.
+
+Two limits, honestly:
+
+* The cost is the broker's **average** for that holding, not a per-lot basis, so
+  a partial sale matches at the average. That is what the broker itself does for
+  delivery stock, and what its own realised history uses.
+* Anything held and sold **before** our first snapshot is not recoverable here.
+  For those the broker's realised history is the only source — and it is already
+  the headline figure on the Portfolio page.
+
 ## Match over all history, then filter
 
 A position opened last week and closed today is a *today* trade, and its entry

@@ -177,7 +177,7 @@ export function PositionsPage() {
   const total = rows.reduce((sum, p) => sum + p.unrealised, 0);
   const longs = rows.filter((p) => p.net_qty > 0 && !p.delivery_sale).length;
   const shorts = rows.filter((p) => p.net_qty < 0 && !p.delivery_sale).length;
-  const sold = rows.filter((p) => p.delivery_sale).length;
+  const sold = data.sold_today ?? [];
   const holdings = rows.filter((p) => p.book === "holding").length;
 
   return (
@@ -188,7 +188,7 @@ export function PositionsPage() {
           <>
             {rows.length} open · {longs} long · {shorts} short
             {holdings > 0 && ` · ${holdings} delivery holdings`}
-            {sold > 0 && ` · ${sold} sold from holdings`} · unrealised{" "}
+             · unrealised{" "}
             <span className={pnlClass(total)}>{signed(total)}</span>
           </>
         }
@@ -219,6 +219,21 @@ export function PositionsPage() {
           </div>
         }
       />
+
+      {/* Their P&L is realised, not unrealised — and the broker's figure on such
+          a row is the mark-to-market of a short that does not exist. */}
+      {sold.length > 0 && (
+        <div
+          className="mb-4 rounded border px-3 py-2 text-sm"
+          style={{ borderColor: "var(--border)", color: "var(--ink-secondary)" }}
+        >
+          Sold from holdings today, awaiting settlement:{" "}
+          <strong>
+            {sold.map((s) => `${s.symbol} (${s.account})`).join(", ")}
+          </strong>
+          . No longer at risk — their P&amp;L is realised and shown on Trades.
+        </div>
+      )}
 
       {data.accounts_missing.length > 0 && (
         <div
@@ -282,10 +297,12 @@ export function PositionsPage() {
       <p className="mt-3 text-xs text-[var(--ink-muted)]">
         {detail
           ? "Ordered by how far each position has moved, largest first. "
-          : "One row per symbol, one column per account — a name held in three places is one line. Hover a symbol for its quantities. An empty cell is \u00b7; zero is a real value and looks different. "} “Delivery” is stock
-        sold out of holdings and awaiting settlement — a negative quantity, but not a
-        short anyone has to buy back. Move is signed in the position’s own direction, so
-        a short that has fallen shows a gain.
+          : "One row per symbol, one column per account — a name held in three places is one line. Hover a symbol for its quantities. An empty cell is \u00b7; zero is a real value and looks different. "}
+        Positions and holdings together: the broker keeps settled delivery stock in a
+        separate book, but both are money at risk. Stock sold out of holdings today is
+        excluded — it carries no risk, and its P&amp;L is realised rather than
+        unrealised. Move is signed in the position’s own direction, so a short that has
+        fallen shows a gain.
       </p>
     </>
   );

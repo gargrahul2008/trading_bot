@@ -147,3 +147,17 @@ def test_the_cost_basis_is_preferred_when_it_is_present():
     with_avg = {"net_qty": -50, "avg_price": 3706.0, "ltp": 3633.0, "unrealised": 0}
     p = account_portfolio("pratibha", FUNDS, [with_avg], [])
     assert p["short_exposure"] == Decimal("50") * Decimal("3706.0")
+
+
+def test_a_delivery_sale_is_not_counted_as_unrealised():
+    """The shares are sold; there is no open risk. And the broker's figure on
+    such a row is the mark-to-market of a short that does not exist —
+    SHRINGARMS showed +3,130 unrealised where the sale was a −6,660 realised
+    loss."""
+    sale = {"net_qty": -1000, "avg_price": 223.91, "ltp": 220.78,
+            "unrealised": 3130.0, "delivery_sale": True}
+    p = account_portfolio("pratibha", FUNDS, [sale, long_position()], [])
+
+    assert p["unrealised"] == Decimal("-37244.80"), "only the real position"
+    assert p["counts"]["positions"] == 1
+    assert p["short_exposure"] == Decimal("0"), "it is not a short"
