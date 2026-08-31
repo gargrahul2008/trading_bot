@@ -201,3 +201,86 @@ def test_trades_also_name_every_account(client, monkeypatch):
 def test_filtering_trades_to_one_account_narrows_the_columns_too(client):
     payload = client.get("/api/trades?account=rahul").json()
     assert payload["accounts"] == ["rahul"]
+
+
+def holding(symbol, qty, cost, ltp, is_open=True):
+    return {"symbol": symbol, "qty": qty, "cost_price": cost, "ltp": ltp,
+            "invested": qty * cost, "market_value": qty * ltp,
+            "unrealised": qty * (ltp - cost), "is_open": is_open,
+            "holding_type": "HLD"}
+
+
+@pytest.fixture
+def client_with_holdings(store, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app import auth as auth_mod
+    from app.main import app
+
+    def section(data):
+        return {"data": data, "as_of": 1.0, "age_s": 30.0, "stale": False,
+                "stale_after_s": 180.0, "source": "rest", "error": None,
+                "ok_count": 1, "fail_count": 0}
+
+    agent = serve_json({
+        "/book": {"user": "pratibha", "sections": {
+            "positions": section([position("NSE:CROMPTON26SEPFUT", -2150, 242.65,
+                                           240.30, 5052.50)]),
+            "holdings": section([
+                holding("NSE:INDOTHAI-EQ", 6682, 264.24, 51.16),
+                holding("BSE:ARL-B", 7225, 60.14, 42.87),
+                holding("NSE:SOLD-EQ", 0, 230.57, 220.78, is_open=False),
+            ]),
+            "orders": section([]), "trades": section([]), "funds": section({}),
+        }},
+        "/health": health(),
+    })
+    wire(monkeypatch, {"pratibha": agent.server_address[1]})
+    stored = auth_mod.hash_password("pw")
+    monkeypatch.setattr(auth_mod, "password_hash", lambda: stored)
+    monkeypatch.setattr(auth_mod, "cookie_secure", lambda: False)
+
+    test_client = TestClient(app)
+    test_client.post("/api/auth/login", json={"password": "pw"})
+    yield test_client
+    agent.shutdown()
+    agent.server_close()
+
+
+def test_holdings_appear_alongside_positions(client_with_holdings):
+    """The broker keeps settled delivery stock in holdings and everything else
+    in positions. That split is bookkeeping, not the trader's view — showing
+    only one left an account with three rows out of fifteen."""
+    rows = client_with_holdings.get("/api/positions").json()["positions"]
+    symbols = {r["symbol"] for r in rows}
+
+    assert "NSE:CROMPTON26SEPFUT" in symbols, "the position"
+    assert "NSE:INDOTHAI-EQ" in symbols and "BSE:ARL-B" in symbols, "the holdings"
+    assert len(rows) == 3
+
+
+def test_a_sold_out_holding_is_not_shown_as_owned(client_with_holdings):
+    """It comes back with qty 0 and its old cost price, but it is gone."""
+    symbols = {r["symbol"] for r in
+               client_with_holdings.get("/api/positions").json()["positions"]}
+    assert "NSE:SOLD-EQ" not in symbols
+
+
+def test_a_holding_carries_its_cost_and_reads_as_long(client_with_holdings):
+    rows = {r["symbol"]: r for r in
+            client_with_holdings.get("/api/positions").json()["positions"]}
+    indothai = rows["NSE:INDOTHAI-EQ"]
+
+    assert indothai["book"] == "holding"
+    assert indothai["direction"] == "LONG"
+    assert indothai["net_qty"] == 6682
+    assert indothai["avg_price"] == pytest.approx(264.24)
+    assert indothai["unrealised"] == pytest.approx(6682 * (51.16 - 264.24))
+    assert indothai["carried"] is True
+
+
+def test_positions_and_holdings_are_told_apart(client_with_holdings):
+    rows = {r["symbol"]: r for r in
+            client_with_holdings.get("/api/positions").json()["positions"]}
+    assert rows["NSE:CROMPTON26SEPFUT"]["book"] == "position"
+    assert rows["NSE:INDOTHAI-EQ"]["book"] == "holding"

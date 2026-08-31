@@ -42,6 +42,9 @@ function Row({ position }: { position: Position }) {
       </Td>
       <Td align="left">
         <span className="font-medium">{position.symbol}</span>
+        {position.book === "holding" && (
+          <Tag title="Settled delivery stock, held in the holdings book">holding</Tag>
+        )}
         {position.is_derivative && <Tag title="Derivatives segment">F&amp;O</Tag>}
         {position.carried && <Tag title="Carried in from a previous day">carried</Tag>}
         {position.delivery_sale && (
@@ -99,13 +102,21 @@ function toMatrix(positions: Position[], accounts: string[]) {
     rows.push({
       key: symbol,
       label: symbol,
-      note: first.delivery_sale ? "sold" : first.is_derivative ? "F&O" : undefined,
+      note: first.delivery_sale
+        ? "sold"
+        : first.is_derivative
+          ? "F&O"
+          : held.every((p) => p.book === "holding")
+            ? "holding"
+            : undefined,
       cells,
       total: held.reduce((sum, p) => sum + p.unrealised, 0),
       // Quantities differ per account, so they belong in the hover rather than
       // in a cell that has to hold one number.
       title: held
-        .map((p) => `${p.account}: ${p.direction} ${Math.abs(p.net_qty)} @ ${p.avg_price ?? "?"}`)
+        .map((p) =>
+          `${p.account}: ${p.direction} ${Math.abs(p.net_qty)} @ ${p.avg_price ?? "?"}` +
+          (p.book === "holding" ? " (holding)" : ""))
         .join("\n"),
     });
   }
@@ -167,6 +178,7 @@ export function PositionsPage() {
   const longs = rows.filter((p) => p.net_qty > 0 && !p.delivery_sale).length;
   const shorts = rows.filter((p) => p.net_qty < 0 && !p.delivery_sale).length;
   const sold = rows.filter((p) => p.delivery_sale).length;
+  const holdings = rows.filter((p) => p.book === "holding").length;
 
   return (
     <>
@@ -175,6 +187,7 @@ export function PositionsPage() {
         subtitle={
           <>
             {rows.length} open · {longs} long · {shorts} short
+            {holdings > 0 && ` · ${holdings} delivery holdings`}
             {sold > 0 && ` · ${sold} sold from holdings`} · unrealised{" "}
             <span className={pnlClass(total)}>{signed(total)}</span>
           </>

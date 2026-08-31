@@ -154,6 +154,9 @@ export interface Position {
   realised: number;
   product_type: string;
   kind: string;
+  /** Which broker book it came from. Fyers keeps settled delivery stock in
+   *  holdings and everything else in positions; both are money at risk. */
+  book: "position" | "holding";
   /** Stock sold out of holdings, awaiting settlement — not a short. */
   delivery_sale?: boolean;
   is_derivative?: boolean;

@@ -189,11 +189,38 @@ def get_portfolio(fy_start: str = FY_START, _: str = Session) -> Dict[str, Any]:
     }
 
 
+def _holding_as_position(holding: Dict[str, Any]) -> Dict[str, Any]:
+    """A holding in the same shape as a position.
+
+    Fyers keeps settled delivery stock in `holdings` and everything else in
+    `positions`. That split is the broker's bookkeeping, not the trader's: both
+    are shares owned and money at risk. Showing only one of them left pratibha
+    with three rows out of fifteen.
+    """
+    qty = float(holding.get("qty") or 0)
+    return {
+        "symbol": holding.get("symbol", ""),
+        "net_qty": qty,
+        "direction": "LONG",
+        "avg_price": float(holding.get("cost_price") or 0),
+        "ltp": float(holding.get("ltp") or 0),
+        "unrealised": float(holding.get("unrealised") or 0),
+        "realised": 0.0,
+        # Delivery stock, held beyond the session by definition.
+        "product_type": holding.get("holding_type") or "CNC",
+        "kind": "positional",
+        "book": "holding",
+        "carried": True,
+        "raw": holding.get("raw"),
+    }
+
+
 @app.get("/api/positions")
 def get_positions(_: str = Session) -> Dict[str, Any]:
     """Everything open right now, across every account, as one list.
 
-    Flattened deliberately: the point of this dashboard is to see six accounts
+    Positions *and* holdings: the broker separates them, the trader does not.
+    Flattened deliberately — the point of this dashboard is to see six accounts
     at once, and a per-account grouping would put that back behind six clicks.
     """
     client = AgentClient()
@@ -209,8 +236,9 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
             missing.append(name)
             continue
         sections = data.get("sections") or {}
-        meta = sections.get("positions") or {}
         from_store = data.get("source") == "store"
+
+        meta = sections.get("positions") or {}
         for position in (meta.get("data") or []):
             if not isinstance(position, dict):
                 continue
@@ -218,8 +246,19 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
                 # A flat row is a position closed today. It belongs on the
                 # Trades page, not among what is currently at risk.
                 continue
-            rows.append(dict(position, account=name, from_store=from_store,
-                             age_s=meta.get("age_s"), stale=bool(meta.get("stale"))))
+            rows.append(dict(position, account=name, book="position",
+                             from_store=from_store, age_s=meta.get("age_s"),
+                             stale=bool(meta.get("stale"))))
+
+        holdings = sections.get("holdings") or {}
+        for holding in (holdings.get("data") or []):
+            if not isinstance(holding, dict) or not holding.get("is_open"):
+                # A sold-out holding comes back with qty 0 and its old cost
+                # price; it is not owned any more.
+                continue
+            rows.append(dict(_holding_as_position(holding), account=name,
+                             from_store=from_store, age_s=holdings.get("age_s"),
+                             stale=bool(holdings.get("stale"))))
 
     # Biggest mover first — the row you would act on is the one furthest from
     # where you wanted it, in either direction.
