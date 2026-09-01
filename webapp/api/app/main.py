@@ -31,7 +31,8 @@ from app.auth import (
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
-    classify_reject, store_orders, store_realised_scrips, store_status, store_trades,
+    classify_reject, store_orders, store_realised_scrips, store_status, store_symbols,
+    store_trades,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -415,6 +416,40 @@ def cancel_order(order_id: str, account: str, _: str = Session) -> Dict[str, Any
 def exit_position(position_id: str, body: AccountBody, _: str = Session) -> Dict[str, Any]:
     return _act(trading.EXIT, body.account, "/positions/%s/exit" % position_id, "POST",
                 {"position_id": position_id}, {})
+
+
+@app.get("/api/symbols")
+def get_symbols(_: str = Session) -> Dict[str, Any]:
+    """Symbols seen in any account, plus whatever is open right now.
+
+    The live half matters: a position opened this morning should be suggestable
+    before it has been through the store.
+    """
+    symbols = set(store_symbols())
+    for result in AgentClient().fan_out("/book", known_accounts()):
+        if not result.ok:
+            continue
+        for kind in ("positions", "holdings"):
+            section = ((result.data or {}).get("sections") or {}).get(kind) or {}
+            for row in (section.get("data") or []):
+                if isinstance(row, dict) and row.get("symbol"):
+                    symbols.add(row["symbol"])
+    return {"symbols": sorted(symbols)}
+
+
+@app.get("/api/quote")
+def get_quote(account: str, symbols: str, _: str = Session) -> Dict[str, Any]:
+    """A live price for one or more symbols, through one account's agent.
+
+    Costs a broker call, so the pad asks only when the symbol settles — not on
+    every keystroke.
+    """
+    if account not in agent_ports():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account: %s" % account)
+    result = AgentClient().call(account, "/quote?symbols=%s" % symbols)
+    if not result.ok:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, result.error or "quote failed")
+    return result.data
 
 
 @app.get("/api/audit")

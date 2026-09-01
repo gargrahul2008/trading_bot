@@ -310,6 +310,17 @@ class FyersGateway:
     def funds(self) -> Dict[str, Any]:
         return summarise_funds(self._call("funds_raw"))
 
+    def quotes(self, symbols: List[str]) -> Dict[str, float]:
+        """Last traded price for one or more symbols.
+
+        Used by the order pad to value a trade before it is placed and to set
+        stop and target as a percentage. On demand rather than polled: it costs
+        a broker call, and the budget is shared with the bots.
+        """
+        if not symbols:
+            return {}
+        return {sym: float(price) for sym, price in self._call("get_ltps", symbols).items()}
+
     # ── writes ──────────────────────────────────────────────────────────────
     def place_order(self, req: PlaceOrderRequest) -> str:
         return self._call("place_order", req)

@@ -28,6 +28,10 @@ LOG = logging.getLogger("agent.server")
 
 MAX_BODY_BYTES = 64 * 1024
 
+# One quote call covers several symbols, but an unbounded list is a way to spend
+# the bots' rate budget from a text box.
+MAX_QUOTE_SYMBOLS = 25
+
 _ORDER_ID = re.compile(r"^/orders/([A-Za-z0-9_.:-]{1,64})$")
 _POSITION_EXIT = re.compile(r"^/positions/([A-Za-z0-9_.:%|-]{1,128})/exit$")
 
@@ -82,6 +86,22 @@ class Agent:
 
     def snapshot(self) -> Dict[str, Any]:
         return self.book.snapshot()
+
+    def quote(self, symbols: List[str]) -> Dict[str, Any]:
+        """A live price, outside the polling schedule.
+
+        Still spends the budget, so a caller that asks for a hundred symbols
+        gets told no rather than quietly costing the bots their headroom.
+        """
+        symbols = [s.strip() for s in symbols if s.strip()][:MAX_QUOTE_SYMBOLS]
+        if not symbols:
+            raise AgentError(400, "no symbols given")
+        if not self.poller.budget.take():
+            raise AgentError(429, "no rate budget spare — try again in a moment")
+        try:
+            return {"quotes": self.gateway.quotes(symbols)}
+        except Exception as exc:
+            raise AgentError(502, str(exc))
 
     def section(self, name: str) -> Dict[str, Any]:
         try:
@@ -159,6 +179,10 @@ class Agent:
                 return 200, self.health()
             if path == "/book":
                 return 200, self.snapshot()
+            if path.startswith("/quote"):
+                # Parsed from the query string by the handler, which passes it
+                # through in `body` for GET.
+                return 200, self.quote((body or {}).get("symbols") or [])
             if path.startswith("/") and path[1:] in self.book.STALE_AFTER:
                 return 200, self.section(path[1:])
             raise AgentError(404, "not found")
@@ -232,7 +256,14 @@ def make_handler(agent: Agent, token: str) -> Callable[..., BaseHTTPRequestHandl
                 return
             try:
                 body = self._body() if method in ("POST", "PATCH", "PUT") else None
-                status, payload = agent.dispatch(method, self.path.split("?")[0], body)
+                path, _, query = self.path.partition("?")
+                if method == "GET" and query:
+                    from urllib.parse import parse_qs
+
+                    parsed = parse_qs(query)
+                    body = {"symbols": [s for v in parsed.get("symbols", [])
+                                        for s in v.split(",")]}
+                status, payload = agent.dispatch(method, path, body)
                 self._send(status, payload)
             except AgentError as exc:
                 self._send(exc.status, {"error": exc.message})

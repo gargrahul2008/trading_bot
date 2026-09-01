@@ -225,3 +225,33 @@ def store_orders(account: Optional[str] = None, day: Optional[str] = None,
         return {"orders": [], "available": False}
     finally:
         reader.conn.close()
+
+
+def store_symbols() -> List[str]:
+    """Every symbol this dashboard has seen, for the order pad's suggestions.
+
+    Drawn from what has actually been traded and held rather than from a symbol
+    master: it is exactly the list someone reaches for, it needs no extra data
+    source to keep current, and a free-typed symbol still works for anything new.
+    """
+    reader = _reader()
+    if reader is None:
+        return []
+    try:
+        found = set()
+        for sql in (
+            "SELECT DISTINCT symbol FROM orders",
+            "SELECT DISTINCT symbol FROM fills",
+            "SELECT DISTINCT symbol FROM realised_history",
+            "SELECT DISTINCT symbol FROM opening_positions",
+        ):
+            try:
+                found.update(row[0] for row in reader.conn.execute(sql) if row[0])
+            except Exception:
+                continue
+        return sorted(found)
+    except Exception as exc:
+        LOG.warning("symbol read failed: %s", exc)
+        return []
+    finally:
+        reader.conn.close()

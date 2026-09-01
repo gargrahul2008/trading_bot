@@ -1,58 +1,38 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card, ErrorNote, Loading, PageHeader } from "../components/ui";
-import { Confirm } from "../components/Confirm";
+import { SymbolInput } from "../components/SymbolInput";
 import { api, ApiError } from "../lib/api";
 import { money } from "../lib/format";
+import { Money } from "../lib/privacy";
 import type { AuditEntry, Overview, PlaceRequest } from "../lib/types";
 
-const PRODUCTS = ["CNC", "INTRADAY", "MARGIN", "MTF", "BO", "CO"] as const;
+const PRODUCTS = ["BO", "CNC", "INTRADAY", "MARGIN", "MTF", "CO"] as const;
 const TYPES = [
   { value: "MARKET", label: "Market" },
   { value: "LIMIT", label: "Limit" },
-  { value: "SL", label: "SL (stop-limit)" },
-  { value: "SL_M", label: "SL-M (stop-market)" },
+  { value: "SL", label: "SL" },
+  { value: "SL_M", label: "SL-M" },
 ] as const;
 
-/** Which price boxes a given order actually uses.
- *
- *  Fields that would be ignored are hidden rather than disabled: an empty box
- *  someone can type into is an invitation to believe it did something.
- */
+/** Stop and target start here, as a percentage of the price, and are converted
+ *  to the points Fyers actually takes. Typed over freely — a default is a
+ *  starting point, not a policy. */
+const DEFAULT_PCT = 2;
+
 function needs(orderType: string, product: string) {
   return {
     limit: orderType === "LIMIT" || orderType === "SL",
     stop: orderType === "SL" || orderType === "SL_M",
-    // Bracket and cover carry their exit with them; on any other product the
-    // broker drops these silently.
     legs: product === "BO" || product === "CO",
     target: product === "BO",
   };
 }
 
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <label className="block">
-      <span className="text-xs font-medium uppercase tracking-wide text-[var(--ink-muted)]">
-        {label}
-      </span>
-      {children}
-      {hint && <span className="mt-0.5 block text-xs text-[var(--ink-muted)]">{hint}</span>}
-    </label>
-  );
-}
-
-const inputClass =
-  "mt-1 w-full rounded border bg-transparent px-3 py-2 text-sm tnum";
+const inputClass = "mt-1 w-full rounded border bg-transparent px-3 py-2 text-sm tnum";
+const labelClass =
+  "text-xs font-medium uppercase tracking-wide text-[var(--ink-muted)]";
 
 export function OrderPadPage() {
   const queryClient = useQueryClient();
@@ -60,38 +40,78 @@ export function OrderPadPage() {
   const [symbol, setSymbol] = useState("");
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   const [qty, setQty] = useState("");
-  const [product, setProduct] = useState("CNC");
-  const [orderType, setOrderType] = useState("LIMIT");
+  const [product, setProduct] = useState<string>("BO");
+  const [orderType, setOrderType] = useState("MARKET");
   const [limitPrice, setLimitPrice] = useState("");
   const [stopPrice, setStopPrice] = useState("");
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
-  const [confirming, setConfirming] = useState(false);
+  const [legsTouched, setLegsTouched] = useState(false);
   const [done, setDone] = useState<string | null>(null);
 
   const overview = useQuery({
     queryKey: ["overview"],
     queryFn: () => api.get<Overview>("/overview"),
+    refetchInterval: 15000,
   });
-  const audit = useQuery({
-    queryKey: ["audit"],
-    queryFn: () => api.get<{ entries: AuditEntry[] }>("/audit?limit=10"),
-    refetchInterval: 10000,
+  const symbols = useQuery({
+    queryKey: ["symbols"],
+    queryFn: () => api.get<{ symbols: string[] }>("/symbols"),
+    staleTime: 5 * 60_000,
   });
+
+  // A quote costs a broker call, so it is fetched when the symbol settles
+  // rather than on every keystroke.
+  const settled = symbol.includes(":") && symbol.length > 6;
+  const quote = useQuery({
+    queryKey: ["quote", account, symbol],
+    queryFn: () =>
+      api.get<{ quotes: Record<string, number> }>(
+        `/quote?account=${encodeURIComponent(account)}&symbols=${encodeURIComponent(symbol)}`,
+      ),
+    enabled: Boolean(account && settled),
+    staleTime: 10_000,
+    retry: false,
+  });
+
+  const ltp = quote.data?.quotes?.[symbol] ?? null;
+  // A symbol the broker will not price is one it does not know. With no confirm
+  // step, that guess — "relia" completing to NSE:RELIA-EQ — would otherwise go
+  // straight out.
+  const unpriced = Boolean(account && settled && !quote.isFetching && ltp === null);
+  const number = (text: string) => (text.trim() === "" ? 0 : Number(text));
+
+  // A market order has no price of its own, so the mark is what values the
+  // trade and what the percentage legs are measured from.
+  const reference =
+    (needs(orderType, product).limit ? number(limitPrice) : 0) ||
+    number(stopPrice) ||
+    ltp ||
+    0;
+
+  // Fill the legs from the price once it is known, and leave them alone the
+  // moment they are typed over.
+  useEffect(() => {
+    if (!legsTouched && reference > 0) {
+      const points = ((reference * DEFAULT_PCT) / 100).toFixed(2);
+      setStopLoss(points);
+      setTakeProfit(points);
+    }
+  }, [reference, legsTouched]);
 
   const place = useMutation({
     mutationFn: (request: PlaceRequest) => api.post("/orders", request),
     onSuccess: () => {
-      setConfirming(false);
-      setDone("Order sent to " + account + ".");
+      setDone(`${side} ${qty} ${symbol} sent to ${account}.`);
       void queryClient.invalidateQueries();
     },
-    onError: () => {
-      setConfirming(false);
-      // A refusal is exactly what the log is for, so refresh it here too — the
-      // success path is not the only one worth seeing.
-      void queryClient.invalidateQueries({ queryKey: ["audit"] });
-    },
+    onError: () => void queryClient.invalidateQueries({ queryKey: ["audit"] }),
+  });
+
+  const audit = useQuery({
+    queryKey: ["audit"],
+    queryFn: () => api.get<{ entries: AuditEntry[] }>("/audit?limit=8"),
+    refetchInterval: 10000,
   });
 
   if (overview.isError) return <ErrorNote error={overview.error} />;
@@ -100,29 +120,28 @@ export function OrderPadPage() {
   const accounts = overview.data.accounts;
   const chosen = accounts.find((a) => a.account === account);
   const want = needs(orderType, product);
-  const number = (text: string) => (text.trim() === "" ? 0 : Number(text));
+  const quantity = number(qty);
+  const value = quantity > 0 && reference > 0 ? quantity * reference : null;
 
   const problems: string[] = [];
   if (!account) problems.push("choose an account");
-  if (!symbol.trim()) problems.push("enter a symbol");
-  if (!qty.trim() || !Number.isInteger(number(qty)) || number(qty) <= 0)
-    problems.push("quantity must be a whole number above zero");
-  if (want.limit && number(limitPrice) <= 0) problems.push("limit price is required");
-  if (want.stop && number(stopPrice) <= 0) problems.push("trigger price is required");
-  if (want.legs && number(stopLoss) <= 0) problems.push("stop-loss is required");
-  if (want.target && number(takeProfit) <= 0) problems.push("target is required");
-
-  const reference = number(limitPrice) || number(stopPrice);
+  if (!symbol.trim()) problems.push("symbol");
+  if (!Number.isInteger(quantity) || quantity <= 0) problems.push("quantity");
+  if (want.limit && number(limitPrice) <= 0) problems.push("limit price");
+  if (want.stop && number(stopPrice) <= 0) problems.push("trigger price");
+  if (want.legs && number(stopLoss) <= 0) problems.push("stop-loss");
+  if (want.target && number(takeProfit) <= 0) problems.push("target");
   if (want.legs && reference > 0 && number(stopLoss) >= reference)
-    problems.push("stop-loss is in points from the entry, not a price");
+    problems.push("stop-loss must be points, not a price");
   if (want.target && reference > 0 && number(takeProfit) >= reference)
-    problems.push("target is in points from the entry, not a price");
+    problems.push("target must be points, not a price");
+  if (unpriced) problems.push("the broker returned no price for this symbol");
 
   const request: PlaceRequest = {
     account,
     symbol: symbol.trim().toUpperCase(),
     side,
-    qty: number(qty),
+    qty: quantity,
     product_type: product,
     order_type: orderType,
     limit_price: want.limit ? number(limitPrice) : 0,
@@ -131,6 +150,7 @@ export function OrderPadPage() {
     take_profit: want.target ? number(takeProfit) : 0,
   };
 
+  const ready = problems.length === 0 && !place.isPending;
   const tradingOff = chosen && !chosen.allow_trading;
   const error =
     place.error instanceof ApiError ? place.error.message : place.error ? String(place.error) : null;
@@ -139,76 +159,85 @@ export function OrderPadPage() {
     <>
       <PageHeader
         title="Place an order"
-        subtitle="Goes to the account you choose. Nothing is sent until you confirm."
+        subtitle="The button says exactly what will be sent, and sends it."
       />
 
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+      {/* Every account's spendable cash, so choosing one is not a guess. */}
+      <div className="mb-4 flex flex-wrap gap-2">
+        {accounts.map((a) => (
+          <button
+            key={a.account}
+            onClick={() => {
+              setAccount(a.account);
+              setDone(null);
+            }}
+            className="rounded border px-3 py-2 text-left"
+            style={{
+              borderColor: account === a.account ? "var(--accent)" : "var(--border)",
+              borderWidth: account === a.account ? 2 : 1,
+            }}
+          >
+            <div className="text-sm font-medium">
+              {a.account}
+              {!a.allow_trading && (
+                <span className="ml-1.5 text-xs text-[var(--status-warning)]">read-only</span>
+              )}
+            </div>
+            <div className="tnum text-xs text-[var(--ink-secondary)]">
+              <Money>{money(a.funds?.available ?? null)}</Money> free
+            </div>
+          </button>
+        ))}
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
         <Card className="p-5">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="Account" hint="Never remembered between orders — choose it each time.">
-              <select
-                value={account}
-                onChange={(event) => {
-                  setAccount(event.target.value);
+          <div className="grid gap-4 sm:grid-cols-4">
+            <div className="sm:col-span-2">
+              <span className={labelClass}>Symbol</span>
+              <SymbolInput
+                value={symbol}
+                onChange={(next) => {
+                  setSymbol(next);
                   setDone(null);
                 }}
+                known={symbols.data?.symbols ?? []}
                 className={inputClass}
-                style={{ borderColor: account ? "var(--border)" : "var(--status-warning)" }}
-              >
-                <option value="">— choose —</option>
-                {accounts.map((a) => (
-                  <option key={a.account} value={a.account}>
-                    {a.account}
-                  </option>
-                ))}
-              </select>
-            </Field>
-
-            <Field label="Symbol" hint="As the broker writes it, e.g. NSE:RELIANCE-EQ">
-              <input
-                value={symbol}
-                onChange={(event) => setSymbol(event.target.value)}
-                placeholder="NSE:RELIANCE-EQ"
-                className={inputClass}
-                style={{ borderColor: "var(--border)" }}
+                autoFocus
               />
-            </Field>
+            </div>
 
-            <Field label="Side">
-              <div className="mt-1 flex gap-2">
-                {(["BUY", "SELL"] as const).map((option) => (
-                  <button
-                    key={option}
-                    onClick={() => setSide(option)}
-                    className="flex-1 rounded border px-3 py-2 text-sm font-semibold"
-                    style={{
-                      borderColor: side === option ? "transparent" : "var(--border)",
-                      background:
-                        side === option
-                          ? option === "BUY"
-                            ? "var(--gain)"
-                            : "var(--loss)"
-                          : "transparent",
-                      color: side === option ? "#fff" : "var(--ink-secondary)",
-                    }}
-                  >
-                    {option}
-                  </button>
-                ))}
-              </div>
-            </Field>
-
-            <Field label="Quantity">
+            <div>
+              <span className={labelClass}>Quantity</span>
               <input
                 value={qty}
-                onChange={(event) => setQty(event.target.value)}
+                onChange={(event) => {
+                  setQty(event.target.value);
+                  setDone(null);
+                }}
                 inputMode="numeric"
                 className={inputClass}
                 style={{ borderColor: "var(--border)" }}
               />
-            </Field>
+            </div>
 
-            <Field label="Product">
+            <div>
+              <span className={labelClass}>
+                Value {ltp !== null && orderType === "MARKET" && (
+                  <span className="normal-case">at {money(ltp)}</span>
+                )}
+              </span>
+              <div className="tnum mt-1 px-3 py-2 text-sm font-semibold">
+                {value === null ? (
+                  <span className="text-[var(--ink-muted)]">—</span>
+                ) : (
+                  <Money>{money(value)}</Money>
+                )}
+              </div>
+            </div>
+
+            <div>
+              <span className={labelClass}>Product</span>
               <select
                 value={product}
                 onChange={(event) => setProduct(event.target.value)}
@@ -216,14 +245,13 @@ export function OrderPadPage() {
                 style={{ borderColor: "var(--border)" }}
               >
                 {PRODUCTS.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
+                  <option key={p} value={p}>{p}</option>
                 ))}
               </select>
-            </Field>
+            </div>
 
-            <Field label="Order type">
+            <div>
+              <span className={labelClass}>Type</span>
               <select
                 value={orderType}
                 onChange={(event) => setOrderType(event.target.value)}
@@ -231,15 +259,14 @@ export function OrderPadPage() {
                 style={{ borderColor: "var(--border)" }}
               >
                 {TYPES.map((t) => (
-                  <option key={t.value} value={t.value}>
-                    {t.label}
-                  </option>
+                  <option key={t.value} value={t.value}>{t.label}</option>
                 ))}
               </select>
-            </Field>
+            </div>
 
             {want.limit && (
-              <Field label="Limit price">
+              <div>
+                <span className={labelClass}>Limit</span>
                 <input
                   value={limitPrice}
                   onChange={(event) => setLimitPrice(event.target.value)}
@@ -247,11 +274,12 @@ export function OrderPadPage() {
                   className={inputClass}
                   style={{ borderColor: "var(--border)" }}
                 />
-              </Field>
+              </div>
             )}
 
             {want.stop && (
-              <Field label="Trigger price" hint="The order activates here.">
+              <div>
+                <span className={labelClass}>Trigger</span>
                 <input
                   value={stopPrice}
                   onChange={(event) => setStopPrice(event.target.value)}
@@ -259,91 +287,132 @@ export function OrderPadPage() {
                   className={inputClass}
                   style={{ borderColor: "var(--border)" }}
                 />
-              </Field>
+              </div>
             )}
 
             {want.legs && (
-              <Field label="Stop-loss (points)" hint="Distance from the entry, not a price.">
+              <div>
+                <span className={labelClass}>Stop-loss (pts)</span>
                 <input
                   value={stopLoss}
-                  onChange={(event) => setStopLoss(event.target.value)}
+                  onChange={(event) => {
+                    setStopLoss(event.target.value);
+                    setLegsTouched(true);
+                  }}
                   inputMode="decimal"
                   className={inputClass}
                   style={{ borderColor: "var(--border)" }}
                 />
-              </Field>
+              </div>
             )}
 
             {want.target && (
-              <Field label="Target (points)" hint="Distance from the entry, not a price.">
+              <div>
+                <span className={labelClass}>Target (pts)</span>
                 <input
                   value={takeProfit}
-                  onChange={(event) => setTakeProfit(event.target.value)}
+                  onChange={(event) => {
+                    setTakeProfit(event.target.value);
+                    setLegsTouched(true);
+                  }}
                   inputMode="decimal"
                   className={inputClass}
                   style={{ borderColor: "var(--border)" }}
                 />
-              </Field>
+              </div>
             )}
           </div>
 
+          {/* The review, in place. There is no separate confirm step, so this
+              and the button below are what stands between a typo and a trade —
+              which is why the button repeats the account and the whole order. */}
+          <div
+            className="mt-4 rounded px-3 py-2 text-sm"
+            style={{ background: "color-mix(in srgb, var(--ink) 4%, var(--surface))" }}
+          >
+            {problems.length > 0 ? (
+              <span className="text-[var(--ink-muted)]">Needs: {problems.join(", ")}</span>
+            ) : (
+              <span>
+                <strong>{side}</strong> {quantity} <strong>{request.symbol}</strong> ·{" "}
+                {product} {TYPES.find((t) => t.value === orderType)?.label}
+                {want.limit && ` @ ${money(request.limit_price!)}`}
+                {want.stop && ` trigger ${money(request.stop_price!)}`}
+                {want.legs && ` · SL ${request.stop_loss} pts`}
+                {want.target && ` · target ${request.take_profit} pts`}
+                {value !== null && (
+                  <>
+                    {" · "}
+                    <Money>{money(value)}</Money>
+                  </>
+                )}
+              </span>
+            )}
+          </div>
+
+          {unpriced && (
+            <div
+              className="mt-3 rounded border px-3 py-2 text-sm"
+              style={{ borderColor: "var(--status-critical)" }}
+            >
+              No price came back for <strong>{symbol}</strong>. Either the broker does not
+              know that symbol — a completion like <code>NSE:RELIA-EQ</code> looks right and
+              is not — or the quote could not be fetched. Check the symbol before placing.
+            </div>
+          )}
+
           {tradingOff && (
             <div
-              className="mt-4 rounded border px-3 py-2 text-sm"
+              className="mt-3 rounded border px-3 py-2 text-sm"
               style={{ borderColor: "var(--status-warning)" }}
             >
-              <strong>{account}</strong>’s agent is running read-only, so this order would
-              be refused. Enable it deliberately with{" "}
-              <code>ALLOW_TRADING=1 python3 deploy/gen_systemd_units.py</code>.
+              <strong>{account}</strong>’s agent is read-only — this order will be refused.
             </div>
-          )}
-
-          {/* Success first: clearing the form used to invalidate it, so the
-              confirmation appeared underneath a complaint about the very order
-              that had just gone through. */}
-          {done && !error && (
-            <div
-              className="mt-4 rounded border px-3 py-2 text-sm"
-              style={{ borderColor: "var(--status-good)" }}
-            >
-              {done} Edit and review again to place another.
-            </div>
-          )}
-
-          {problems.length > 0 && !done && (
-            <p className="mt-4 text-sm text-[var(--ink-muted)]">
-              Before this can be sent: {problems.join(" · ")}.
-            </p>
           )}
 
           {error && (
             <div
-              className="mt-4 rounded border px-3 py-2 text-sm"
+              className="mt-3 rounded border px-3 py-2 text-sm"
               style={{ borderColor: "var(--status-critical)", color: "var(--status-critical)" }}
             >
               {error}
             </div>
           )}
 
-          <button
-            onClick={() => {
-              setDone(null);
-              setConfirming(true);
-            }}
-            disabled={problems.length > 0}
-            className="mt-4 w-full rounded px-3 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
-            style={{ background: side === "BUY" ? "var(--gain)" : "var(--loss)" }}
-          >
-            Review {side.toLowerCase()} order
-          </button>
+          {done && !error && (
+            <div
+              className="mt-3 rounded border px-3 py-2 text-sm"
+              style={{ borderColor: "var(--status-good)" }}
+            >
+              {done}
+            </div>
+          )}
+
+          <div className="mt-4 grid grid-cols-2 gap-3">
+            {(["BUY", "SELL"] as const).map((option) => (
+              <button
+                key={option}
+                onClick={() => {
+                  setSide(option);
+                  setDone(null);
+                  if (problems.length === 0) place.mutate({ ...request, side: option });
+                }}
+                disabled={!ready}
+                className="rounded px-3 py-3 text-sm font-semibold text-white disabled:opacity-40"
+                style={{ background: option === "BUY" ? "var(--gain)" : "var(--loss)" }}
+              >
+                {place.isPending && side === option
+                  ? "Sending…"
+                  : ready
+                    ? `${option} ${quantity} ${request.symbol}${account ? ` · ${account}` : ""}`
+                    : option}
+              </button>
+            ))}
+          </div>
         </Card>
 
-        <Card className="p-5">
+        <Card className="p-4">
           <h2 className="text-sm font-semibold">Recent actions</h2>
-          <p className="mt-1 text-xs text-[var(--ink-muted)]">
-            Everything placed, changed or cancelled from this dashboard — recorded before
-            it reached the broker.
-          </p>
           <ul className="mt-3 space-y-2 text-xs">
             {(audit.data?.entries ?? []).map((entry) => (
               <li key={entry.id} className="border-b pb-2" style={{ borderColor: "var(--hairline)" }}>
@@ -364,7 +433,9 @@ export function OrderPadPage() {
                 </div>
                 <div className="text-[var(--ink-secondary)]">{entry.summary}</div>
                 {entry.result === "error" && entry.message && (
-                  <div className="text-[var(--status-critical)]">{entry.message.slice(0, 120)}</div>
+                  <div className="text-[var(--status-critical)]">
+                    {entry.message.slice(0, 110)}
+                  </div>
                 )}
               </li>
             ))}
@@ -375,37 +446,12 @@ export function OrderPadPage() {
         </Card>
       </div>
 
-      {confirming && (
-        <Confirm
-          title={`${side} ${request.qty} ${request.symbol}`}
-          account={account}
-          danger={side === "SELL"}
-          busy={place.isPending}
-          confirmLabel={`Place ${side.toLowerCase()} order`}
-          lines={[
-            { label: "Symbol", value: request.symbol },
-            { label: "Side", value: side },
-            { label: "Quantity", value: request.qty },
-            { label: "Product", value: product },
-            { label: "Type", value: TYPES.find((t) => t.value === orderType)?.label },
-            ...(want.limit ? [{ label: "Limit", value: money(request.limit_price!) }] : []),
-            ...(want.stop ? [{ label: "Trigger", value: money(request.stop_price!) }] : []),
-            ...(want.legs
-              ? [{ label: "Stop-loss", value: `${request.stop_loss} pts from entry` }]
-              : []),
-            ...(want.target
-              ? [{ label: "Target", value: `${request.take_profit} pts from entry` }]
-              : []),
-          ]}
-          warning={
-            orderType === "MARKET"
-              ? "A market order fills at whatever price is available, which may be well away from the last traded price."
-              : undefined
-          }
-          onCancel={() => setConfirming(false)}
-          onConfirm={() => place.mutate(request)}
-        />
-      )}
+      <p className="mt-3 text-xs text-[var(--ink-muted)]">
+        BUY and SELL place immediately — there is no second confirmation, so the line above
+        and the button text are the check. Stop-loss and target default to {DEFAULT_PCT}% of
+        the price and are sent as points from the entry; typing over either one stops them
+        following the price.
+      </p>
     </>
   );
 }

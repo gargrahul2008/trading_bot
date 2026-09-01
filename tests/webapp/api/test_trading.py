@@ -268,3 +268,25 @@ def test_an_unreadable_audit_log_does_not_break_the_page(setup, monkeypatch):
     response = client.get("/api/audit")
     assert response.status_code == 200
     assert response.json()["available"] is False
+
+
+def test_a_quote_needs_a_real_account(setup):
+    client, _, _ = setup
+    assert client.get("/api/quote?account=nobody&symbols=NSE:X-EQ").status_code == 404
+
+
+def test_symbols_come_from_what_has_been_traded(setup, monkeypatch):
+    """Suggestions are drawn from the accounts' own history rather than a symbol
+    master: it is the list someone reaches for, and it needs no extra source to
+    stay current."""
+    client, _, path = setup
+    conn = connect(path)
+    from webapp.store.writer import Writer
+    Writer(conn, "rahul").orders([
+        {"order_id": "1", "symbol": "NSE:RELIANCE-EQ", "side": "BUY"},
+        {"order_id": "2", "symbol": "BSE:ARL-B", "side": "SELL"},
+    ])
+    conn.close()
+
+    symbols = client.get("/api/symbols").json()["symbols"]
+    assert "NSE:RELIANCE-EQ" in symbols and "BSE:ARL-B" in symbols
