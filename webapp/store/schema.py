@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS orders (
     run           TEXT,           -- e.g. rahul/reliance
     matched_by    TEXT,           -- order_id | symbol
     placed_at     TEXT,
+    -- The broker's own text on the order. On a reject it is the only thing that
+    -- says why, and common/broker/reject_parser.py turns it into a cause.
+    message       TEXT,
+    channel       TEXT,               -- api | web: how the order was placed
+    order_tag     TEXT,               -- the web control that fired it, e.g. 2:Exit
     trading_day   TEXT NOT NULL,
     first_seen    REAL NOT NULL,
     updated_at    REAL NOT NULL,

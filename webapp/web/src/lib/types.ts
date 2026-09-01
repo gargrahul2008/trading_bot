@@ -242,3 +242,38 @@ export interface RealisedPayload {
   fy_start: string;
   available: boolean;
 }
+
+export interface Order {
+  account: string;
+  order_id: string;
+  symbol: string;
+  side: string;
+  qty: number;
+  filled_qty: number;
+  remaining_qty?: number;
+  limit_price: number;
+  traded_price?: number;
+  product_type: string;
+  status: string;
+  is_open: boolean;
+  /** bot | manual | pending — who placed it. */
+  source: string | null;
+  run: string | null;
+  matched_by: string | null;
+  /** api | web, as the broker stamps it. */
+  channel?: string | null;
+  order_tag?: string | null;
+  placed_at?: string | null;
+  trading_day: string;
+  message?: string | null;
+  /** The reject's cause, from the parser the bots use. */
+  kind?: string | null;
+  reason?: string | null;
+  live: boolean;
+}
+
+export interface OrdersPayload {
+  orders: Order[];
+  accounts: string[];
+  available: boolean;
+}

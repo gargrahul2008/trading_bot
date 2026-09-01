@@ -29,7 +29,7 @@ from app.auth import (
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
-    store_status, store_realised_scrips, store_trades,
+    classify_reject, store_orders, store_realised_scrips, store_status, store_trades,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -288,6 +288,50 @@ def get_trades(account: Optional[str] = None, day: Optional[str] = None,
     # As with positions: an account that has closed nothing still gets a column.
     payload["accounts"] = [account] if account else known_accounts()
     return payload
+
+
+@app.get("/api/orders")
+def get_orders(account: Optional[str] = None, day: Optional[str] = None,
+               limit: int = 500, _: str = Session) -> Dict[str, Any]:
+    """Every order, including cancelled and rejected, with the reject's cause.
+
+    Today comes from the agents so a status change shows within seconds; earlier
+    days come from the store. Where both have an order the live one wins, since
+    the store is only as current as the last poll.
+    """
+    client = AgentClient()
+    names = [account] if account else known_accounts()
+
+    live: Dict[tuple, Dict[str, Any]] = {}
+    if not day:
+        for result in client.fan_out("/orders", names):
+            if not result.ok:
+                continue
+            section = result.data or {}
+            for order in (section.get("data") or []):
+                if not isinstance(order, dict):
+                    continue
+                row = dict(order, account=result.account, live=True)
+                row.update(classify_reject(order.get("message")))
+                live[(result.account, str(order.get("order_id")))] = row
+
+    stored = store_orders(account, day, limit)
+    rows = list(live.values())
+    seen = set(live)
+    for order in stored["orders"]:
+        key = (order["account"], str(order["order_id"]))
+        if key in seen:
+            continue
+        order["live"] = False
+        rows.append(order)
+
+    rows.sort(key=lambda r: (str(r.get("trading_day") or ""), str(r.get("order_id") or "")),
+              reverse=True)
+    return {
+        "orders": rows[:limit],
+        "accounts": names,
+        "available": stored["available"] or bool(live),
+    }
 
 
 @app.get("/api/realised")

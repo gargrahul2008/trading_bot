@@ -176,3 +176,52 @@ def store_realised_scrips(account: Optional[str] = None,
         return {"scrips": [], "totals": {}, "available": False}
     finally:
         reader.conn.close()
+
+
+def classify_reject(message: Optional[str]) -> Dict[str, Any]:
+    """Turn a broker reject message into a cause.
+
+    Reuses the parser the live bots already rely on, so the dashboard names a
+    reject the same way the bot that hit it does — margin shortfall, circuit
+    limit, closing-auction session, disclosed-quantity, TPIN authorisation.
+    Anything it does not recognise stays unclassified rather than being filed
+    under a wrong cause.
+    """
+    if not message:
+        return {"kind": None, "reason": None}
+    try:
+        from common.broker.reject_parser import parse_reject
+
+        action = parse_reject(message)
+        return {"kind": action.kind, "reason": action.reason or message}
+    except Exception:
+        return {"kind": None, "reason": message}
+
+
+def store_orders(account: Optional[str] = None, day: Optional[str] = None,
+                 limit: int = 1000) -> Dict[str, Any]:
+    """Every order the store holds, newest first."""
+    reader = _reader()
+    if reader is None:
+        return {"orders": [], "available": False}
+    try:
+        sql = "SELECT * FROM orders WHERE 1=1"
+        params: List[Any] = []
+        if account:
+            sql += " AND account = ?"
+            params.append(account)
+        if day:
+            sql += " AND trading_day = ?"
+            params.append(day)
+        sql += " ORDER BY trading_day DESC, order_id DESC LIMIT ?"
+        params.append(limit)
+        rows = [dict(r) for r in reader.conn.execute(sql, params)]
+        for row in rows:
+            row.pop("raw", None)
+            row.update(classify_reject(row.get("message")))
+        return {"orders": rows, "available": True}
+    except Exception as exc:
+        LOG.warning("order read failed: %s", exc)
+        return {"orders": [], "available": False}
+    finally:
+        reader.conn.close()

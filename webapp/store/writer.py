@@ -150,9 +150,9 @@ class Writer:
             self.conn.executemany(
                 "INSERT INTO orders (account, order_id, symbol, side, qty, filled_qty,"
                 " limit_price, stop_price, traded_price, product_type, kind, status,"
-                " status_code, is_open, source, run, matched_by, placed_at, trading_day,"
-                " first_seen, updated_at, raw)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " status_code, is_open, source, run, matched_by, placed_at, message,"
+                " channel, order_tag, trading_day, first_seen, updated_at, raw)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(account, order_id) DO UPDATE SET"
                 "   filled_qty = excluded.filled_qty,"
                 "   traded_price = excluded.traded_price,"
@@ -166,6 +166,9 @@ class Writer:
                 "   source = COALESCE(excluded.source, orders.source),"
                 "   run = COALESCE(excluded.run, orders.run),"
                 "   matched_by = COALESCE(excluded.matched_by, orders.matched_by),"
+                "   message = COALESCE(excluded.message, orders.message),"
+                "   channel = COALESCE(excluded.channel, orders.channel),"
+                "   order_tag = COALESCE(excluded.order_tag, orders.order_tag),"
                 "   updated_at = excluded.updated_at,"
                 "   raw = excluded.raw"
                 " WHERE excluded.updated_at >= orders.updated_at",
@@ -178,7 +181,9 @@ class Writer:
                         r.get("product_type", ""), r.get("kind", ""), r.get("status", ""),
                         r.get("status_code"), 1 if r.get("is_open") else 0,
                         r.get("source"), r.get("run"), r.get("matched_by"),
-                        r.get("placed_at"), day_of(r, day), now, now, _compact(r),
+                        r.get("placed_at"), r.get("message") or None,
+                        r.get("channel") or None, r.get("order_tag") or None,
+                        day_of(r, day), now, now, _compact(r),
                     )
                     for r in rows
                 ],

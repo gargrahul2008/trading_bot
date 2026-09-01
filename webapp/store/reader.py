@@ -152,6 +152,9 @@ class Reader:
             "run": row["run"],
             "matched_by": row["matched_by"],
             "placed_at": row["placed_at"],
+            "message": row["message"],
+            "channel": row["channel"],
+            "order_tag": row["order_tag"],
             "_updated_at": row["updated_at"],
         }
 
