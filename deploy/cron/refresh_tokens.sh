@@ -45,6 +45,13 @@ if [ "$count" -eq 0 ]; then
   exit 1
 fi
 
+# The exchanges' instrument list: public CSVs, no account, no proxy, so this
+# spends none of the accounts' rate budget. Instruments are added, renamed and
+# moved between series constantly, and the order pad treats "not in this list"
+# as "does not exist".
+echo "$(date -u +%FT%TZ) refreshing the instrument list"
+"$PY" scripts/fetch_symbols.py || echo "$(date -u +%FT%TZ) instrument refresh FAILED"
+
 echo "$(date -u +%FT%TZ) syncing FyersFire auth"
 "$PY" scripts/sync_fyersfire_auth.py
 

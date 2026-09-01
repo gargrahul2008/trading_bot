@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -203,6 +203,26 @@ CREATE TABLE IF NOT EXISTS history_progress (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (account, kind)
 );
+
+-- The exchanges' own instrument list, refreshed daily.
+--
+-- Two things it settles that nothing else can. A symbol typed by hand is either
+-- in here or it does not exist — a completion like NSE:RELIA-EQ looks right and
+-- is not. And tick size is per instrument, not per account: 20MICRONS trades in
+-- paise while 360ONE trades in ten-paise steps, so a price the exchange will
+-- not accept is otherwise only discovered as a reject.
+CREATE TABLE IF NOT EXISTS symbols (
+    symbol      TEXT PRIMARY KEY,       -- NSE:RELIANCE-EQ
+    name        TEXT NOT NULL DEFAULT '',
+    short_name  TEXT NOT NULL DEFAULT '',
+    exchange    TEXT NOT NULL DEFAULT '',
+    segment     TEXT NOT NULL DEFAULT '',
+    tick_size   REAL NOT NULL DEFAULT 0.05,
+    lot_size    REAL NOT NULL DEFAULT 1,
+    isin        TEXT,
+    updated_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_symbols_short ON symbols (short_name);
 
 -- Every order action taken through the dashboard.
 --

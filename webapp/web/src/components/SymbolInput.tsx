@@ -1,49 +1,62 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
-/** Symbol entry that completes rather than demands exactness.
+import { api } from "../lib/api";
+
+export interface SymbolMatch {
+  symbol: string;
+  name: string;
+  short_name: string;
+  tick_size: number;
+  lot_size: number;
+  exchange: string;
+}
+
+/** Symbol entry backed by the exchanges' own instrument list.
  *
- *  Typing "relia" offers NSE:RELIANCE-EQ. Typing a bare name with no exchange
- *  offers the NSE and BSE equity forms, because that is what the prefix and
- *  suffix would have been anyway — the broker's format is not worth retyping.
- *
- *  Free text still works: a symbol the dashboard has never seen is exactly the
- *  case a fixed list would block.
+ *  Searched on the server — 22,000 instruments is not a list to ship to a
+ *  browser — and only once something has been typed. A dropdown that opens on
+ *  focus with arbitrary suggestions is noise: nobody wants the first eight
+ *  symbols alphabetically.
  */
 export function SymbolInput({
   value,
   onChange,
-  known,
+  onPick,
   className,
   autoFocus,
 }: {
   value: string;
   onChange: (symbol: string) => void;
-  known: string[];
+  onPick?: (match: SymbolMatch) => void;
   className?: string;
   autoFocus?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
+  const [typed, setTyped] = useState("");
   const blurTimer = useRef<number>();
 
-  const suggestions = useMemo(() => {
-    const text = value.trim().toUpperCase();
-    if (!text) return known.slice(0, 8);
+  // Debounced, so a query goes out per pause rather than per keystroke.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setTyped(value.trim()), 140);
+    return () => window.clearTimeout(timer);
+  }, [value]);
 
-    const matches = known.filter((s) => s.includes(text));
-    // A bare name is far more likely to be an equity than anything else, so
-    // offer the two forms it would take rather than nothing at all.
-    if (!text.includes(":") && matches.length < 8) {
-      const bare = text.replace(/[^A-Z0-9&-]/g, "");
-      for (const guess of [`NSE:${bare}-EQ`, `BSE:${bare}-EQ`]) {
-        if (bare && !matches.includes(guess)) matches.push(guess);
-      }
-    }
-    return matches.slice(0, 8);
-  }, [value, known]);
+  const { data } = useQuery({
+    queryKey: ["symbol-search", typed],
+    queryFn: () =>
+      api.get<{ matches: SymbolMatch[] }>(`/symbols?q=${encodeURIComponent(typed)}`),
+    // Nothing typed, nothing suggested.
+    enabled: typed.length >= 1,
+    staleTime: 60_000,
+  });
 
-  function choose(symbol: string) {
-    onChange(symbol);
+  const matches = typed.length >= 1 ? (data?.matches ?? []) : [];
+
+  function choose(match: SymbolMatch) {
+    onChange(match.symbol);
+    onPick?.(match);
     setOpen(false);
   }
 
@@ -59,21 +72,20 @@ export function SymbolInput({
         }}
         onFocus={() => setOpen(true)}
         onBlur={() => {
-          // Let a click on a suggestion land before the list closes.
           blurTimer.current = window.setTimeout(() => setOpen(false), 150);
         }}
         onKeyDown={(event) => {
-          if (!open || !suggestions.length) return;
+          if (!open || !matches.length) return;
           if (event.key === "ArrowDown") {
             event.preventDefault();
-            setActive((i) => Math.min(i + 1, suggestions.length - 1));
+            setActive((i) => Math.min(i + 1, matches.length - 1));
           } else if (event.key === "ArrowUp") {
             event.preventDefault();
             setActive((i) => Math.max(i - 1, 0));
           } else if (event.key === "Enter" || event.key === "Tab") {
-            if (suggestions[active]) {
+            if (matches[active]) {
               event.preventDefault();
-              choose(suggestions[active]);
+              choose(matches[active]);
             }
           } else if (event.key === "Escape") {
             setOpen(false);
@@ -84,27 +96,31 @@ export function SymbolInput({
         style={{ borderColor: "var(--border)" }}
       />
 
-      {open && suggestions.length > 0 && (
+      {open && matches.length > 0 && (
         <ul
-          className="absolute z-30 mt-1 w-full overflow-hidden rounded border shadow-lg"
+          className="absolute z-30 mt-1 max-h-72 w-full overflow-auto rounded border shadow-lg"
           style={{ background: "var(--surface)", borderColor: "var(--border)" }}
         >
-          {suggestions.map((symbol, index) => (
-            <li key={symbol}>
+          {matches.map((match, index) => (
+            <li key={match.symbol}>
               <button
                 onMouseDown={() => {
                   window.clearTimeout(blurTimer.current);
-                  choose(symbol);
+                  choose(match);
                 }}
                 onMouseEnter={() => setActive(index)}
-                className={`block w-full px-3 py-1.5 text-left text-sm ${
+                className={`block w-full px-3 py-1.5 text-left ${
                   index === active ? "bg-black/5 dark:bg-white/10" : ""
                 }`}
               >
-                {symbol}
-                {!known.includes(symbol) && (
-                  <span className="ml-2 text-xs text-[var(--ink-muted)]">new</span>
-                )}
+                <div className="flex items-baseline justify-between gap-3">
+                  <span className="text-sm font-medium">{match.symbol}</span>
+                  <span className="text-[10px] text-[var(--ink-muted)]">
+                    tick {match.tick_size}
+                    {match.lot_size > 1 && ` · lot ${match.lot_size}`}
+                  </span>
+                </div>
+                <div className="truncate text-xs text-[var(--ink-muted)]">{match.name}</div>
               </button>
             </li>
           ))}

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card, ErrorNote, Loading, PageHeader } from "../components/ui";
 import { SymbolInput } from "../components/SymbolInput";
+import type { SymbolMatch } from "../components/SymbolInput";
 import { api, ApiError } from "../lib/api";
 import { money } from "../lib/format";
 import { Money } from "../lib/privacy";
@@ -31,6 +32,28 @@ function needs(orderType: string, product: string) {
 }
 
 const inputClass = "mt-1 w-full rounded border bg-transparent px-3 py-2 text-sm tnum";
+
+/** Round to the instrument's tick.
+ *
+ *  Tick size is per instrument, not per exchange: 20MICRONS trades in paise and
+ *  RELIANCE in ten-paise steps. A price off the tick is rejected by the
+ *  exchange, so this is the difference between an order working and an order
+ *  bouncing.
+ */
+function toTick(price: number, tick: number): number {
+  if (!(tick > 0)) return price;
+  const steps = Math.round(price / tick);
+  // Back through a fixed number of decimals, or 0.1 * 3 reappears as
+  // 0.30000000000000004 and the exchange sees an off-tick price.
+  const decimals = (String(tick).split(".")[1] ?? "").length;
+  return Number((steps * tick).toFixed(decimals));
+}
+
+/** What a points figure is as a percentage of the price it applies to. */
+function asPercent(points: number, reference: number): string | null {
+  if (!(points > 0) || !(reference > 0)) return null;
+  return ((points / reference) * 100).toFixed(2) + "%";
+}
 const labelClass =
   "text-xs font-medium uppercase tracking-wide text-[var(--ink-muted)]";
 
@@ -47,6 +70,8 @@ export function OrderPadPage() {
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
   const [legsTouched, setLegsTouched] = useState(false);
+  // The instrument itself, once picked: its tick is what prices must land on.
+  const [instrument, setInstrument] = useState<SymbolMatch | null>(null);
   const [done, setDone] = useState<string | null>(null);
 
   const overview = useQuery({
@@ -54,12 +79,6 @@ export function OrderPadPage() {
     queryFn: () => api.get<Overview>("/overview"),
     refetchInterval: 15000,
   });
-  const symbols = useQuery({
-    queryKey: ["symbols"],
-    queryFn: () => api.get<{ symbols: string[] }>("/symbols"),
-    staleTime: 5 * 60_000,
-  });
-
   // A quote costs a broker call, so it is fetched when the symbol settles
   // rather than on every keystroke.
   const settled = symbol.includes(":") && symbol.length > 6;
@@ -91,13 +110,15 @@ export function OrderPadPage() {
 
   // Fill the legs from the price once it is known, and leave them alone the
   // moment they are typed over.
+  const tick = instrument?.tick_size ?? 0;
   useEffect(() => {
     if (!legsTouched && reference > 0) {
-      const points = ((reference * DEFAULT_PCT) / 100).toFixed(2);
+      // The legs are distances, and the exchange wants them on the tick too.
+      const points = String(toTick((reference * DEFAULT_PCT) / 100, tick || 0.05));
       setStopLoss(points);
       setTakeProfit(points);
     }
-  }, [reference, legsTouched]);
+  }, [reference, legsTouched, tick]);
 
   const place = useMutation({
     mutationFn: (request: PlaceRequest) => api.post("/orders", request),
@@ -144,10 +165,10 @@ export function OrderPadPage() {
     qty: quantity,
     product_type: product,
     order_type: orderType,
-    limit_price: want.limit ? number(limitPrice) : 0,
-    stop_price: want.stop ? number(stopPrice) : 0,
-    stop_loss: want.legs ? number(stopLoss) : 0,
-    take_profit: want.target ? number(takeProfit) : 0,
+    limit_price: want.limit ? toTick(number(limitPrice), tick) : 0,
+    stop_price: want.stop ? toTick(number(stopPrice), tick) : 0,
+    stop_loss: want.legs ? toTick(number(stopLoss), tick) : 0,
+    take_profit: want.target ? toTick(number(takeProfit), tick) : 0,
   };
 
   const ready = problems.length === 0 && !place.isPending;
@@ -200,8 +221,12 @@ export function OrderPadPage() {
                 onChange={(next) => {
                   setSymbol(next);
                   setDone(null);
+                  if (next !== instrument?.symbol) setInstrument(null);
                 }}
-                known={symbols.data?.symbols ?? []}
+                onPick={(match) => {
+                  setInstrument(match);
+                  setDone(null);
+                }}
                 className={inputClass}
                 autoFocus
               />
@@ -292,7 +317,12 @@ export function OrderPadPage() {
 
             {want.legs && (
               <div>
-                <span className={labelClass}>Stop-loss (pts)</span>
+                <span className={labelClass}>
+                  Stop-loss (pts){" "}
+                  <span className="normal-case text-[var(--ink-secondary)]">
+                    {asPercent(number(stopLoss), reference) ?? ""}
+                  </span>
+                </span>
                 <input
                   value={stopLoss}
                   onChange={(event) => {
@@ -308,7 +338,12 @@ export function OrderPadPage() {
 
             {want.target && (
               <div>
-                <span className={labelClass}>Target (pts)</span>
+                <span className={labelClass}>
+                  Target (pts){" "}
+                  <span className="normal-case text-[var(--ink-secondary)]">
+                    {asPercent(number(takeProfit), reference) ?? ""}
+                  </span>
+                </span>
                 <input
                   value={takeProfit}
                   onChange={(event) => {

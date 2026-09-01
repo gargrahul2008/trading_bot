@@ -22,6 +22,7 @@ try:
     from webapp.history.importer import realised_total
     from webapp.pnl import charges as charges_mod
     from webapp.pnl import portfolio as portfolio_mod
+    from webapp.history import symbols as symbols_mod
     from webapp.pnl.realised import by_scrip as realised_by_scrip
     from webapp.pnl.service import matches as matched_trades
     from webapp.store.reader import Reader
@@ -33,6 +34,7 @@ except Exception as exc:  # pragma: no cover - only if the tree is broken
     charges_mod = None  # type: ignore
     matched_trades = None  # type: ignore
     realised_by_scrip = None  # type: ignore
+    symbols_mod = None  # type: ignore
     LOG.warning("store unavailable: %s", exc)
 
 
@@ -223,6 +225,37 @@ def store_orders(account: Optional[str] = None, day: Optional[str] = None,
     except Exception as exc:
         LOG.warning("order read failed: %s", exc)
         return {"orders": [], "available": False}
+    finally:
+        reader.conn.close()
+
+
+def search_symbols(query: str, limit: int = 12) -> Dict[str, Any]:
+    """Instruments matching a fragment, from the exchanges' own list."""
+    reader = _reader()
+    if reader is None or symbols_mod is None:
+        return {"matches": [], "available": False}
+    try:
+        return {
+            "matches": symbols_mod.search(reader.conn, query, limit),
+            "available": symbols_mod.counts(reader.conn)["symbols"] > 0,
+        }
+    except Exception as exc:
+        LOG.warning("symbol search failed: %s", exc)
+        return {"matches": [], "available": False}
+    finally:
+        reader.conn.close()
+
+
+def lookup_symbol(symbol: str) -> Optional[Dict[str, Any]]:
+    """One instrument, with its tick and lot size. None means the exchanges do
+    not list it — which for the order pad means it cannot be traded."""
+    reader = _reader()
+    if reader is None or symbols_mod is None:
+        return None
+    try:
+        return symbols_mod.lookup(reader.conn, symbol)
+    except Exception:
+        return None
     finally:
         reader.conn.close()
 

@@ -31,8 +31,8 @@ from app.auth import (
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
-    classify_reject, store_orders, store_realised_scrips, store_status, store_symbols,
-    store_trades,
+    classify_reject, lookup_symbol, search_symbols, store_orders,
+    store_realised_scrips, store_status, store_symbols, store_trades,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -419,22 +419,28 @@ def exit_position(position_id: str, body: AccountBody, _: str = Session) -> Dict
 
 
 @app.get("/api/symbols")
-def get_symbols(_: str = Session) -> Dict[str, Any]:
-    """Symbols seen in any account, plus whatever is open right now.
+def get_symbols(q: str = "", limit: int = 12, _: str = Session) -> Dict[str, Any]:
+    """Instruments matching a fragment, from the exchanges' own daily list.
 
-    The live half matters: a position opened this morning should be suggestable
-    before it has been through the store.
+    Searched on the server: 22,000 instruments is not a list to ship to a
+    browser, and the ranking that puts NSE:RELIANCE-EQ above BSE:RELICAB-B
+    belongs next to the data.
     """
-    symbols = set(store_symbols())
-    for result in AgentClient().fan_out("/book", known_accounts()):
-        if not result.ok:
-            continue
-        for kind in ("positions", "holdings"):
-            section = ((result.data or {}).get("sections") or {}).get(kind) or {}
-            for row in (section.get("data") or []):
-                if isinstance(row, dict) and row.get("symbol"):
-                    symbols.add(row["symbol"])
-    return {"symbols": sorted(symbols)}
+    return search_symbols(q, limit)
+
+
+@app.get("/api/symbols/{symbol:path}")
+def get_symbol(symbol: str, _: str = Session) -> Dict[str, Any]:
+    """One instrument, with its tick and lot size.
+
+    404 means the exchanges do not list it. For the order pad that is the answer
+    to "is this real?", which a one-click pad needs before it will send.
+    """
+    found = lookup_symbol(symbol)
+    if found is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND,
+                            "%s is not in the exchanges' instrument list" % symbol)
+    return found
 
 
 @app.get("/api/quote")
