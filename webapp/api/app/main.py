@@ -89,20 +89,34 @@ class AccountBody(BaseModel):
     account: str
 
 
+_audit_ready = False
+
+
 def _audit_conn():
     """A writable store handle for the audit log, or None.
 
-    Never blocks an action: refusing to trade because a log is unavailable is
-    the wrong trade-off on a live account.
+    Migrates on first use. The agents normally create and migrate the store, but
+    relying on that means an API started before any agent has written finds no
+    audit table — and, because audit failures are swallowed so they cannot block
+    a trade, that silence is invisible. It happened: the first order placed
+    through the pad went to the broker and was never logged.
+
+    Still never blocks an action: refusing to trade because a log is unavailable
+    is the wrong trade-off on a live account.
     """
+    global _audit_ready
     try:
         import sys
 
         if str(REPO) not in sys.path:
             sys.path.insert(0, str(REPO))
-        from webapp.store.schema import connect as store_connect
+        from webapp.store.schema import connect as store_connect, migrate as store_migrate
 
-        return store_connect()
+        conn = store_connect()
+        if not _audit_ready:
+            store_migrate(conn)
+            _audit_ready = True
+        return conn
     except Exception as exc:
         LOG.warning("audit store unavailable: %s", exc)
         return None
@@ -411,6 +425,11 @@ def get_audit(limit: int = 50, _: str = Session) -> Dict[str, Any]:
         return {"entries": [], "available": False}
     try:
         return {"entries": trading.recent(conn, limit), "available": True}
+    except Exception as exc:
+        # An unreadable log is worth reporting, not worth a 500 on a page that
+        # also shows live account figures.
+        LOG.warning("audit read failed: %s", exc)
+        return {"entries": [], "available": False, "error": str(exc)}
     finally:
         conn.close()
 

@@ -220,3 +220,51 @@ def test_a_malformed_order_never_reaches_the_agent(setup):
     client, agent, _ = setup
     assert client.post("/api/orders", json={"account": "rahul"}).status_code == 422
     assert agent.calls == []
+
+
+def test_the_audit_table_is_created_if_the_agents_have_not_yet(tmp_path, monkeypatch):
+    """The agents normally create and migrate the store. An API started before
+    any agent has written found no audit table — and because audit failures are
+    swallowed so they cannot block a trade, that silence was invisible. The
+    first order placed through the pad reached the broker and was never logged.
+    """
+    from fastapi.testclient import TestClient
+
+    from app import auth as auth_mod
+    from app import main as main_mod
+    from app import store as store_mod
+
+    empty = str(tmp_path / "never-migrated.db")
+    monkeypatch.setenv("DASHBOARD_DB", empty)
+    monkeypatch.setattr(store_mod, "REPO", REPO)
+    monkeypatch.setattr(main_mod, "REPO", REPO)
+    monkeypatch.setattr(main_mod, "_audit_ready", False)
+
+    agent = RecordingAgent()
+    wire(monkeypatch, {"rahul": agent.start()})
+    stored = auth_mod.hash_password("pw")
+    monkeypatch.setattr(auth_mod, "password_hash", lambda: stored)
+    monkeypatch.setattr(auth_mod, "cookie_secure", lambda: False)
+
+    from app.main import app
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"password": "pw"})
+    try:
+        assert client.post("/api/orders", json=ORDER).status_code == 200
+        assert len(audit_rows(empty)) == 1, "the order was logged"
+        assert client.get("/api/audit").json()["entries"][0]["action"] == "place"
+    finally:
+        agent.stop()
+
+
+def test_an_unreadable_audit_log_does_not_break_the_page(setup, monkeypatch):
+    """It shares a page with live account figures; a broken log should not take
+    those down with it."""
+    client, _, path = setup
+    from app import trading as trading_mod
+    monkeypatch.setattr(trading_mod, "recent",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("corrupt")))
+
+    response = client.get("/api/audit")
+    assert response.status_code == 200
+    assert response.json()["available"] is False

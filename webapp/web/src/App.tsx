@@ -7,6 +7,7 @@ import { api, ApiError } from "./lib/api";
 import { LoginPage } from "./pages/LoginPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { PortfolioPage } from "./pages/PortfolioPage";
+import { OrderPadPage } from "./pages/OrderPadPage";
 import { OrdersPage } from "./pages/OrdersPage";
 import { PositionsPage } from "./pages/PositionsPage";
 import { TradesPage } from "./pages/TradesPage";
@@ -51,6 +52,7 @@ export function App() {
         <Route path="/positions" element={<PositionsPage />} />
         <Route path="/trades" element={<TradesPage />} />
         <Route path="/orders" element={<OrdersPage />} />
+        <Route path="/place" element={<OrderPadPage />} />
         <Route path="/overview" element={<OverviewPage />} />
         <Route path="*" element={<Navigate to="/portfolio" replace />} />
       </Route>

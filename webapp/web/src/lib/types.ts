@@ -277,3 +277,27 @@ export interface OrdersPayload {
   accounts: string[];
   available: boolean;
 }
+
+export interface PlaceRequest {
+  account: string;
+  symbol: string;
+  side: "BUY" | "SELL";
+  qty: number;
+  product_type: string;
+  order_type: string;
+  limit_price?: number;
+  stop_price?: number;
+  stop_loss?: number;
+  take_profit?: number;
+  validity?: string;
+}
+
+export interface AuditEntry {
+  id: number;
+  at: number;
+  action: string;
+  account: string;
+  summary: string;
+  result: string;
+  message: string | null;
+}
