@@ -275,18 +275,33 @@ def test_a_quote_needs_a_real_account(setup):
     assert client.get("/api/quote?account=nobody&symbols=NSE:X-EQ").status_code == 404
 
 
-def test_symbols_come_from_what_has_been_traded(setup, monkeypatch):
-    """Suggestions are drawn from the accounts' own history rather than a symbol
-    master: it is the list someone reaches for, and it needs no extra source to
-    stay current."""
+def test_symbols_are_searched_in_the_exchanges_list(setup):
+    """Suggestions come from the instrument master, so a symbol is either real
+    or absent — which is what a one-click pad needs before it will send."""
     client, _, path = setup
     conn = connect(path)
-    from webapp.store.writer import Writer
-    Writer(conn, "rahul").orders([
-        {"order_id": "1", "symbol": "NSE:RELIANCE-EQ", "side": "BUY"},
-        {"order_id": "2", "symbol": "BSE:ARL-B", "side": "SELL"},
-    ])
+    from webapp.history.symbols import parse, store as store_symbols
+    store_symbols(conn, parse(
+        "1,RELIANCE INDUSTRIES LTD,0,1,0.1,INE002A01018,x,2026-08-31,,NSE:RELIANCE-EQ,"
+        "10,10,2885,RELIANCE,2885,-1.0,XX,1,None,1,3.2\n", "NSE", "CASH"))
     conn.close()
 
-    symbols = client.get("/api/symbols").json()["symbols"]
-    assert "NSE:RELIANCE-EQ" in symbols and "BSE:ARL-B" in symbols
+    matches = client.get("/api/symbols?q=reli").json()["matches"]
+    assert matches[0]["symbol"] == "NSE:RELIANCE-EQ"
+    assert matches[0]["tick_size"] == 0.1
+
+
+def test_nothing_typed_returns_nothing(setup):
+    assert client_matches(setup, "") == []
+
+
+def client_matches(setup, query):
+    client, _, _ = setup
+    return client.get("/api/symbols?q=%s" % query).json()["matches"]
+
+
+def test_an_unlisted_symbol_is_a_404(setup):
+    """This is how the pad answers 'is this real?'. NSE:RELIA-EQ looks right
+    and does not exist."""
+    client, _, _ = setup
+    assert client.get("/api/symbols/NSE:RELIA-EQ").status_code == 404
