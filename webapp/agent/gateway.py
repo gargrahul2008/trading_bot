@@ -65,6 +65,9 @@ POSITIONAL_PRODUCTS = ("CNC", "MARGIN", "MTF")
 SEGMENT_CASH = 10
 SEGMENT_DERIVATIVES = 11
 
+ORDER_TYPES = ("MARKET", "LIMIT", "SL", "SL_M")
+PRODUCT_TYPES = ("CNC", "INTRADAY", "MARGIN", "MTF", "BO", "CO")
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     try:
@@ -322,9 +325,13 @@ class FyersGateway:
 
 
 def build_order_request(payload: Dict[str, Any]) -> PlaceOrderRequest:
-    """Turn a validated JSON body into a broker request. Raises ValueError on
-    anything the broker would reject, so a bad request fails here rather than at
-    Fyers with an opaque code."""
+    """Turn a validated JSON body into a broker request.
+
+    Raises ValueError on anything the broker would reject, so a bad request
+    fails here with a sentence rather than at Fyers with a code — and, more to
+    the point, so an order that is missing the price it needs never reaches the
+    market at all.
+    """
     symbol = str(payload.get("symbol") or "").strip()
     if not symbol:
         raise ValueError("symbol is required")
@@ -337,15 +344,55 @@ def build_order_request(payload: Dict[str, Any]) -> PlaceOrderRequest:
     if qty <= 0 or qty != qty.to_integral_value():
         raise ValueError("qty must be a positive whole number")
 
-    order_type = str(payload.get("order_type") or "LIMIT").upper()
-    if order_type not in ("MARKET", "LIMIT"):
-        raise ValueError("order_type must be MARKET or LIMIT")
-
-    limit_price = to_decimal(payload.get("limit_price"))
-    if order_type == "LIMIT" and limit_price <= 0:
-        raise ValueError("limit_price is required for a LIMIT order")
+    order_type = str(payload.get("order_type") or "LIMIT").upper().replace("-", "_")
+    if order_type not in ORDER_TYPES:
+        raise ValueError("order_type must be one of %s" % ", ".join(sorted(ORDER_TYPES)))
 
     product_type = str(payload.get("product_type") or "CNC").upper()
+    if product_type not in PRODUCT_TYPES:
+        raise ValueError("product_type must be one of %s" % ", ".join(sorted(PRODUCT_TYPES)))
+
+    limit_price = to_decimal(payload.get("limit_price"))
+    stop_price = to_decimal(payload.get("stop_price"))
+    stop_loss = to_decimal(payload.get("stop_loss"))
+    take_profit = to_decimal(payload.get("take_profit"))
+
+    # Each type needs its own prices. A limit order with no limit would fill at
+    # market, and a stop with no trigger would fire immediately — both are ways
+    # to place an order nobody asked for.
+    if order_type in ("LIMIT", "SL") and limit_price <= 0:
+        raise ValueError("limit_price is required for a %s order" % order_type)
+    if order_type in ("SL", "SL_M") and stop_price <= 0:
+        raise ValueError("stop_price is required for a %s order" % order_type)
+    if order_type == "MARKET" and limit_price > 0:
+        raise ValueError("a MARKET order takes no limit_price")
+
+    # Bracket and cover orders carry their exit with them, and the broker
+    # rejects them without it.
+    if product_type == "BO" and (stop_loss <= 0 or take_profit <= 0):
+        raise ValueError("a BO order needs both stop_loss and take_profit, in points")
+    if product_type == "CO" and stop_loss <= 0:
+        raise ValueError("a CO order needs stop_loss, in points")
+    if product_type not in ("BO", "CO") and (stop_loss > 0 or take_profit > 0):
+        raise ValueError(
+            "stop_loss and take_profit apply to BO and CO orders only — "
+            "on a %s order they would be silently ignored" % product_type
+        )
+
+    # These are distances from the entry, not prices. Someone typing 1465 into
+    # a stop-loss box meaning "stop at 1465" would place a stop 1,465 points
+    # away, which is no stop at all.
+    reference = limit_price if limit_price > 0 else stop_price
+    for name, value in (("stop_loss", stop_loss), ("take_profit", take_profit)):
+        if value > 0 and reference > 0 and value >= reference:
+            raise ValueError(
+                "%s is %s, which is not less than the order price %s — these are "
+                "POINTS away from the entry, not a price" % (name, value, reference)
+            )
+
+    validity = str(payload.get("validity") or "DAY").upper()
+    if validity not in ("DAY", "IOC"):
+        raise ValueError("validity must be DAY or IOC")
 
     return PlaceOrderRequest(
         symbol=symbol,
@@ -354,7 +401,10 @@ def build_order_request(payload: Dict[str, Any]) -> PlaceOrderRequest:
         product_type=product_type,
         order_type=order_type,
         limit_price=limit_price,
-        validity=str(payload.get("validity") or "DAY").upper(),
+        stop_price=stop_price,
+        stop_loss=stop_loss,
+        take_profit=take_profit,
+        validity=validity,
         disclosed_qty=int(payload.get("disclosed_qty") or 0),
         offline_order=bool(payload.get("offline_order") or False),
     )

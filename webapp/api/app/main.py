@@ -6,6 +6,7 @@ brokers are reached that way).
 """
 from __future__ import annotations
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -17,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app import overview as overview_mod
+from app import trading
 from app.agents import AgentClient
 from app.auth import (
     Session,
@@ -57,6 +59,82 @@ if settings.cors_origins:
 
 class LoginBody(BaseModel):
     password: str
+
+
+class PlaceBody(BaseModel):
+    account: str
+    symbol: str
+    side: str
+    qty: int
+    product_type: str = "CNC"
+    order_type: str = "LIMIT"
+    limit_price: float = 0
+    stop_price: float = 0
+    stop_loss: float = 0
+    take_profit: float = 0
+    validity: str = "DAY"
+    disclosed_qty: int = 0
+    offline_order: bool = False
+
+
+class ModifyBody(BaseModel):
+    account: str
+    qty: Optional[int] = None
+    limit_price: Optional[float] = None
+    stop_price: Optional[float] = None
+    order_type: Optional[str] = None
+
+
+class AccountBody(BaseModel):
+    account: str
+
+
+def _audit_conn():
+    """A writable store handle for the audit log, or None.
+
+    Never blocks an action: refusing to trade because a log is unavailable is
+    the wrong trade-off on a live account.
+    """
+    try:
+        import sys
+
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        from webapp.store.schema import connect as store_connect
+
+        return store_connect()
+    except Exception as exc:
+        LOG.warning("audit store unavailable: %s", exc)
+        return None
+
+
+def _act(action: str, account: str, path: str, method: str,
+         payload: Dict[str, Any], body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Run one order action against one account's agent, audited either way."""
+    if account not in agent_ports():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account: %s" % account)
+
+    conn = _audit_conn()
+    audit_id = trading.begin(conn, action, account, payload) if conn else None
+    try:
+        result = AgentClient().call(account, path, method=method, body=body)
+    except Exception as exc:
+        if conn:
+            trading.finish(conn, audit_id, False, str(exc))
+            conn.close()
+        raise
+
+    if not result.ok:
+        if conn:
+            trading.finish(conn, audit_id, False, result.error or "agent error")
+            conn.close()
+        # 502, not 500: this API is fine, the broker or the agent refused.
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, result.error or "agent error")
+
+    if conn:
+        trading.finish(conn, audit_id, True, json.dumps(result.data, default=str)[:500])
+        conn.close()
+    return {"ok": True, "account": account, "result": result.data}
 
 
 @app.post("/api/auth/login")
@@ -288,6 +366,53 @@ def get_trades(account: Optional[str] = None, day: Optional[str] = None,
     # As with positions: an account that has closed nothing still gets a column.
     payload["accounts"] = [account] if account else known_accounts()
     return payload
+
+
+@app.post("/api/orders")
+def place_order(body: PlaceBody, _: str = Session) -> Dict[str, Any]:
+    """Place an order in one named account.
+
+    The account is part of the request and is never defaulted — six accounts on
+    one screen is the point of this dashboard, and also exactly how an order
+    ends up in the wrong one. The agent refuses unless it was started with
+    --allow-trading, so this cannot reach a broker the host did not deliberately
+    enable.
+    """
+    payload = body.model_dump()
+    account = payload.pop("account")
+    return _act(trading.PLACE, account, "/orders", "POST", payload, payload)
+
+
+@app.patch("/api/orders/{order_id}")
+def modify_order(order_id: str, body: ModifyBody, _: str = Session) -> Dict[str, Any]:
+    payload = {k: v for k, v in body.model_dump().items() if v is not None}
+    account = payload.pop("account")
+    return _act(trading.MODIFY, account, "/orders/%s" % order_id, "PATCH",
+                dict(payload, order_id=order_id), payload)
+
+
+@app.delete("/api/orders/{order_id}")
+def cancel_order(order_id: str, account: str, _: str = Session) -> Dict[str, Any]:
+    return _act(trading.CANCEL, account, "/orders/%s" % order_id, "DELETE",
+                {"order_id": order_id})
+
+
+@app.post("/api/positions/{position_id}/exit")
+def exit_position(position_id: str, body: AccountBody, _: str = Session) -> Dict[str, Any]:
+    return _act(trading.EXIT, body.account, "/positions/%s/exit" % position_id, "POST",
+                {"position_id": position_id}, {})
+
+
+@app.get("/api/audit")
+def get_audit(limit: int = 50, _: str = Session) -> Dict[str, Any]:
+    """What has been done through this dashboard, most recent first."""
+    conn = _audit_conn()
+    if conn is None:
+        return {"entries": [], "available": False}
+    try:
+        return {"entries": trading.recent(conn, limit), "available": True}
+    finally:
+        conn.close()
 
 
 @app.get("/api/orders")

@@ -55,24 +55,35 @@ class FyersClient(Broker):
 
         return with_retries(_call, max_retries=4, base_sleep=0.4, max_sleep=3.0, logger=LOG)
 
+    # FYERS order types. 3 and 4 are the stop variants: 3 triggers and fills at
+    # market, 4 triggers and then works as a limit.
+    _ORDER_TYPES = {"LIMIT": 1, "MARKET": 2, "SL_M": 3, "SL": 4}
+
     def place_order(self, req: PlaceOrderRequest) -> str:
         # FYERS requires integer qty
         qty_int = int(req.qty)
         fy_side = 1 if req.side == "BUY" else -1
-        order_type = 2 if req.order_type == "MARKET" else 1  # 2=MARKET, 1=LIMIT in FYERS
+        order_type = self._ORDER_TYPES.get(str(req.order_type).upper(), 2)
+
+        # A limit price on a market order, or a stop price on a plain limit, is
+        # at best ignored and at worst honoured. Send only what the type uses.
+        wants_limit = order_type in (1, 4)
+        wants_stop = order_type in (3, 4)
+
         data = {
             "symbol": req.symbol,
             "qty": int(qty_int),
             "type": order_type,
             "side": fy_side,
             "productType": str(req.product_type),
-            "limitPrice": float(req.limit_price) if order_type == 1 else 0,
-            "stopPrice": 0,
+            "limitPrice": float(req.limit_price) if wants_limit else 0,
+            "stopPrice": float(req.stop_price) if wants_stop else 0,
             "validity": req.validity,
             "disclosedQty": int(req.disclosed_qty),
             "offlineOrder": bool(req.offline_order),
-            "stopLoss": 0,
-            "takeProfit": 0,
+            # Points from entry, not prices — Fyers reads them that way.
+            "stopLoss": float(req.stop_loss),
+            "takeProfit": float(req.take_profit),
             "isSliceOrder": False,
         }
         data.update(req.raw or {})

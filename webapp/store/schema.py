@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -203,6 +203,25 @@ CREATE TABLE IF NOT EXISTS history_progress (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (account, kind)
 );
+
+-- Every order action taken through the dashboard.
+--
+-- Written BEFORE the broker is called, then updated with the outcome. That
+-- ordering is the point: an action that crashed, timed out, or left the process
+-- mid-call still leaves a record saying it was attempted. A log written only on
+-- success is silent about exactly the cases worth investigating.
+CREATE TABLE IF NOT EXISTS audit (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    at        REAL NOT NULL,
+    action    TEXT NOT NULL,       -- place | modify | cancel | exit
+    account   TEXT NOT NULL,
+    summary   TEXT NOT NULL,       -- human-readable, e.g. "BUY 140 NSE:RELIANCE-EQ MTF @1465"
+    detail    TEXT,                -- the request, as JSON
+    result    TEXT NOT NULL,       -- pending | ok | error
+    message   TEXT,
+    finished_at REAL
+);
+CREATE INDEX IF NOT EXISTS ix_audit_at ON audit (at DESC);
 
 -- The agent's own last word on each account: what the API falls back to when the
 -- agent itself cannot be reached.

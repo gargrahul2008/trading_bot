@@ -5,7 +5,10 @@ from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional, Protocol, runtime_checkable
 
 Side = Literal["BUY", "SELL"]
-OrderType = Literal["MARKET", "LIMIT"]
+# SL is a stop-limit (Fyers type 4): triggers at stop_price, then works as a
+# limit at limit_price. SL_M is a stop-market (type 3): triggers at stop_price
+# and fills at whatever the market gives.
+OrderType = Literal["MARKET", "LIMIT", "SL", "SL_M"]
 ProductType = Literal["CNC", "INTRADAY", "MARGIN"]
 
 D0 = Decimal("0")
@@ -35,6 +38,13 @@ class PlaceOrderRequest:
 
     order_type: OrderType = "MARKET"
     limit_price: Decimal = D0
+    # Trigger price for SL and SL_M.
+    stop_price: Decimal = D0
+    # Bracket and cover legs, in POINTS away from the entry, not absolute
+    # prices — that is what Fyers takes, and passing a price here would place a
+    # stop hundreds of rupees from where it was meant to go.
+    stop_loss: Decimal = D0
+    take_profit: Decimal = D0
     time_in_force: str = "GTC"   # crypto typical; FYERS ignores
     validity: str = "DAY"        # FYERS typical; crypto ignores
     disclosed_qty: int = 0
