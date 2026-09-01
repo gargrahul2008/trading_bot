@@ -16,7 +16,7 @@ committed. Shorts are reported as exposure, separately.
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 D0 = Decimal("0")
 
@@ -54,8 +54,14 @@ def account_portfolio(
     capital_in: Any = 0,
     realised: Any = 0,
     realised_is_partial: bool = False,
+    excluded: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """One account's standing.
+
+    `excluded` names scrips the holder has judged unsellable. They are kept out
+    of deployed, market value, unrealised and the return, and reported on their
+    own — because a ratio measured against capital that includes a written-off
+    holding is wrong by that much, and quietly so.
 
     `realised` is passed in rather than computed here: for the period the store
     covers it comes from matched round trips, and for earlier months from the
@@ -70,11 +76,20 @@ def account_portfolio(
     # Its `unrealised` from the broker is the mark-to-market of a short that does
     # not exist, so including it would put a number in the unrealised column that
     # is neither unrealised nor the right size.
+    excluded = excluded or set()
     open_positions = [p for p in positions
                       if _dec(p.get("net_qty")) != 0 and not p.get("delivery_sale")]
+
+    # Split before anything is summed, so no total can accidentally include
+    # both. The excluded side is measured the same way, just reported apart.
+    dead_positions = [p for p in open_positions if p.get("symbol") in excluded]
+    dead_holdings = [h for h in holdings
+                     if h.get("is_open") and h.get("symbol") in excluded]
+    open_positions = [p for p in open_positions if p.get("symbol") not in excluded]
     longs = [p for p in open_positions if _dec(p.get("net_qty")) > 0]
     shorts = [p for p in open_positions if _dec(p.get("net_qty")) < 0]
-    held = [h for h in holdings if h.get("is_open")]
+    held = [h for h in holdings
+            if h.get("is_open") and h.get("symbol") not in excluded]
 
     # What was paid for what is owned. Holdings carry their cost price; a long
     # position carries its average.
@@ -133,6 +148,29 @@ def account_portfolio(
         # or its capital base is incomplete, because the ledger records opening
         # *cash* and not the securities already owned at the start of the year.
         "deployed_exceeds_capital": bool(capital_in > 0 and deployed > capital_in),
+        "excluded": _excluded_block(dead_positions, dead_holdings),
+    }
+
+
+def _excluded_block(positions: List[Dict[str, Any]],
+                    holdings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """What was set aside, and what it is nominally worth.
+
+    Reported so the exclusion stays visible: money written off is still money,
+    and a page that simply dropped these rows would be a different kind of lie
+    from the one it is trying to fix.
+    """
+    longs = [p for p in positions if _dec(p.get("net_qty")) > 0]
+    cost = (sum((_dec(p.get("net_qty")) * _basis(p) for p in longs), D0)
+            + _sum(holdings, "invested"))
+    value = (sum((_dec(p.get("net_qty")) * _dec(p.get("ltp")) for p in longs), D0)
+             + _sum(holdings, "market_value"))
+    return {
+        "count": len(positions) + len(holdings),
+        "symbols": sorted({r.get("symbol", "") for r in positions + holdings}),
+        "cost": cost,
+        "market_value": value,
+        "unrealised": _sum(positions, "unrealised") + _sum(holdings, "unrealised"),
     }
 
 
@@ -155,6 +193,14 @@ def consolidate(accounts: List[Dict[str, Any]]) -> Dict[str, Any]:
     # If any account's realised had to be stitched from two sources, the total
     # inherits that — a caveat that applies to a part applies to the sum.
     totals["realised_is_partial"] = any(a["realised_is_partial"] for a in accounts)
+    blocks = [a.get("excluded") or {} for a in accounts]
+    totals["excluded"] = {
+        "count": sum(int(b.get("count") or 0) for b in blocks),
+        "symbols": sorted({s for b in blocks for s in (b.get("symbols") or [])}),
+        "cost": sum((b.get("cost") or D0 for b in blocks), D0),
+        "market_value": sum((b.get("market_value") or D0 for b in blocks), D0),
+        "unrealised": sum((b.get("unrealised") or D0 for b in blocks), D0),
+    }
     totals["return_pct"] = (
         totals["pnl"] / totals["capital_in"] * Decimal("100")
         if totals["capital_in"] > 0 else None

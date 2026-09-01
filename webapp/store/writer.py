@@ -139,12 +139,67 @@ class Writer:
         ))
 
     # ── orders ──────────────────────────────────────────────────────────────
+    def _transitions(self, rows: List[Dict[str, Any]], now: float,
+                     day: str) -> List[tuple]:
+        """What changed since the last poll, as rows for order_events.
+
+        Derived from the store rather than from memory, so an agent restart does
+        not lose the comparison — and so a transition that happened while no
+        agent was running is still noticed on the next poll.
+        """
+        previous = {
+            r["order_id"]: (r["status"], r["filled_qty"])
+            for r in self.conn.execute(
+                "SELECT order_id, status, filled_qty FROM orders WHERE account = ?",
+                (self.account,))
+        }
+
+        events = []
+        for row in rows:
+            oid = str(row["order_id"])
+            status = str(row.get("status") or "")
+            filled = float(row.get("filled_qty") or 0)
+            was = previous.get(oid)
+
+            if was is None:
+                kind, from_status = "placed", None
+            else:
+                from_status, was_filled = was[0], float(was[1] or 0)
+                if status == from_status and filled == was_filled:
+                    continue
+                if status == "FILLED":
+                    kind = "filled"
+                elif status == "REJECTED":
+                    kind = "rejected"
+                elif status == "CANCELLED":
+                    kind = "cancelled"
+                elif filled > was_filled:
+                    kind = "partial"
+                else:
+                    kind = "changed"
+
+            events.append((
+                now, self.account, oid, row.get("symbol", ""), row.get("side", ""),
+                kind, from_status, status, filled, float(row.get("qty") or 0),
+                float(row.get("traded_price") or row.get("limit_price") or 0),
+                row.get("source"), row.get("run"), row.get("message"),
+                day_of(row, day),
+            ))
+        return events
+
     def orders(self, rows: Iterable[Dict[str, Any]]) -> None:
         rows = [r for r in rows if r.get("order_id")]
         if not rows:
             return
         now = time.time()
         day = trading_day(now)
+
+        # Recorded before the upsert overwrites what it is compared against.
+        try:
+            events = self._transitions(rows, now, day)
+        except Exception as exc:
+            LOG.warning("%s: could not derive order events: %s", self.account, exc)
+            events = []
 
         def write():
             self.conn.executemany(
@@ -190,6 +245,12 @@ class Writer:
             )
 
         self._safe("orders", write)
+
+        if events:
+            self._safe("order events", lambda: self.conn.executemany(
+                "INSERT INTO order_events (at, account, order_id, symbol, side, kind,"
+                " from_status, to_status, filled_qty, qty, price, source, run, message,"
+                " trading_day) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", events))
 
     # ── fills ───────────────────────────────────────────────────────────────
     def fills(self, rows: Iterable[Dict[str, Any]]) -> None:

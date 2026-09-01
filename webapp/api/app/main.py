@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +31,8 @@ from app.auth import (
 )
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
+    store_activity,
+    store_exclusions,
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
     classify_reject, lookup_symbol, search_symbols, store_orders,
     store_realised_scrips, store_status, store_symbols, store_trades,
@@ -232,6 +235,7 @@ def get_portfolio(fy_start: str = FY_START, _: str = Session) -> Dict[str, Any]:
         return {"accounts": [], "totals": None, "configured": False}
 
     books = {result.account: result for result in client.fan_out("/book", names)}
+    excluded = store_exclusions()
 
     computed = []
     extras = {}
@@ -246,6 +250,7 @@ def get_portfolio(fy_start: str = FY_START, _: str = Session) -> Dict[str, Any]:
             return (sections.get(kind) or {}).get("data")
 
         realised = store_realised(name, from_date=fy_start)
+        set_aside = set(excluded.get(name, {}))
         computed.append(portfolio_mod.account_portfolio(
             name,
             funds=section("funds"),
@@ -256,6 +261,7 @@ def get_portfolio(fy_start: str = FY_START, _: str = Session) -> Dict[str, Any]:
             # trades supply per-trade detail and are never added to it.
             realised=realised["net"],
             realised_is_partial=not realised["available"],
+            excluded=set_aside,
         ))
         extras[name] = {
             "realised_detail": realised,
@@ -517,6 +523,63 @@ def get_orders(account: Optional[str] = None, day: Optional[str] = None,
         "accounts": names,
         "available": stored["available"] or bool(live),
     }
+
+
+class ExclusionBody(BaseModel):
+    account: str
+    symbol: str
+    reason: str = ""
+
+
+@app.get("/api/exclusions")
+def get_exclusions(_: str = Session) -> Dict[str, Any]:
+    """Scrips kept out of the working portfolio, per account."""
+    return {"exclusions": store_exclusions()}
+
+
+@app.post("/api/exclusions")
+def add_exclusion(body: ExclusionBody, _: str = Session) -> Dict[str, Any]:
+    """Set a scrip aside. Reversible, and it changes no position data."""
+    conn = _audit_conn()
+    if conn is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "store unavailable")
+    try:
+        conn.execute(
+            "INSERT INTO exclusions (account, symbol, reason, at) VALUES (?,?,?,?)"
+            " ON CONFLICT(account, symbol) DO UPDATE SET reason = excluded.reason",
+            (body.account, body.symbol, body.reason, time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "account": body.account, "symbol": body.symbol}
+
+
+@app.delete("/api/exclusions")
+def drop_exclusion(account: str, symbol: str, _: str = Session) -> Dict[str, Any]:
+    """Put a scrip back into the working portfolio."""
+    conn = _audit_conn()
+    if conn is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "store unavailable")
+    try:
+        conn.execute("DELETE FROM exclusions WHERE account = ? AND symbol = ?",
+                     (account, symbol))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "account": account, "symbol": symbol}
+
+
+@app.get("/api/activity")
+def get_activity(account: Optional[str] = None, day: Optional[str] = None,
+                 limit: int = 200, _: str = Session) -> Dict[str, Any]:
+    """Everything that changed, newest first, across every account.
+
+    The answer to "what happened while I was not looking" — fills, rejects,
+    cancellations and closes in one stream rather than spread over three pages.
+    """
+    payload = store_activity(account, day, limit)
+    payload["accounts"] = [account] if account else known_accounts()
+    return payload
 
 
 @app.get("/api/realised")

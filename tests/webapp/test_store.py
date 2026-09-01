@@ -287,3 +287,95 @@ def test_capital_can_be_asked_as_at_a_date(db):
     assert reader.capital_in("rahul", upto="2026-08-31") == "500000.0"
     assert reader.capital_in("rahul") == "800000.0"
     reader.conn.close()
+
+
+# ── order events ────────────────────────────────────────────────────────────
+#
+# Orders are upserted, so a status moving from PENDING to FILLED overwrites the
+# previous value and the change itself is lost. Nothing then tells you a
+# position closed while you were looking elsewhere.
+
+
+def order(status, filled=0.0, **kw):
+    row = {"order_id": "1", "symbol": "NSE:RELIANCE-EQ", "side": "BUY",
+           "qty": 140, "filled_qty": filled, "status": status}
+    row.update(kw)
+    return row
+
+
+def events(conn):
+    return [dict(r) for r in conn.execute(
+        "SELECT kind, order_id, from_status, to_status, filled_qty"
+        " FROM order_events ORDER BY id")]
+
+
+def test_a_status_change_is_recorded_before_it_is_overwritten(db):
+    _, conn = db
+    writer = Writer(conn, "rahul")
+
+    writer.orders([order("PENDING")])
+    writer.orders([order("FILLED", 140)])
+
+    assert [e["kind"] for e in events(conn)] == ["placed", "filled"]
+    assert events(conn)[1]["from_status"] == "PENDING"
+
+
+def test_an_unchanged_order_records_nothing(db):
+    """The poller re-reads every order every few seconds. Logging each read
+    would bury the changes in thousands of rows that say nothing happened."""
+    _, conn = db
+    writer = Writer(conn, "rahul")
+
+    for _ in range(5):
+        writer.orders([order("PENDING")])
+
+    assert len(events(conn)) == 1, "one placement, not five"
+
+
+def test_a_partial_fill_is_its_own_event(db):
+    """Quantity moving without the status moving is still something happening,
+    and on a large order it is the thing worth watching."""
+    _, conn = db
+    writer = Writer(conn, "rahul")
+
+    writer.orders([order("PENDING")])
+    writer.orders([order("PENDING", 70)])
+    writer.orders([order("PENDING", 110)])
+
+    kinds = [e["kind"] for e in events(conn)]
+    assert kinds == ["placed", "partial", "partial"]
+    assert events(conn)[-1]["filled_qty"] == 110.0
+
+
+def test_a_reject_keeps_its_cause(db):
+    _, conn = db
+    Writer(conn, "rahul").orders([
+        order("REJECTED", message="RED:Margin shortfall for this order")])
+
+    row = conn.execute("SELECT kind, message FROM order_events").fetchone()
+    assert row["kind"] == "placed"
+    assert "Margin" in row["message"]
+
+
+def test_transitions_survive_an_agent_restart(db):
+    """The comparison comes from the store, not from memory — so a change that
+    happened while no agent was running is still noticed on the next poll."""
+    _, conn = db
+    Writer(conn, "rahul").orders([order("PENDING")])
+
+    # A fresh writer, as after a restart, with no memory of the previous poll.
+    Writer(conn, "rahul").orders([order("CANCELLED")])
+
+    assert [e["kind"] for e in events(conn)] == ["placed", "cancelled"]
+
+
+def test_one_account_does_not_see_another_accounts_order_ids(db):
+    """Fyers order ids are not unique across accounts. Comparing them globally
+    would report pratibha's order as a change to rahul's."""
+    _, conn = db
+    Writer(conn, "rahul").orders([order("PENDING")])
+    Writer(conn, "pratibha").orders([order("FILLED", 140)])
+
+    kinds = [(r["account"], r["kind"]) for r in conn.execute(
+        "SELECT account, kind FROM order_events ORDER BY id")]
+    assert kinds == [("rahul", "placed"), ("pratibha", "placed")]

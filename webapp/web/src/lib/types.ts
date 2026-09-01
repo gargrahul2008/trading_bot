@@ -117,6 +117,7 @@ export interface PortfolioRow {
    *  securities the account already held at the start of the year. */
   deployed_exceeds_capital: boolean;
   counts: { positions: number; long: number; short: number; holdings: number };
+  excluded: ExcludedBlock;
   from_store: boolean;
   reachable: boolean;
   error: string | null;
@@ -137,6 +138,18 @@ export interface PortfolioTotals {
   pnl: string;
   return_pct: string | null;
   counts: { positions: number; long: number; short: number; holdings: number };
+  excluded: ExcludedBlock;
+}
+
+/** Scrips held out of the working portfolio. Reported rather than dropped:
+ *  money written off is still money, and a page that silently omitted it would
+ *  be a different kind of wrong from the one exclusion fixes. */
+export interface ExcludedBlock {
+  count: number;
+  symbols: string[];
+  cost: string;
+  market_value: string;
+  unrealised: string;
 }
 
 export interface Portfolio {
@@ -300,4 +313,41 @@ export interface AuditEntry {
   summary: string;
   result: string;
   message: string | null;
+}
+
+/** One thing that happened: an order changing state, or a position closing.
+ *  The stream is heterogeneous by design — the point is to read it in one
+ *  pass, not to switch pages to learn what became of a trade. */
+export interface ActivityEvent {
+  at: number | string | null;
+  account: string;
+  symbol: string;
+  side: string;
+  event: "placed" | "partial" | "filled" | "cancelled" | "rejected" | "changed" | "closed";
+  order_id?: string | null;
+  qty?: number | string | null;
+  filled_qty?: number | null;
+  /** Money on a close arrives as a decimal string, computed exactly. */
+  price?: number | string | null;
+  entry_price?: number | string | null;
+  from_status?: string | null;
+  to_status?: string | null;
+  /** Present on a close only, and null when the day's charges are not in —
+   *  an unknown cost is not a zero one. */
+  net_pnl?: string | null;
+  /** Gross, before charges. Shown when the net cannot be computed. */
+  pnl?: string | null;
+  charges?: string | null;
+  source?: string | null;
+  run?: string | null;
+  message?: string | null;
+  kind?: string | null;
+  reason?: string | null;
+  trading_day: string;
+}
+
+export interface ActivityPayload {
+  events: ActivityEvent[];
+  accounts: string[];
+  available: boolean;
 }

@@ -69,7 +69,8 @@ export function plural(n: number, one: string, many?: string): string {
 
 /** Money arrives from the API as decimal strings. Parsing at the edge keeps the
  *  exact value in the payload and confines the float to display. */
-export function num(value: string | null | undefined): number | null {
+export function num(value: string | number | null | undefined): number | null {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (value === null || value === undefined || value === "") return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;

@@ -7,6 +7,7 @@ import { Matrix, MatrixEmpty } from "../components/Matrix";
 import type { MatrixRow, TotalRow } from "../components/Matrix";
 import { api } from "../lib/api";
 import { age, money, pnlClass, qty as fmtQty, signed } from "../lib/format";
+import { useExclusions } from "../lib/exclusions";
 import { Money, usePrivacy } from "../lib/privacy";
 import type { Position, PositionsPayload } from "../lib/types";
 
@@ -24,7 +25,11 @@ function describe(position: Position): { label: string; tone: string } {
   return { label: "SHORT", tone: "text-[var(--loss)]" };
 }
 
-function Row({ position }: { position: Position }) {
+function Row({ position, onSetAside, aside }: {
+  position: Position;
+  onSetAside: () => void;
+  aside: boolean;
+}) {
   const { label, tone } = describe(position);
   const move =
     position.avg_price > 0
@@ -75,6 +80,19 @@ function Row({ position }: { position: Position }) {
         </strong>
       </Td>
       <Td muted>{position.stale ? age(position.age_s) : ""}</Td>
+      <Td align="right">
+        <button
+          onClick={onSetAside}
+          className="text-xs text-[var(--ink-muted)] hover:underline"
+          title={
+            aside
+              ? "Count this scrip in the working portfolio again"
+              : "Keep this scrip out of deployed capital and the return"
+          }
+        >
+          {aside ? "restore" : "set aside"}
+        </button>
+      </Td>
     </tr>
   );
 }
@@ -160,6 +178,8 @@ function toMatrix(positions: Position[], accounts: string[]) {
 export function PositionsPage() {
   const { hidden, toggle } = usePrivacy();
   const [detail, setDetail] = useState(false);
+  const [showAside, setShowAside] = useState(false);
+  const { isExcluded, reasonFor, exclude, restore, busy } = useExclusions();
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["positions"],
     queryFn: () => api.get<PositionsPayload>("/positions"),
@@ -169,7 +189,11 @@ export function PositionsPage() {
   if (isError) return <ErrorNote error={error} />;
   if (isLoading || !data) return <Loading what="positions" />;
 
-  const rows = data.positions;
+  const all = data.positions;
+  // Set-aside scrips leave every total on this page, and reappear together in
+  // their own section — so the exclusion is visible rather than a silent gap.
+  const rows = all.filter((p) => !isExcluded(p.account, p.symbol));
+  const aside = all.filter((p) => isExcluded(p.account, p.symbol));
   // From the server, not from the rows: an account holding nothing must still
   // appear, as a column of dots.
   const accounts = data.accounts;
@@ -188,6 +212,7 @@ export function PositionsPage() {
           <>
             {rows.length} open · {longs} long · {shorts} short
             {holdings > 0 && ` · ${holdings} delivery holdings`}
+            {aside.length > 0 && ` · ${aside.length} set aside`}
              · unrealised{" "}
             <span className={pnlClass(total)}>{signed(total)}</span>
           </>
@@ -279,6 +304,9 @@ export function PositionsPage() {
                 </Th>
                 <Th>Unrealised</Th>
                 <Th align="right">Age</Th>
+                <Th align="right" help="Keep a scrip you cannot sell out of the working totals">
+                  {" "}
+                </Th>
               </tr>
             </thead>
             <tbody>
@@ -286,12 +314,91 @@ export function PositionsPage() {
                 <Row
                   key={`${position.account}-${position.symbol}-${position.product_type}`}
                   position={position}
+                  aside={false}
+                  onSetAside={() =>
+                    !busy &&
+                    exclude({
+                      account: position.account,
+                      symbol: position.symbol,
+                      reason: window.prompt(
+                        `Keep ${position.symbol} out of the working portfolio. Why?`,
+                        "cannot be sold",
+                      ) ?? "",
+                    })
+                  }
                 />
               ))}
             </tbody>
           </table>
         )}
       </Card>
+      )}
+
+      {aside.length > 0 && (
+        <Card className="mt-4 overflow-x-auto">
+          <button
+            onClick={() => setShowAside((on) => !on)}
+            className="flex w-full items-baseline gap-2 px-4 py-2.5 text-left"
+          >
+            <span className="text-sm font-semibold">
+              {showAside ? "▾" : "▸"} Set aside ({aside.length})
+            </span>
+            <span className="text-xs text-[var(--ink-muted)]">
+              held out of deployed capital, unrealised and the return
+            </span>
+            <span className="ml-auto text-xs text-[var(--ink-secondary)]">
+              <Money>
+                {money(
+                  aside.reduce(
+                    (sum, p) => sum + Math.abs(p.net_qty) * (p.avg_price || p.ltp || 0),
+                    0,
+                  ),
+                )}
+              </Money>{" "}
+              at cost
+            </span>
+          </button>
+          {showAside && (
+            <table className="w-full min-w-[980px]">
+              <thead>
+                <tr>
+                  <Th align="left">Account</Th>
+                  <Th align="left">Symbol</Th>
+                  <Th align="left">Side</Th>
+                  <Th>Qty</Th>
+                  <Th help="What it cost">Avg</Th>
+                  <Th>LTP</Th>
+                  <Th help="Move from the average, in the position's own direction">
+                    Move
+                  </Th>
+                  <Th>Unrealised</Th>
+                  <Th align="right">Age</Th>
+                  <Th align="right"> </Th>
+                </tr>
+              </thead>
+              <tbody>
+                {aside.map((position) => (
+                  <Row
+                    key={`${position.account}-${position.symbol}-${position.product_type}`}
+                    position={position}
+                    aside
+                    onSetAside={() =>
+                      !busy &&
+                      restore({ account: position.account, symbol: position.symbol })
+                    }
+                  />
+                ))}
+              </tbody>
+            </table>
+          )}
+          {showAside && (
+            <p className="px-4 py-2 text-xs text-[var(--ink-muted)]">
+              {aside
+                .map((p) => `${p.symbol}: ${reasonFor(p.account, p.symbol) || "no reason given"}`)
+                .join(" · ")}
+            </p>
+          )}
+        </Card>
       )}
 
       <p className="mt-3 text-xs text-[var(--ink-muted)]">

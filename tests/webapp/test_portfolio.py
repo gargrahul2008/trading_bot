@@ -184,3 +184,71 @@ def test_no_capital_recorded_is_not_treated_as_over_deployed():
     """That case has its own banner; flagging it twice says nothing new."""
     p = account_portfolio("piyush", FUNDS, [], [holding()], capital_in=0)
     assert p["deployed_exceeds_capital"] is False
+
+
+# ── setting a scrip aside ───────────────────────────────────────────────────
+#
+# A suspended or written-off holding still sits in the broker's book at cost.
+# Left in, it drags every ratio measured against deployed capital — and does so
+# invisibly, which is worse than being wrong loudly.
+
+
+def test_an_excluded_holding_leaves_deployed_and_the_return():
+    """VIKASECO cost ₹1.38 lakh and cannot be sold. Counting it as deployed
+    makes the return on the money that is actually working look smaller."""
+    live = holding(invested=206028.0, value=212301.0, unreal=6273.0)
+    dead = dict(holding(invested=137662.0, value=0.0, unreal=-137662.0),
+                symbol="NSE:VIKASECO-EQ")
+
+    with_it = account_portfolio("rahul", FUNDS, [], [live, dead], capital_in=500000)
+    without = account_portfolio("rahul", FUNDS, [], [live, dead], capital_in=500000,
+                                excluded={"NSE:VIKASECO-EQ"})
+
+    assert with_it["deployed"] == Decimal("343690.0")
+    assert without["deployed"] == Decimal("206028.0")
+    assert without["unrealised"] == Decimal("6273.0")
+    assert without["return_pct"] > with_it["return_pct"], (
+        "excluding a write-off must not flatter the return, but it must stop "
+        "the write-off from dragging the working book's")
+
+
+def test_what_was_set_aside_is_still_reported():
+    """Money written off is still money. A page that simply dropped the row
+    would be a different kind of lie from the one exclusion fixes."""
+    dead = dict(holding(invested=137662.0, value=1400.0, unreal=-136262.0),
+                symbol="NSE:VIKASECO-EQ")
+    p = account_portfolio("rahul", FUNDS, [], [dead], excluded={"NSE:VIKASECO-EQ"})
+
+    assert p["excluded"]["count"] == 1
+    assert p["excluded"]["symbols"] == ["NSE:VIKASECO-EQ"]
+    assert p["excluded"]["cost"] == Decimal("137662.0")
+    assert p["excluded"]["unrealised"] == Decimal("-136262.0")
+    assert p["deployed"] == Decimal("0"), "it must be gone from the working figure"
+
+
+def test_excluding_a_position_not_only_a_holding():
+    """The same scrip can sit in either book; the judgement is about the scrip."""
+    stuck = dict(long_position(qty=100, avg=50.0, ltp=1.0, unreal=-4900.0),
+                 symbol="NSE:STUCK-EQ")
+    p = account_portfolio("rahul", FUNDS, [stuck], [], excluded={"NSE:STUCK-EQ"})
+
+    assert p["deployed"] == Decimal("0")
+    assert p["unrealised"] == Decimal("0")
+    assert p["counts"]["positions"] == 0
+    assert p["excluded"]["cost"] == Decimal("5000.00")
+
+
+def test_exclusions_consolidate_across_accounts():
+    """Two accounts each stuck with the same scrip is one line, one total."""
+    dead = dict(holding(invested=100000.0, value=0.0, unreal=-100000.0),
+                symbol="NSE:VIKASECO-EQ")
+    accounts = [
+        account_portfolio(name, FUNDS, [], [dead], excluded={"NSE:VIKASECO-EQ"})
+        for name in ("rahul", "pratibha")
+    ]
+    totals = consolidate(accounts)
+
+    assert totals["excluded"]["count"] == 2
+    assert totals["excluded"]["symbols"] == ["NSE:VIKASECO-EQ"], "one name, not two"
+    assert totals["excluded"]["cost"] == Decimal("200000.0")
+    assert totals["deployed"] == Decimal("0")

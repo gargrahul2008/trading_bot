@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -223,6 +223,49 @@ CREATE TABLE IF NOT EXISTS symbols (
     updated_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_symbols_short ON symbols (short_name);
+
+-- Holdings that are not really holdings.
+--
+-- A scrip that cannot be sold — suspended, delisted, written off — still sits
+-- in the broker's book at its cost, and every ratio measured against deployed
+-- capital is wrong by that much. Excluding it is a judgement, not a fact, so it
+-- is recorded here with its reason rather than edited into the position data.
+CREATE TABLE IF NOT EXISTS exclusions (
+    account  TEXT NOT NULL,
+    symbol   TEXT NOT NULL,
+    reason   TEXT NOT NULL DEFAULT '',
+    at       REAL NOT NULL,
+    PRIMARY KEY (account, symbol)
+);
+
+-- What changed, and when.
+--
+-- Orders are upserted, so a status moving from PENDING to FILLED overwrites the
+-- previous value and the change itself is lost. Nothing then tells you a
+-- position closed while you were looking elsewhere — it is simply not there any
+-- more, which is the difference between a dashboard and a record.
+--
+-- One row per transition, appended, never updated.
+CREATE TABLE IF NOT EXISTS order_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    at           REAL NOT NULL,
+    account      TEXT NOT NULL,
+    order_id     TEXT NOT NULL,
+    symbol       TEXT NOT NULL,
+    side         TEXT NOT NULL DEFAULT '',
+    kind         TEXT NOT NULL,          -- placed | filled | partial | cancelled | rejected | changed
+    from_status  TEXT,
+    to_status    TEXT,
+    filled_qty   REAL NOT NULL DEFAULT 0,
+    qty          REAL NOT NULL DEFAULT 0,
+    price        REAL NOT NULL DEFAULT 0,
+    source       TEXT,                   -- bot | manual
+    run          TEXT,
+    message      TEXT,
+    trading_day  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_order_events_at ON order_events (at DESC);
+CREATE INDEX IF NOT EXISTS ix_order_events_day ON order_events (trading_day, account);
 
 -- Every order action taken through the dashboard.
 --

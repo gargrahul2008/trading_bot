@@ -118,6 +118,7 @@ export function PortfolioPage() {
   const ret = num(t.return_pct);
   const noCapital = data.accounts.filter((row) => num(row.capital_in) === 0);
   const overDeployed = data.accounts.filter((row) => row.deployed_exceeds_capital);
+  const aside = t.excluded;
 
   return (
     <>
@@ -127,6 +128,15 @@ export function PortfolioPage() {
           <>
             {t.accounts} accounts as one book · since {data.fy_start} ·{" "}
             {count(t.counts.positions)} open positions
+            {aside?.count > 0 && (
+              <>
+                {" · "}
+                <span title={aside.symbols.join(", ")}>
+                  {aside.count} set aside, worth <Money>{money(num(aside.cost))}</Money> at
+                  cost, excluded from every figure below
+                </span>
+              </>
+            )}
           </>
         }
         actions={
