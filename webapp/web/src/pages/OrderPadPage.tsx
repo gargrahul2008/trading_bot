@@ -5,9 +5,9 @@ import { Card, ErrorNote, Loading, PageHeader } from "../components/ui";
 import { SymbolInput } from "../components/SymbolInput";
 import type { SymbolMatch } from "../components/SymbolInput";
 import { api, ApiError } from "../lib/api";
-import { money } from "../lib/format";
+import { money, num } from "../lib/format";
 import { Money } from "../lib/privacy";
-import type { AuditEntry, Overview, PlaceRequest } from "../lib/types";
+import type { AuditEntry, LimitsPayload, Overview, PlaceRequest } from "../lib/types";
 
 const PRODUCTS = ["BO", "CNC", "INTRADAY", "MARGIN", "MTF", "CO"] as const;
 const TYPES = [
@@ -73,6 +73,11 @@ export function OrderPadPage() {
   // The instrument itself, once picked: its tick is what prices must land on.
   const [instrument, setInstrument] = useState<SymbolMatch | null>(null);
   const [done, setDone] = useState<string | null>(null);
+  // Sizing is collapsed by default: someone who already knows the quantity must
+  // not have to dismiss a calculator to type it.
+  const [sizing, setSizing] = useState(false);
+  const [riskAmount, setRiskAmount] = useState("");
+  const [deployAmount, setDeployAmount] = useState("");
 
   const overview = useQuery({
     queryKey: ["overview"],
@@ -129,6 +134,12 @@ export function OrderPadPage() {
     onError: () => void queryClient.invalidateQueries({ queryKey: ["audit"] }),
   });
 
+  const limits = useQuery({
+    queryKey: ["limits"],
+    queryFn: () => api.get<LimitsPayload>("/limits"),
+    staleTime: 60_000,
+  });
+
   const audit = useQuery({
     queryKey: ["audit"],
     queryFn: () => api.get<{ entries: AuditEntry[] }>("/audit?limit=8"),
@@ -170,6 +181,12 @@ export function OrderPadPage() {
     stop_loss: want.legs ? toTick(number(stopLoss), tick) : 0,
     take_profit: want.target ? toTick(number(takeProfit), tick) : 0,
   };
+
+  // Shown before the button is pressed, so the server's refusal is a backstop
+  // rather than the first anyone hears of the limit.
+  const cap = num(limits.data?.limits?.[account]?.max_order_value ?? null) ?? 0;
+  const overCap = cap > 0 && value !== null && value > cap;
+  if (overCap) problems.push(`over ${account}'s ${money(cap)} per-order limit`);
 
   const ready = problems.length === 0 && !place.isPending;
   const tradingOff = chosen && !chosen.allow_trading;
@@ -233,7 +250,16 @@ export function OrderPadPage() {
             </div>
 
             <div>
-              <span className={labelClass}>Quantity</span>
+              <span className={labelClass}>
+                Quantity{" "}
+                <button
+                  type="button"
+                  onClick={() => setSizing((on) => !on)}
+                  className="normal-case text-[var(--ink-muted)] hover:underline"
+                >
+                  {sizing ? "hide sizing" : "size it"}
+                </button>
+              </span>
               <input
                 value={qty}
                 onChange={(event) => {
@@ -260,6 +286,76 @@ export function OrderPadPage() {
                 )}
               </div>
             </div>
+
+            {sizing && (
+              <div className="col-span-full grid grid-cols-2 gap-3 rounded border px-3 py-3 md:grid-cols-4"
+                   style={{ borderColor: "var(--hairline)" }}>
+                <div>
+                  <span className={labelClass}>Risk ₹</span>
+                  <input
+                    value={riskAmount}
+                    onChange={(event) => {
+                      setRiskAmount(event.target.value);
+                      setDeployAmount("");
+                      // Quantity is what the stop can afford: the amount you
+                      // are willing to lose, divided by the distance to it.
+                      const points = number(stopLoss);
+                      const risk = number(event.target.value);
+                      if (points > 0 && risk > 0) {
+                        setQty(String(Math.max(Math.floor(risk / points), 0)));
+                        setDone(null);
+                      }
+                    }}
+                    inputMode="numeric"
+                    placeholder="what you can lose"
+                    className={inputClass}
+                    style={{ borderColor: "var(--border)" }}
+                  />
+                </div>
+                <div>
+                  <span className={labelClass}>Deploy ₹</span>
+                  <input
+                    value={deployAmount}
+                    onChange={(event) => {
+                      setDeployAmount(event.target.value);
+                      setRiskAmount("");
+                      const money_ = number(event.target.value);
+                      if (reference > 0 && money_ > 0) {
+                        setQty(String(Math.max(Math.floor(money_ / reference), 0)));
+                        setDone(null);
+                      }
+                    }}
+                    inputMode="numeric"
+                    placeholder="what you can commit"
+                    className={inputClass}
+                    style={{ borderColor: "var(--border)" }}
+                  />
+                </div>
+                <div className="col-span-2 self-end text-xs text-[var(--ink-muted)]">
+                  {riskAmount && number(stopLoss) > 0 ? (
+                    <>
+                      {money(number(riskAmount))} risked over a{" "}
+                      {number(stopLoss)}-point stop is {qty || 0} shares
+                      {reference > 0 && (
+                        <> — {money(number(qty) * reference)} committed</>
+                      )}
+                      .
+                    </>
+                  ) : deployAmount && reference > 0 ? (
+                    <>
+                      {money(number(deployAmount))} at {money(reference)} is {qty || 0}{" "}
+                      shares
+                      {number(stopLoss) > 0 && (
+                        <> — {money(number(qty) * number(stopLoss))} at risk</>
+                      )}
+                      .
+                    </>
+                  ) : (
+                    "Risk needs a stop-loss; deploy needs a price. Whichever you type sets the quantity."
+                  )}
+                </div>
+              </div>
+            )}
 
             <div>
               <span className={labelClass}>Product</span>

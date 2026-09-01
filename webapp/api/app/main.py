@@ -10,6 +10,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Response, status
@@ -33,6 +34,8 @@ from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     store_activity,
     store_exclusions,
+    store_limits,
+    rms_mod,
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
     classify_reject, lookup_symbol, search_symbols, store_orders,
     store_realised_scrips, store_status, store_symbols, store_trades,
@@ -389,6 +392,115 @@ def get_trades(account: Optional[str] = None, day: Optional[str] = None,
     return payload
 
 
+def _reference_price(account: str, body: PlaceBody,
+                     book: Optional[Dict[str, Any]]) -> Optional[Any]:
+    """What one share will cost, for the purpose of bounding the order.
+
+    A limit order states it. A market order does not, so the price is fetched —
+    and if it cannot be, the order's value cannot be established at all, which
+    is the one thing every limit here is measured in.
+    """
+    if body.limit_price:
+        return body.limit_price
+    if body.stop_price:
+        return body.stop_price
+
+    result = AgentClient().call(account, "/quote?symbols=%s" % body.symbol)
+    if result.ok:
+        for row in ((result.data or {}).get("d") or []):
+            price = ((row or {}).get("v") or {}).get("lp")
+            if price:
+                return price
+
+    # The book's own last price, seconds to a minute old. Good enough to catch a
+    # quantity typed with an extra zero, which is what this is for.
+    for kind in ("positions", "holdings"):
+        section = ((book or {}).get("sections") or {}).get(kind) or {}
+        for row in (section.get("data") or []):
+            if isinstance(row, dict) and row.get("symbol") == body.symbol:
+                if row.get("ltp"):
+                    return row["ltp"]
+    return None
+
+
+def _is_reducing(body: PlaceBody, book: Optional[Dict[str, Any]]) -> bool:
+    """True when this order closes rather than opens.
+
+    A daily loss limit that stops someone cutting a losing position is not a
+    risk control; it is the trap the control existed to prevent.
+    """
+    section = ((book or {}).get("sections") or {}).get("positions") or {}
+    for row in (section.get("data") or []):
+        if not isinstance(row, dict) or row.get("symbol") != body.symbol:
+            continue
+        net = float(row.get("net_qty") or 0)
+        if net > 0 and body.side.upper() == "SELL":
+            return body.qty <= net
+        if net < 0 and body.side.upper() == "BUY":
+            return body.qty <= abs(net)
+    return False
+
+
+def _orders_in_last_minute(conn, account: str) -> int:
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM audit WHERE action = ? AND account = ?"
+            " AND at > ? AND result != 'refused'",
+            (trading.PLACE, account, time.time() - 60)).fetchone()
+        return int(row["n"])
+    except Exception as exc:
+        LOG.warning("could not count recent orders: %s", exc)
+        return 0
+
+
+def _check_risk(account: str, body: PlaceBody) -> None:
+    """Refuse an order that breaks a limit, and record the refusal.
+
+    In the API rather than the browser: this is the only path to a broker, so
+    it is the only place a limit is worth putting. A rule that can be skipped by
+    opening the network tab is a suggestion, not a limit.
+    """
+    if rms_mod is None:
+        return
+
+    limits = rms_mod.resolve(store_limits(), account)
+    result = AgentClient().call(account, "/book")
+    book = result.data if result.ok else store_book(account)
+
+    price = _reference_price(account, body, book)
+    if price is None:
+        raise HTTPException(
+            422,
+            "no price available for %s, so this order's value cannot be checked "
+            "against the risk limits — place it as a limit order" % body.symbol)
+
+    conn = _audit_conn()
+    recent = _orders_in_last_minute(conn, account) if conn else 0
+    try:
+        rms_mod.check(
+            account=account, symbol=body.symbol, qty=body.qty, price=price,
+            limits=limits, book=book, recent_orders=recent,
+            reducing=_is_reducing(body, book))
+    except rms_mod.Breach as breach:
+        if conn:
+            # Refusals are audited too. An order that never reached the broker
+            # is still something someone tried to do, and the pattern of what
+            # the limits stop is the reason to keep or change them.
+            audit_id = trading.begin(conn, trading.PLACE, account, body.model_dump())
+            trading.finish(conn, audit_id, False, "refused: " + breach.reason)
+            conn.execute("UPDATE audit SET result = 'refused' WHERE id = ?", (audit_id,))
+            conn.commit()
+            conn.close()
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            breach.reason) from breach
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 @app.post("/api/orders")
 def place_order(body: PlaceBody, _: str = Session) -> Dict[str, Any]:
     """Place an order in one named account.
@@ -398,10 +510,67 @@ def place_order(body: PlaceBody, _: str = Session) -> Dict[str, Any]:
     ends up in the wrong one. The agent refuses unless it was started with
     --allow-trading, so this cannot reach a broker the host did not deliberately
     enable.
+
+    Risk limits are checked first, and a refusal is audited: an order that never
+    reached the broker is still something someone tried to do.
     """
+    if body.account not in agent_ports():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account: %s" % body.account)
+    _check_risk(body.account, body)
+
     payload = body.model_dump()
     account = payload.pop("account")
     return _act(trading.PLACE, account, "/orders", "POST", payload, payload)
+
+
+class LimitBody(BaseModel):
+    account: str = "*"
+    name: str
+    value: str
+
+
+@app.get("/api/limits")
+def get_limits(_: str = Session) -> Dict[str, Any]:
+    """The risk limits in force, per account, and what each one means."""
+    if rms_mod is None:
+        return {"limits": {}, "rules": {}, "available": False}
+    rows = store_limits()
+    return {
+        "limits": {name: {rule: str(value) for rule, value in
+                          rms_mod.resolve(rows, name).items()}
+                   for name in known_accounts()},
+        "defaults": {rule: str(value) for rule, value in rms_mod.DEFAULTS.items()},
+        "rules": rms_mod.LIMITS,
+        "rows": rows,
+        "available": True,
+    }
+
+
+@app.post("/api/limits")
+def set_limit(body: LimitBody, _: str = Session) -> Dict[str, Any]:
+    """Change one limit. 0 turns a rule off, which is not the same as unset."""
+    if rms_mod is None or body.name not in rms_mod.LIMITS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "no such limit: %s" % body.name)
+    try:
+        value = Decimal(body.value)
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "not a number: %s" % body.value)
+    if value < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "a limit cannot be negative")
+
+    conn = _audit_conn()
+    if conn is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "store unavailable")
+    try:
+        conn.execute(
+            "INSERT INTO rms_limits (account, name, value, at) VALUES (?,?,?,?)"
+            " ON CONFLICT(account, name) DO UPDATE SET value = excluded.value,"
+            " at = excluded.at",
+            (body.account, body.name, str(value), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"ok": True, "account": body.account, "name": body.name, "value": str(value)}
 
 
 @app.patch("/api/orders/{order_id}")

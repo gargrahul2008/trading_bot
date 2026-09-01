@@ -305,3 +305,122 @@ def test_an_unlisted_symbol_is_a_404(setup):
     and does not exist."""
     client, _, _ = setup
     assert client.get("/api/symbols/NSE:RELIA-EQ").status_code == 404
+
+
+# ── risk limits ─────────────────────────────────────────────────────────────
+#
+# Enforced here rather than in the browser. The API is the only path to a
+# broker, so it is the only place a limit is worth putting: a rule the network
+# tab can skip is a suggestion.
+
+
+def set_limit(client, name, value, account="*"):
+    response = client.post("/api/limits",
+                           json={"account": account, "name": name, "value": str(value)})
+    assert response.status_code == 200, response.text
+
+
+def test_an_order_over_the_value_limit_never_reaches_the_broker(setup):
+    """1,400 shares instead of 140 is one keystroke and ₹20 lakh."""
+    client, agent, _ = setup
+    set_limit(client, "max_order_value", 500000)
+
+    response = client.post("/api/orders", json=dict(ORDER, qty=1400))
+
+    assert response.status_code == 403
+    assert "20,51,700" in response.json()["detail"], "say what the figure was"
+    assert agent.calls == [], "nothing may reach the broker"
+
+
+def test_a_refusal_is_audited(setup):
+    """An order that never reached the broker is still something someone tried
+    to do, and the pattern of what the limits stop is why they are kept."""
+    client, _, path = setup
+    set_limit(client, "max_order_value", 500000)
+    client.post("/api/orders", json=dict(ORDER, qty=1400))
+
+    rows = audit_rows(path)
+    assert len(rows) == 1
+    assert rows[0]["result"] == "refused"
+    assert "max_order_value" not in rows[0]["message"], "the reason, not the rule name"
+    assert "20,51,700" in rows[0]["message"]
+
+
+def test_a_refused_order_does_not_count_towards_the_rate_limit(setup):
+    """Otherwise one fat-fingered order locks the account out for a minute."""
+    client, agent, _ = setup
+    set_limit(client, "max_order_value", 500000)
+    set_limit(client, "max_orders_per_minute", 2)
+
+    for _ in range(5):
+        client.post("/api/orders", json=dict(ORDER, qty=1400))
+    accepted = client.post("/api/orders", json=ORDER)
+
+    assert accepted.status_code == 200
+    assert len(agent.calls) == 1
+
+
+def test_the_rate_limit_stops_a_loop(setup):
+    client, agent, _ = setup
+    set_limit(client, "max_orders_per_minute", 3)
+
+    codes = [client.post("/api/orders", json=ORDER).status_code for _ in range(5)]
+
+    assert codes == [200, 200, 200, 403, 403]
+    assert len(agent.calls) == 3
+
+
+def test_a_per_account_limit_beats_the_default(setup):
+    """A cap that is right for one account is a cage on another."""
+    client, agent, _ = setup
+    set_limit(client, "max_order_value", 100000)
+    set_limit(client, "max_order_value", 900000, account="rahul")
+
+    assert client.post("/api/orders", json=ORDER).status_code == 200
+    assert client.post("/api/orders", json=dict(ORDER, account="pratibha")
+                       ).status_code == 403
+
+
+def test_a_market_order_with_no_obtainable_price_is_refused(setup):
+    """Every limit here is measured in the order's value. A market order whose
+    price cannot be established has no value to measure, and passing it through
+    unchecked would make the limits optional exactly when they matter."""
+    client, agent, _ = setup
+
+    response = client.post("/api/orders", json=dict(
+        ORDER, order_type="MARKET", limit_price=0))
+
+    assert response.status_code == 422
+    assert "no price available" in response.json()["detail"]
+    assert agent.calls == []
+
+
+def test_limits_are_readable(setup):
+    client, _, _ = setup
+    set_limit(client, "max_order_value", 750000, account="rahul")
+
+    payload = client.get("/api/limits").json()
+
+    assert payload["limits"]["rahul"]["max_order_value"] == "750000"
+    assert payload["limits"]["pratibha"]["max_order_value"] == "500000", "the built-in"
+    assert "max_daily_loss" in payload["rules"]
+
+
+def test_a_nonsense_limit_is_rejected(setup):
+    client, _, _ = setup
+
+    assert client.post("/api/limits", json={"name": "max_moons", "value": "1"}
+                       ).status_code == 400
+    assert client.post("/api/limits", json={"name": "max_order_value", "value": "lots"}
+                       ).status_code == 400
+    assert client.post("/api/limits", json={"name": "max_order_value", "value": "-1"}
+                       ).status_code == 400
+
+
+def test_setting_limits_requires_a_session(setup):
+    client, _, _ = setup
+    client.post("/api/auth/logout")
+
+    assert client.post("/api/limits", json={"name": "max_order_value", "value": "1"}
+                       ).status_code == 401
+    assert client.get("/api/limits").status_code == 401

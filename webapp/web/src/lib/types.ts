@@ -351,3 +351,13 @@ export interface ActivityPayload {
   accounts: string[];
   available: boolean;
 }
+
+
+/** Risk limits, resolved per account. Enforced in the API — the pad shows them
+ *  so a refusal is not the first anyone hears of a limit. */
+export interface LimitsPayload {
+  limits: Record<string, Record<string, string>>;
+  defaults: Record<string, string>;
+  rules: Record<string, string>;
+  available: boolean;
+}

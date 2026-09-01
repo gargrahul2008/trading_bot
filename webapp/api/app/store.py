@@ -23,6 +23,7 @@ try:
     from webapp.history.importer import realised_total
     from webapp.pnl import charges as charges_mod
     from webapp.pnl import portfolio as portfolio_mod
+    from webapp.pnl import rms as rms_mod
     from webapp.history import symbols as symbols_mod
     from webapp.pnl.realised import by_scrip as realised_by_scrip
     from webapp.pnl.service import matches as matched_trades
@@ -32,6 +33,7 @@ except Exception as exc:  # pragma: no cover - only if the tree is broken
     Reader = None  # type: ignore
     realised_total = None  # type: ignore
     portfolio_mod = None  # type: ignore
+    rms_mod = None  # type: ignore
     charges_mod = None  # type: ignore
     matched_trades = None  # type: ignore
     realised_by_scrip = None  # type: ignore
@@ -158,6 +160,21 @@ def store_trades(account: Optional[str] = None, day: Optional[str] = None,
     except Exception as exc:
         LOG.warning("trade read failed: %s", exc)
         return empty
+    finally:
+        reader.conn.close()
+
+
+def store_limits() -> List[Dict[str, Any]]:
+    """Every risk limit row, defaults included. Empty means the built-ins."""
+    reader = _reader()
+    if reader is None:
+        return []
+    try:
+        return [dict(r) for r in reader.conn.execute(
+            "SELECT account, name, value FROM rms_limits")]
+    except Exception as exc:
+        LOG.debug("rms limits unavailable: %s", exc)
+        return []
     finally:
         reader.conn.close()
 

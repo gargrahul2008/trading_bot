@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { Card, ErrorNote, Loading, PageHeader, Stat } from "../components/ui";
 import { AccountStatus, Chip } from "../components/StatusChip";
+import { RiskLimits } from "../components/RiskLimits";
 import { api } from "../lib/api";
 import { age, count, money, plural, pnlClass, signed } from "../lib/format";
 import { Money, usePrivacy } from "../lib/privacy";
@@ -249,6 +250,8 @@ export function OverviewPage() {
           </tbody>
         </table>
       </Card>
+
+      <RiskLimits accounts={accounts.map((row) => row.account)} />
 
       <p className="mt-3 text-xs text-[var(--ink-muted)]">
         Realised today is the broker's own day figure, marked from the previous close. A

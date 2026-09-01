@@ -22,7 +22,7 @@ import os
 import sqlite3
 from typing import Optional
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 DEFAULT_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "dashboard.db"
@@ -224,6 +224,20 @@ CREATE TABLE IF NOT EXISTS symbols (
 );
 CREATE INDEX IF NOT EXISTS ix_symbols_short ON symbols (short_name);
 
+-- Risk limits, per account, with '*' as the default for all of them.
+--
+-- Stored rather than configured in a file because they are read on the path of
+-- every order and changed from the dashboard. A missing row means the built-in
+-- default; a row of 0 means the rule is deliberately off, which is not the same
+-- thing and must not look the same.
+CREATE TABLE IF NOT EXISTS rms_limits (
+    account  TEXT NOT NULL,          -- an account name, or '*' for the default
+    name     TEXT NOT NULL,
+    value    TEXT NOT NULL,
+    at       REAL NOT NULL,
+    PRIMARY KEY (account, name)
+);
+
 -- Holdings that are not really holdings.
 --
 -- A scrip that cannot be sold — suspended, delisted, written off — still sits
@@ -280,7 +294,7 @@ CREATE TABLE IF NOT EXISTS audit (
     account   TEXT NOT NULL,
     summary   TEXT NOT NULL,       -- human-readable, e.g. "BUY 140 NSE:RELIANCE-EQ MTF @1465"
     detail    TEXT,                -- the request, as JSON
-    result    TEXT NOT NULL,       -- pending | ok | error
+    result    TEXT NOT NULL,       -- pending | ok | error | refused
     message   TEXT,
     finished_at REAL
 );
