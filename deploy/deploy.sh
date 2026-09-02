@@ -132,25 +132,61 @@ done
 [ "$units_changed" = "1" ] && run systemctl daemon-reload
 [ "$units_changed" = "1" ] || say "installed units already match"
 
-# ── 4. restart what changed ──────────────────────────────────────────────────
-step "Agents"
-if [ -z "$changed" ] && [ "$agents_changed" = "0" ]; then
-  say "nothing the agents run has changed — leaving them alone"
+# ── 4. build the UI ──────────────────────────────────────────────────────────
+#
+# webapp/web/dist is not in git, so a pull never updates it. Without this the
+# API restarts happily and keeps serving the bundle built last time — the deploy
+# reports success and the browser shows the old dashboard, which is the worst
+# combination of the two.
+step "Dashboard UI"
+if [ ! -d webapp/web ]; then
+  say "no webapp/web — nothing to build"
+elif [ -d webapp/web/dist ] && [ -z "$changed" ] && ! touches '^webapp/web/'; then
+  say "no change under webapp/web/ — keeping the built bundle"
+elif ! command -v npm >/dev/null 2>&1; then
+  warn "npm not found — the dashboard will serve whatever was built last"
 else
-  if touches '^webapp/' || [ "$agents_changed" = "1" ]; then
-    units="$(ls deploy/systemd/generated/agent-*.service 2>/dev/null \
-             | xargs -n1 basename | sed 's/\.service$//' | tr '\n' ' ')"
-    did "restarting: $units"
-    run systemctl restart $units
-    if systemctl is-enabled dashboard.service >/dev/null 2>&1; then
-      did "restarting: dashboard"
-      run systemctl restart dashboard
-    elif [ "$dashboard_changed" = "1" ]; then
-      warn "dashboard.service installed but not enabled — systemctl enable --now dashboard"
-    fi
-  else
-    say "no change under webapp/ — agents left running"
+  # npm ci, not install: the lockfile is what was tested, and a deploy is not
+  # the place to discover a resolved dependency has moved.
+  run sh -c 'cd webapp/web && npm ci --silent && npm run build'
+  if [ "$APPLY" = "1" ] && [ ! -f webapp/web/dist/index.html ]; then
+    die "the UI build produced no dist/index.html — not restarting onto a broken bundle"
   fi
+  did "built webapp/web/dist"
+fi
+
+# ── 5. restart what changed ──────────────────────────────────────────────────
+step "Agents"
+# An agent restart drops a poll and reloads a token, so it is worth doing only
+# for code an agent actually runs. Everything under webapp/web/ is served by the
+# dashboard and never imported by an agent — restarting them for a changed
+# button is a cost paid for nothing, and during market hours it is a real one.
+agent_code="$(printf '%s' "$changed" | grep '^webapp/' | grep -v '^webapp/web/' | grep -v '^webapp/api/')"
+if [ -n "$agent_code" ] || [ "$agents_changed" = "1" ]; then
+  units="$(ls deploy/systemd/generated/agent-*.service 2>/dev/null \
+           | xargs -n1 basename | sed 's/\.service$//' | tr '\n' ' ')"
+  did "restarting: $units"
+  run systemctl restart $units
+elif [ -n "$changed" ]; then
+  say "nothing an agent imports has changed — leaving them polling"
+else
+  say "nothing new — leaving them polling"
+fi
+
+step "Dashboard"
+# The dashboard serves both the API and the built bundle, so any change under
+# webapp/ is a reason to restart it — including one only the UI cares about.
+if ! systemctl is-enabled dashboard.service >/dev/null 2>&1; then
+  if [ "$dashboard_changed" = "1" ]; then
+    warn "dashboard.service installed but not enabled — systemctl enable --now dashboard"
+  else
+    say "dashboard.service not enabled — see docs/dashboard_https.md"
+  fi
+elif touches '^webapp/' || [ "$units_changed" = "1" ]; then
+  did "restarting: dashboard"
+  run systemctl restart dashboard
+else
+  say "no change under webapp/ — dashboard left running"
 fi
 
 if touches '^deploy/cron/'; then
@@ -159,7 +195,7 @@ if touches '^deploy/cron/'; then
   say "deploy/cron/ changed — cron picks these up on its next run, no restart needed"
 fi
 
-# ── 5. verify ────────────────────────────────────────────────────────────────
+# ── 6. verify ────────────────────────────────────────────────────────────────
 step "Preflight"
 if [ "$APPLY" = "1" ]; then
   sleep 3    # let the agents finish their first poll before asking about them
