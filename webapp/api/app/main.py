@@ -33,6 +33,7 @@ from app.auth import (
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     store_exclusions,
+    store_entry_times,
     store_limits,
     rms_mod,
     trading_day,
@@ -357,6 +358,10 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
     client = AgentClient()
     names = known_accounts()
     books = {result.account: result for result in client.fan_out("/book", names)}
+    # When each position was entered. The broker does not say, and without it
+    # any "recent" ordering has to fall back on something that moves — which is
+    # how the pad's list came to reshuffle itself on every tick.
+    entered = store_entry_times()
 
     rows: List[Dict[str, Any]] = []
     missing: List[str] = []
@@ -400,6 +405,11 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
             rows.append(dict(_holding_as_position(holding), account=name,
                              from_store=from_store, age_s=holdings.get("age_s"),
                              stale=bool(holdings.get("stale"))))
+
+    for row in rows:
+        when = entered.get((row["account"], row.get("symbol", ""))) or {}
+        row["opened_day"] = when.get("opened_day")
+        row["opened_at"] = when.get("opened_at")
 
     # Biggest mover first — the row you would act on is the one furthest from
     # where you wanted it, in either direction.

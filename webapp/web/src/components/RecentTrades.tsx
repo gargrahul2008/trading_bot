@@ -16,8 +16,17 @@ import type { PositionsPayload, Trade, TradesPayload } from "../lib/types";
  *  Every line carries both the money and the percentage. An amount alone cannot
  *  be judged — ₹12,000 up is a good day on ₹2 lakh and noise on ₹40 lakh — and
  *  a percentage alone hides the size of the bet.
+ *
+ *  Ordered by when the trade happened, never by its P&L. Sorting by size looks
+ *  reasonable and is unusable: unrealised P&L moves on every tick, so the rows
+ *  reshuffled themselves while being read. A row only moves here when something
+ *  is actually opened or closed.
+ *
+ *  Every open position is listed, always. They are what is held, and dropping
+ *  one to make room for a closed trade would hide live money. Only the closed
+ *  tail is capped.
  */
-const LIMIT = 20;
+const CLOSED_SHOWN = 20;
 
 interface Line {
   key: string;
@@ -36,6 +45,10 @@ interface Line {
    *  net means the day's charges are not in yet. */
   estimated?: boolean;
   when: string;
+  /** What the list is ordered by: entry day for an open line, exit day for a
+   *  closed one. Empty sorts last, which is where a position the store never
+   *  saw opened belongs — it predates the history. */
+  at: string;
 }
 
 function closedLine(trade: Trade): Line {
@@ -47,6 +60,7 @@ function closedLine(trade: Trade): Line {
   const pnl = net ?? num(trade.gross);
   const cost = Math.abs(quantity) * entry;
   return {
+    at: `${trade.closed_day} ${trade.closed_at ?? ""}`,
     key: `c-${trade.account}-${trade.symbol}-${trade.closed_at ?? trade.closed_day}-${trade.entry_price}`,
     account: trade.account,
     symbol: trade.symbol,
@@ -74,13 +88,12 @@ export function RecentTrades({ onPick }: { onPick?: (account: string, symbol: st
     refetchInterval: 30_000,
   });
 
-  // Open first: those are live money, and the closed ones are history however
-  // recent. Within each group, most recent first.
   const open: Line[] = (positions.data?.positions ?? [])
     .filter((p) => p.net_qty !== 0 && !p.delivery_sale)
     .map((p) => {
       const cost = Math.abs(p.net_qty) * (p.avg_price || p.ltp || 0);
       return {
+        at: `${p.opened_day ?? ""} ${p.opened_at ?? ""}`.trim(),
         key: `o-${p.account}-${p.symbol}-${p.product_type}`,
         account: p.account,
         symbol: p.symbol,
@@ -91,13 +104,21 @@ export function RecentTrades({ onPick }: { onPick?: (account: string, symbol: st
         pnl: p.unrealised,
         pct: cost ? (p.unrealised / cost) * 100 : null,
         open: true,
-        when: p.opened_today ? "today" : p.carried ? "carried" : "",
+        when: p.opened_day ?? (p.carried ? "carried" : ""),
       };
-    })
-    .sort((a, b) => Math.abs(b.pnl ?? 0) - Math.abs(a.pnl ?? 0));
+    });
 
-  const closed: Line[] = (trades.data?.trades ?? []).map(closedLine);
-  const lines = [...open, ...closed].slice(0, LIMIT);
+  // Newest first, and stable: the tie-break is the row's own key, so two
+  // trades closed in the same second keep their order between refreshes rather
+  // than swapping places on whichever arrived first.
+  const byTime = (a: Line, b: Line) =>
+    b.at.localeCompare(a.at) || a.key.localeCompare(b.key);
+
+  const closed: Line[] = (trades.data?.trades ?? [])
+    .map(closedLine)
+    .sort(byTime)
+    .slice(0, CLOSED_SHOWN);
+  const lines = [...open, ...closed].sort(byTime);
 
   return (
     <Card className="mt-4 overflow-x-auto">
@@ -107,7 +128,7 @@ export function RecentTrades({ onPick }: { onPick?: (account: string, symbol: st
       >
         <span className="text-sm font-semibold">Recent</span>
         <span className="text-xs text-[var(--ink-muted)]">
-          {open.length} open, then the latest closed — {lines.length} shown
+          every open position, and the {CLOSED_SHOWN} most recent closes — newest first
         </span>
       </div>
 

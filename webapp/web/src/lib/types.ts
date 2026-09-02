@@ -178,6 +178,11 @@ export interface Position {
   is_derivative?: boolean;
   carried?: boolean;
   opened_today?: boolean;
+  /** When this position was entered — the oldest still-open parcel, matched
+   *  from the fill history. The broker does not report it. Null where the
+   *  store never saw the position opened. */
+  opened_day?: string | null;
+  opened_at?: string | null;
   from_store: boolean;
   stale: boolean;
   age_s: number | null;

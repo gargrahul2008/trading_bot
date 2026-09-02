@@ -27,6 +27,7 @@ try:
     from webapp.history import symbols as symbols_mod
     from webapp.pnl.realised import by_scrip as realised_by_scrip
     from webapp.pnl.service import matches as matched_trades
+    from webapp.pnl.service import open_lots_by_position
     from webapp.store.reader import Reader
     from webapp.store.writer import trading_day
     from webapp.store.schema import connect
@@ -38,6 +39,7 @@ except Exception as exc:  # pragma: no cover - only if the tree is broken
     rms_mod = None  # type: ignore
     charges_mod = None  # type: ignore
     matched_trades = None  # type: ignore
+    open_lots_by_position = None  # type: ignore
     realised_by_scrip = None  # type: ignore
     symbols_mod = None  # type: ignore
     LOG.warning("store unavailable: %s", exc)
@@ -162,6 +164,31 @@ def store_trades(account: Optional[str] = None, day: Optional[str] = None,
     except Exception as exc:
         LOG.warning("trade read failed: %s", exc)
         return empty
+    finally:
+        reader.conn.close()
+
+
+def store_entry_times(account: Optional[str] = None) -> Dict[tuple, Dict[str, Any]]:
+    """When each open position was actually entered, keyed (account, symbol).
+
+    The broker's own view has no such field — a position is simply there — so a
+    list of "recent trades" had nothing stable to order by and fell back to
+    sorting by P&L, which changes on every tick and reshuffles the rows as you
+    read them.
+
+    Derived from the oldest open parcel in the FIFO book, so adding to a
+    position does not make it look new. Positions the store never saw opened —
+    holdings that predate its fill history — are simply absent, and the caller
+    puts them last, which is where they belong.
+    """
+    reader = _reader()
+    if reader is None or open_lots_by_position is None:
+        return {}
+    try:
+        return open_lots_by_position(reader.conn, account)
+    except Exception as exc:
+        LOG.warning("entry times unavailable: %s", exc)
+        return {}
     finally:
         reader.conn.close()
 

@@ -91,6 +91,29 @@ def report(conn: sqlite3.Connection, account: Optional[str] = None,
     }
 
 
+def open_lots_by_position(conn: sqlite3.Connection,
+                          account: Optional[str] = None) -> Dict[tuple, Dict[str, Any]]:
+    """What is still open, keyed (account, symbol), with when it was entered.
+
+    Keyed without the product type on purpose: the caller is joining this onto
+    the broker's positions and holdings, which are separate books for the same
+    scrip. The oldest parcel wins, so a name held in both is dated from whenever
+    it was first bought.
+    """
+    _, books = match_fills(_fills(conn, account))
+    out: Dict[tuple, Dict[str, Any]] = {}
+    for (acct, symbol, _product), lots in books.items():
+        if not lots or open_position(lots)["qty"] == 0:
+            continue
+        oldest = min(lots, key=lambda lot: (lot.day, lot.at or "", lot.trade_id))
+        key = (acct, symbol)
+        previous = out.get(key)
+        if previous is None or (oldest.day, oldest.at or "") < (previous["opened_day"],
+                                                               previous["opened_at"] or ""):
+            out[key] = {"opened_day": oldest.day, "opened_at": oldest.at}
+    return out
+
+
 def days_available(conn: sqlite3.Connection, account: Optional[str] = None) -> List[str]:
     sql = "SELECT DISTINCT trading_day FROM fills"
     params: List[Any] = []
