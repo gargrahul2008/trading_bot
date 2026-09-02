@@ -35,6 +35,11 @@ REPO = Path(__file__).resolve().parents[1]
 ACCOUNTS = REPO / "accounts"
 OUT = REPO / "deploy" / "systemd" / "generated"
 
+#: Which accounts may place orders. One account name per line, or the single
+#: word "all". Absent means every agent is read-only, which is the right default
+#: for a fresh clone.
+TRADING_FILE = REPO / "deploy" / "trading_enabled"
+
 # Where the repo and its virtualenv live on the CONTROL HOST (64.227.135.117).
 # These are the real values, not placeholders, so regenerating on the host
 # produces no diff — and the units committed here are the ones that actually
@@ -152,11 +157,37 @@ WantedBy=multi-user.target
 """
 
 
+def trading_accounts() -> object:
+    """Which accounts may place orders: a set of names, or "all".
+
+    Read from a file rather than only from the environment, because arming has
+    to survive the next deploy. An environment variable lives for one shell
+    invocation: a later deploy run without it would regenerate every unit
+    read-only and restart the agents, turning trading off minutes after it was
+    turned on and saying nothing about it.
+
+    Per account, not all-or-nothing, so the account being traded by hand can be
+    armed while the ones running bots stay read-only.
+    """
+    raw = os.environ.get("ALLOW_TRADING", "").strip()
+    if not raw and TRADING_FILE.exists():
+        raw = " ".join(
+            line.split("#")[0].strip()
+            for line in TRADING_FILE.read_text(encoding="utf-8").splitlines()
+        ).strip()
+    if not raw:
+        return set()
+    names = {part.strip() for part in raw.replace(",", " ").split() if part.strip()}
+    if names & {"1", "true", "yes", "all"}:
+        return "all"
+    return names
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
-    # Trading routes are opt-in: without ALLOW_TRADING=1 the generated agents are
-    # read-only and cannot place an order however they are called.
-    allow_trading = os.environ.get("ALLOW_TRADING", "").strip() in ("1", "true", "yes")
+    # Trading routes are opt-in: an agent generated without its account named
+    # here is read-only and cannot place an order however it is called.
+    armed = trading_accounts()
     emit_auth = os.environ.get("EMIT_AUTH_UNITS", "").strip() in ("1", "true", "yes")
     ports = load_agent_ports()
     known = dict(ports)
@@ -172,6 +203,7 @@ def main() -> None:
         user = user_dir.name
         # one dashboard agent per user, on its own stable loopback port
         port = assign_agent_port(ports, user)
+        allow_trading = armed == "all" or user in armed
         (OUT / f"agent-{user}.service").write_text(
             AGENT_UNIT.format(
                 user=user, install=INSTALL_DIR, python=PYTHON, port=port,
@@ -191,6 +223,15 @@ def main() -> None:
                 BOT_UNIT.format(user=user, strat=strat, install=INSTALL_DIR, python=PYTHON)
             )
             print(f"  bot-{user}-{strat}.service (started by cron, not enable-able)")
+
+    if armed:
+        who = "every account" if armed == "all" else ", ".join(sorted(armed))
+        print(f"\n  *** TRADING ENABLED for {who} — these agents can place real orders.")
+        print(f"  Source: {'ALLOW_TRADING in the environment' if os.environ.get('ALLOW_TRADING') else TRADING_FILE}")
+        unknown = set() if armed == "all" else armed - set(ports)
+        if unknown:
+            print(f"  WARNING: {', '.join(sorted(unknown))} named but not an account here"
+                  " — check the spelling, nothing was armed for it.")
 
     if not emit_auth:
         print("\n  fyers-auth-*.service not emitted: deploy/cron/refresh_tokens.sh"

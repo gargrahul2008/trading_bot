@@ -87,3 +87,4 @@ webapp/web/tsconfig.tsbuildinfo
 
 # dashboard store (written by the agents)
 webapp/data/
+deploy/trading_enabled

@@ -241,6 +241,16 @@ fi
 "$REPO/deploy/preflight.sh"
 status=$?
 
+step "Trading"
+# Arming is the one deploy-time decision that can lose money, so it is stated
+# on every run rather than left to be inferred from a unit file.
+if [ -s deploy/trading_enabled ]; then
+  warn "TRADING ENABLED for: $(tr '\n' ' ' < deploy/trading_enabled | sed 's/ *$//')"
+  say "these agents can place real orders — deploy/trading_enabled is what says so"
+else
+  say "every agent is read-only (no deploy/trading_enabled)"
+fi
+
 step "Store"
 "$PY" -m webapp.store.status || true
 
