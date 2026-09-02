@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { Card, ErrorNote, Loading, PageHeader } from "../components/ui";
+import { RecentTrades } from "../components/RecentTrades";
 import { SymbolInput } from "../components/SymbolInput";
 import type { SymbolMatch } from "../components/SymbolInput";
 import { api, ApiError } from "../lib/api";
@@ -133,6 +134,21 @@ export function OrderPadPage() {
     },
     onError: () => void queryClient.invalidateQueries({ queryKey: ["audit"] }),
   });
+
+  // A symbol can arrive without passing through the dropdown — picked from the
+  // Recent list, or pasted whole. Its tick has to be looked up anyway, or
+  // toTick is handed a tick of zero and the price goes to the exchange
+  // unrounded, which it rejects.
+  const lookup = useQuery({
+    queryKey: ["symbol", symbol],
+    queryFn: () => api.get<SymbolMatch>(`/symbols/${encodeURIComponent(symbol)}`),
+    enabled: settled && instrument?.symbol !== symbol,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  useEffect(() => {
+    if (lookup.data && lookup.data.symbol === symbol) setInstrument(lookup.data);
+  }, [lookup.data, symbol]);
 
   const limits = useQuery({
     queryKey: ["limits"],
@@ -576,6 +592,16 @@ export function OrderPadPage() {
           </ul>
         </Card>
       </div>
+
+      {/* Clicking a line loads its account and symbol into the pad — adding to a
+          position or closing one is the commonest reason to open this page. */}
+      <RecentTrades
+        onPick={(pickedAccount, pickedSymbol) => {
+          setAccount(pickedAccount);
+          setSymbol(pickedSymbol);
+          setDone(null);
+        }}
+      />
 
       <p className="mt-3 text-xs text-[var(--ink-muted)]">
         BUY and SELL place immediately — there is no second confirmation, so the line above

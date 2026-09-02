@@ -52,11 +52,10 @@ def client(store, monkeypatch):
     agent = serve_json({
         "/orders": {"data": [
             order("LIVE-1", "NSE:RELIANCE-EQ", source="bot", run="rahul/reliance",
-                  matched_by="order_id", channel="api", trading_day="2026-08-28"),
+                  matched_by="order_id", channel="api"),
             order("LIVE-2", "NSE:OFSS-EQ", status="REJECTED", is_open=False,
                   message="You are not allowed to trade in this market (16387)",
-                  source="manual", channel="web", order_tag="2:Charts",
-                  trading_day="2026-08-28"),
+                  source="manual", channel="web", order_tag="2:Charts"),
         ], "age_s": 2.0, "stale": False},
         "/health": health(),
     })
@@ -125,3 +124,16 @@ def test_it_needs_a_session(client):
     from app.main import app
 
     assert TestClient(app).get("/api/orders").status_code == 401
+
+
+def test_a_live_order_carries_todays_date(client):
+    """The agent normalises an order without a trading day — it only ever sees
+    today's book. That left the Day column blank on every live row, so "today"
+    had to be inferred from an empty cell."""
+    import datetime as dt
+
+    live = [o for o in client.get("/api/orders").json()["orders"] if o["live"]]
+
+    assert live, "this fixture must have live orders for the test to mean anything"
+    today = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5, minutes=30)).date()
+    assert all(o["trading_day"] == today.isoformat() for o in live)

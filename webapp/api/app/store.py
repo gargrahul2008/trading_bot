@@ -28,9 +28,11 @@ try:
     from webapp.pnl.realised import by_scrip as realised_by_scrip
     from webapp.pnl.service import matches as matched_trades
     from webapp.store.reader import Reader
+    from webapp.store.writer import trading_day
     from webapp.store.schema import connect
 except Exception as exc:  # pragma: no cover - only if the tree is broken
     Reader = None  # type: ignore
+    trading_day = None  # type: ignore
     realised_total = None  # type: ignore
     portfolio_mod = None  # type: ignore
     rms_mod = None  # type: ignore
@@ -203,91 +205,6 @@ def store_exclusions(account: Optional[str] = None) -> Dict[str, Any]:
         return {}
     finally:
         reader.conn.close()
-
-
-def store_activity(account: Optional[str] = None, day: Optional[str] = None,
-                   limit: int = 200) -> Dict[str, Any]:
-    """What actually happened, newest first — one stream, all accounts.
-
-    Two kinds of thing move without anyone watching: an order changes status,
-    and a position closes. The first is recorded as it happens; the second is
-    derived, because a close is not an event the broker reports — it is the
-    absence of a position that was there before. Both belong in one list, or
-    you are still reading two pages to answer "what changed?".
-    """
-    empty = {"events": [], "available": False}
-    reader = _reader()
-    if reader is None:
-        return empty
-    try:
-        sql = "SELECT * FROM order_events WHERE 1=1"
-        params: List[Any] = []
-        if account:
-            sql += " AND account = ?"
-            params.append(account)
-        if day:
-            sql += " AND trading_day = ?"
-            params.append(day)
-        sql += " ORDER BY at DESC LIMIT ?"
-        params.append(limit)
-
-        events = []
-        for row in reader.conn.execute(sql, params):
-            # `event` is claimed before the reject classifier runs: it also
-            # writes a `kind`, and letting it land first replaced every event
-            # name with the reject taxonomy's.
-            row = dict(row)
-            row["event"] = row.pop("kind")
-            row.update(classify_reject(row.get("message")))
-            events.append(row)
-    except Exception as exc:
-        # A missing table means an agent has not written since the migration,
-        # not a broken page: closures below still stand on their own.
-        LOG.warning("activity read failed: %s", exc)
-        events = []
-    finally:
-        reader.conn.close()
-
-    # A matched round trip names its figures gross/net; the stream calls them
-    # pnl/net_pnl so a close reads the same way as everything beside it. Money
-    # stays a decimal string, as everywhere else — the browser must not round it.
-    for trade in store_trades(account, day, limit).get("trades", []):
-        events.append({
-            "at": trade.get("closed_at"), "account": trade.get("account"),
-            "symbol": trade.get("symbol"), "side": trade.get("direction"),
-            "event": "closed", "qty": trade.get("qty"),
-            "price": trade.get("exit_price"), "entry_price": trade.get("entry_price"),
-            "pnl": trade.get("gross"), "net_pnl": trade.get("net"),
-            "charges": trade.get("charges"),
-            "product_type": trade.get("product_type"),
-            "trading_day": trade.get("closed_day"),
-            "order_id": trade.get("exit_order_id"),
-        })
-
-    events.sort(key=lambda e: _when(e), reverse=True)
-    return {"events": events[:limit], "available": True}
-
-
-def _when(event: Dict[str, Any]) -> float:
-    """Seconds since the epoch, however the source spelled its timestamp.
-
-    Order events carry a float; a matched trade carries whatever the broker's
-    fill did, which may be a string. An unparseable time sorts oldest rather
-    than raising — a badly stamped row is still worth showing.
-    """
-    at = event.get("at")
-    if isinstance(at, (int, float)):
-        return float(at)
-    for text in (at, event.get("trading_day")):
-        if not isinstance(text, str) or not text:
-            continue
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-            try:
-                return datetime.strptime(text[:len(datetime.now().strftime(fmt))],
-                                         fmt).timestamp()
-            except ValueError:
-                continue
-    return 0.0
 
 
 def store_realised_scrips(account: Optional[str] = None,

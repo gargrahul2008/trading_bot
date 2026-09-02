@@ -204,6 +204,8 @@ export interface Trade {
   exit_price: string;
   opened_day: string;
   closed_day: string;
+  opened_at?: string | null;
+  closed_at?: string | null;
   product_type: string;
   gross: string;
   /** null when the day's charges are unknown — never a confident zero. */
@@ -314,44 +316,6 @@ export interface AuditEntry {
   result: string;
   message: string | null;
 }
-
-/** One thing that happened: an order changing state, or a position closing.
- *  The stream is heterogeneous by design — the point is to read it in one
- *  pass, not to switch pages to learn what became of a trade. */
-export interface ActivityEvent {
-  at: number | string | null;
-  account: string;
-  symbol: string;
-  side: string;
-  event: "placed" | "partial" | "filled" | "cancelled" | "rejected" | "changed" | "closed";
-  order_id?: string | null;
-  qty?: number | string | null;
-  filled_qty?: number | null;
-  /** Money on a close arrives as a decimal string, computed exactly. */
-  price?: number | string | null;
-  entry_price?: number | string | null;
-  from_status?: string | null;
-  to_status?: string | null;
-  /** Present on a close only, and null when the day's charges are not in —
-   *  an unknown cost is not a zero one. */
-  net_pnl?: string | null;
-  /** Gross, before charges. Shown when the net cannot be computed. */
-  pnl?: string | null;
-  charges?: string | null;
-  source?: string | null;
-  run?: string | null;
-  message?: string | null;
-  kind?: string | null;
-  reason?: string | null;
-  trading_day: string;
-}
-
-export interface ActivityPayload {
-  events: ActivityEvent[];
-  accounts: string[];
-  available: boolean;
-}
-
 
 /** Risk limits, resolved per account. Enforced in the API — the pad shows them
  *  so a refusal is not the first anyone hears of a limit. */

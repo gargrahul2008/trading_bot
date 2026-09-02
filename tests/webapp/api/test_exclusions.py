@@ -1,8 +1,7 @@
-"""The Activity stream and the set-aside list.
+"""Setting a scrip aside.
 
-Both exist for the same complaint: things change without anyone seeing. An
-order's status is overwritten in place, and a holding nobody can sell quietly
-distorts every ratio measured against deployed capital.
+A holding nobody can sell still sits in the broker's book at cost, distorting
+every ratio measured against deployed capital — and doing it silently.
 """
 import sys
 from pathlib import Path
@@ -83,56 +82,6 @@ def client(store, monkeypatch):
     yield test_client
     agent.shutdown()
     agent.server_close()
-
-
-# ── the stream ──────────────────────────────────────────────────────────────
-
-def test_a_fill_is_still_there_after_the_order_moved_on(client):
-    """The order row now says FILLED and nothing else. Without the event log
-    there is no record that it was ever working, or when it filled."""
-    events = client.get("/api/activity").json()["events"]
-    kinds = [(e["order_id"], e["event"]) for e in events]
-
-    assert ("1", "placed") in kinds
-    assert ("1", "filled") in kinds
-
-
-def test_a_close_carries_what_the_broker_does_not_report(client):
-    """A close is not an event the broker sends — it is the absence of a
-    position. Derived here, it can say what the entry was and what was made."""
-    closed = [e for e in client.get("/api/activity").json()["events"]
-              if e["event"] == "closed"]
-
-    assert len(closed) == 1
-    assert closed[0]["symbol"] == "NSE:RELIANCE-EQ"
-    assert float(closed[0]["entry_price"]) == 1300.0
-    assert float(closed[0]["price"]) == 1320.0
-    assert float(closed[0]["pnl"]) == 2000.0
-    assert closed[0]["net_pnl"] is None, (
-        "no charge data for the day, and an unknown cost is not a zero one")
-
-
-def test_a_reject_names_its_cause(client):
-    """The one event worth acting on immediately."""
-    rejected = [e for e in client.get("/api/activity").json()["events"]
-                if e["event"] == "rejected" or e.get("to_status") == "REJECTED"]
-
-    assert rejected, "a rejected order must appear in the stream"
-    assert rejected[0]["kind"] == "MARGIN_SHORTFALL"
-    assert rejected[0]["run"] == "rahul/reliance"
-
-
-def test_the_stream_is_newest_first(client):
-    """It is read from the top, once, to answer 'what changed?'"""
-    events = client.get("/api/activity").json()["events"]
-    times = [e["at"] for e in events if isinstance(e["at"], (int, float))]
-
-    assert times == sorted(times, reverse=True)
-
-
-def test_activity_requires_a_session(client):
-    client.post("/api/auth/logout")
-    assert client.get("/api/activity").status_code == 401
 
 
 # ── setting a scrip aside ───────────────────────────────────────────────────

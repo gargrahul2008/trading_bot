@@ -32,10 +32,10 @@ from app.auth import (
 )
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
-    store_activity,
     store_exclusions,
     store_limits,
     rms_mod,
+    trading_day,
     portfolio_mod, store_book, store_capital, store_counts, store_realised,
     classify_reject, lookup_symbol, search_symbols, store_orders,
     store_realised_scrips, store_status, store_symbols, store_trades,
@@ -671,7 +671,13 @@ def get_orders(account: Optional[str] = None, day: Optional[str] = None,
             for order in (section.get("data") or []):
                 if not isinstance(order, dict):
                     continue
+                # The agent normalises an order without a trading day — it only
+                # ever sees today's book, so it has no reason to carry one. The
+                # store stamps it on the way in, which left every live row with
+                # a blank Day column that had to be *inferred* to mean today.
                 row = dict(order, account=result.account, live=True)
+                if not row.get("trading_day") and trading_day is not None:
+                    row["trading_day"] = trading_day()
                 row.update(classify_reject(order.get("message")))
                 live[(result.account, str(order.get("order_id")))] = row
 
@@ -736,19 +742,6 @@ def drop_exclusion(account: str, symbol: str, _: str = Session) -> Dict[str, Any
     finally:
         conn.close()
     return {"ok": True, "account": account, "symbol": symbol}
-
-
-@app.get("/api/activity")
-def get_activity(account: Optional[str] = None, day: Optional[str] = None,
-                 limit: int = 200, _: str = Session) -> Dict[str, Any]:
-    """Everything that changed, newest first, across every account.
-
-    The answer to "what happened while I was not looking" — fills, rejects,
-    cancellations and closes in one stream rather than spread over three pages.
-    """
-    payload = store_activity(account, day, limit)
-    payload["accounts"] = [account] if account else known_accounts()
-    return payload
 
 
 @app.get("/api/realised")

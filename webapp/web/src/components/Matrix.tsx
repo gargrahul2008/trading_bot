@@ -29,6 +29,11 @@ export interface MatrixRow {
   /** account -> value. Missing means the account has no such row at all. */
   cells: Record<string, number | null | undefined>;
   total: number;
+  /** account -> the same figure as a percentage of what it was measured
+   *  against. An amount alone cannot be judged: ₹12,000 up is a good day on
+   *  ₹2 lakh and a rounding error on ₹40 lakh. */
+  percents?: Record<string, number | null | undefined>;
+  totalPercent?: number | null;
   title?: string;
 }
 
@@ -172,12 +177,18 @@ export function Matrix({
                     </td>
                   );
                 }
+                const pct = row.percents?.[account];
                 return (
                   <td
                     key={account}
                     className={`tnum px-3 py-1.5 text-right ${pnlClass(value)}`}
                   >
                     {mask(signed(value))}
+                    {pct !== null && pct !== undefined && (
+                      <span className="ml-1 text-xs opacity-70">
+                        ({fmt(pct, true)})
+                      </span>
+                    )}
                   </td>
                 );
               })}
@@ -186,6 +197,11 @@ export function Matrix({
                 style={{ borderColor: "var(--border)" }}
               >
                 {mask(signed(row.total))}
+                {row.totalPercent !== null && row.totalPercent !== undefined && (
+                  <span className="ml-1 text-xs font-normal opacity-70">
+                    ({fmt(row.totalPercent, true)})
+                  </span>
+                )}
               </td>
             </tr>
           ))}

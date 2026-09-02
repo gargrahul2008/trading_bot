@@ -78,6 +78,12 @@ function Row({ position, onSetAside, aside }: {
         <strong>
           <Money>{signed(position.unrealised)}</Money>
         </strong>
+        {move !== null && (
+          <span className="ml-1 text-xs opacity-70">
+            ({move > 0 ? "+" : move < 0 ? "−" : ""}
+            {Math.abs(move).toFixed(2)}%)
+          </span>
+        )}
       </Td>
       <Td muted>{position.stale ? age(position.age_s) : ""}</Td>
       <Td align="right">
@@ -113,9 +119,21 @@ function toMatrix(positions: Position[], accounts: string[]) {
   const rows: MatrixRow[] = [];
   for (const [symbol, held] of bySymbol) {
     const cells: Record<string, number | null | undefined> = {};
+    // Measured against what the account paid for that symbol, not against the
+    // whole book: the question a percentage answers here is "how is this
+    // position doing", and cost is what it is doing it against.
+    const paid: Record<string, number> = {};
     for (const position of held) {
       cells[position.account] = (cells[position.account] ?? 0) + position.unrealised;
+      paid[position.account] =
+        (paid[position.account] ?? 0) +
+        Math.abs(position.net_qty) * (position.avg_price || position.ltp || 0);
     }
+    const percents: Record<string, number | null> = {};
+    for (const [name, value] of Object.entries(cells)) {
+      percents[name] = paid[name] ? ((value ?? 0) / paid[name]) * 100 : null;
+    }
+    const totalPaid = Object.values(paid).reduce((sum, n) => sum + n, 0);
     const first = held[0];
     rows.push({
       key: symbol,
@@ -128,7 +146,11 @@ function toMatrix(positions: Position[], accounts: string[]) {
             ? "holding"
             : undefined,
       cells,
+      percents,
       total: held.reduce((sum, p) => sum + p.unrealised, 0),
+      totalPercent: totalPaid
+        ? (held.reduce((sum, p) => sum + p.unrealised, 0) / totalPaid) * 100
+        : null,
       // Quantities differ per account, so they belong in the hover rather than
       // in a cell that has to hold one number.
       title: held
