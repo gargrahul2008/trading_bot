@@ -66,7 +66,16 @@ SEGMENT_CASH = 10
 SEGMENT_DERIVATIVES = 11
 
 ORDER_TYPES = ("MARKET", "LIMIT", "SL", "SL_M")
-PRODUCT_TYPES = ("CNC", "INTRADAY", "MARGIN", "MTF", "BO", "CO")
+#: BO and CO are gone: Fyers deprecated them as product types and answers
+#: "-55 BO and CO orders are deprecated. Please use stopLoss and takeProfit
+#: fields." An order still carries its own exit — through those fields on an
+#: ordinary order, not through a product type of its own.
+PRODUCT_TYPES = ("CNC", "INTRADAY", "MARGIN", "MTF")
+
+#: Products on which Fyers acts on an attached stopLoss/takeProfit. On a
+#: delivery order they are accepted and ignored, which is worse than refused:
+#: the order works and the protection silently does not exist.
+BRACKET_PRODUCTS = ("INTRADAY", "MARGIN")
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -378,16 +387,15 @@ def build_order_request(payload: Dict[str, Any]) -> PlaceOrderRequest:
     if order_type == "MARKET" and limit_price > 0:
         raise ValueError("a MARKET order takes no limit_price")
 
-    # Bracket and cover orders carry their exit with them, and the broker
-    # rejects them without it.
-    if product_type == "BO" and (stop_loss <= 0 or take_profit <= 0):
-        raise ValueError("a BO order needs both stop_loss and take_profit, in points")
-    if product_type == "CO" and stop_loss <= 0:
-        raise ValueError("a CO order needs stop_loss, in points")
-    if product_type not in ("BO", "CO") and (stop_loss > 0 or take_profit > 0):
+    # An attached exit rides on the order's stopLoss/takeProfit fields now that
+    # BO and CO are deprecated. Refused rather than dropped where the broker
+    # would ignore them: an order that works while its stop quietly does not
+    # exist is the worst of the available outcomes.
+    if (stop_loss > 0 or take_profit > 0) and product_type not in BRACKET_PRODUCTS:
         raise ValueError(
-            "stop_loss and take_profit apply to BO and CO orders only — "
-            "on a %s order they would be silently ignored" % product_type
+            "an attached stop-loss or target works on %s orders — on a %s order "
+            "Fyers ignores it, leaving the position unprotected"
+            % (" and ".join(BRACKET_PRODUCTS), product_type)
         )
 
     # These are distances from the entry, not prices. Someone typing 1465 into

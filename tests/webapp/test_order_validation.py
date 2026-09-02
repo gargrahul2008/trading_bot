@@ -57,33 +57,48 @@ def test_sl_m_is_accepted_however_it_is_written():
     assert build(order_type="sl-m", stop_price=1400).order_type == "SL_M"
 
 
-# ── bracket and cover legs ───────────────────────────────────────────────────
-def test_a_bracket_order_needs_both_legs():
-    order = build(order_type="LIMIT", limit_price=1465, product_type="BO",
+# ── an attached exit ─────────────────────────────────────────────────────────
+#
+# Fyers deprecated BO and CO as product types: an order carrying its own exit
+# now does it through stopLoss/takeProfit on an ordinary order. The pad sent
+# product_type=BO and every order came back "-55 BO and CO orders are
+# deprecated".
+
+
+def test_bo_and_co_are_no_longer_product_types():
+    """The broker refuses them outright, so refusing here costs a round trip
+    less and says why in a sentence."""
+    refuses("product_type must be one of", order_type="MARKET", product_type="BO")
+    refuses("product_type must be one of", order_type="MARKET", product_type="CO")
+
+
+def test_an_intraday_order_carries_its_own_stop_and_target():
+    order = build(order_type="LIMIT", limit_price=1465, product_type="INTRADAY",
                   stop_loss=10, take_profit=25)
     assert order.stop_loss == Decimal("10") and order.take_profit == Decimal("25")
-    refuses("needs both stop_loss and take_profit", order_type="LIMIT",
-            limit_price=1465, product_type="BO", stop_loss=10)
 
 
-def test_a_cover_order_needs_its_stop():
-    assert build(order_type="LIMIT", limit_price=1465, product_type="CO",
+def test_one_leg_alone_is_allowed():
+    """A stop without a target is a complete intention. Requiring both was a
+    rule of the bracket product, not of the exit itself."""
+    assert build(order_type="LIMIT", limit_price=1465, product_type="MARGIN",
                  stop_loss=10).stop_loss == Decimal("10")
-    refuses("CO order needs stop_loss", order_type="LIMIT", limit_price=1465,
-            product_type="CO")
 
 
-def test_legs_on_an_ordinary_order_are_refused_rather_than_dropped():
-    """The broker ignores them on a CNC order. Someone who typed a stop-loss
-    would believe they had one."""
-    refuses("BO and CO orders only", order_type="LIMIT", limit_price=1465, stop_loss=5)
+def test_legs_on_a_delivery_order_are_refused_rather_than_dropped():
+    """Fyers accepts them on CNC and acts on neither. An order that works while
+    its stop silently does not exist is worse than one that is refused."""
+    refuses("leaving the position unprotected", order_type="LIMIT",
+            limit_price=1465, product_type="CNC", stop_loss=5)
+    refuses("leaving the position unprotected", order_type="LIMIT",
+            limit_price=1465, product_type="MTF", take_profit=5)
 
 
 def test_a_leg_given_as_a_price_rather_than_points_is_caught():
     """Fyers reads these as POINTS from the entry. Typing 1465 meaning 'stop at
     1465' would place a stop 1,465 points away — which is no stop at all."""
     refuses("POINTS away from the entry", order_type="LIMIT", limit_price=1465,
-            product_type="BO", stop_loss=1465, take_profit=25)
+            product_type="INTRADAY", stop_loss=1465, take_profit=25)
 
 
 # ── the basics ───────────────────────────────────────────────────────────────

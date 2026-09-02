@@ -430,12 +430,15 @@ def _reference_price(account: str, body: PlaceBody,
     if body.stop_price:
         return body.stop_price
 
+    # The agent normalises a quote to {"quotes": {symbol: price}}. Reading the
+    # broker's own {"d": [{"v": {"lp": ...}}]} shape here matched nothing, so
+    # every market order on a symbol the account did not already hold was
+    # refused for having no price.
     result = AgentClient().call(account, "/quote?symbols=%s" % body.symbol, timeout=1.5)
     if result.ok:
-        for row in ((result.data or {}).get("d") or []):
-            price = ((row or {}).get("v") or {}).get("lp")
-            if price:
-                return price
+        price = ((result.data or {}).get("quotes") or {}).get(body.symbol)
+        if price:
+            return price
 
     # The book's own last price, seconds to a minute old. Good enough to catch a
     # quantity typed with an extra zero, which is what this is for.

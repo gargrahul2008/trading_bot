@@ -20,9 +20,15 @@ from tests.webapp.api.conftest import TOKEN, wire  # noqa: E402
 class RecordingAgent:
     """Stands in for one account's agent, recording what reached it."""
 
-    def __init__(self, allow_trading=True, delay=0.0):
+    def __init__(self, allow_trading=True, delay=0.0, ltp=None):
+        # Only writes. The risk check reads /book and /quote first, and a test
+        # asserting "nothing reached the broker" means no order was placed —
+        # not that nothing was asked.
         self.calls = []
+        self.reads = []
         self.allow_trading = allow_trading
+        # What /quote answers, in the shape the real agent uses.
+        self.ltp = ltp
         # Seconds the agent spends waiting on the broker before answering. The
         # point of the delay is that the order still goes through.
         self.delay = delay
@@ -61,6 +67,15 @@ class RecordingAgent:
                 if not agent.allow_trading:
                     return self._respond(403, {"error": "this agent is read-only"})
                 self._respond(200, {"order_id": "NEW-1"})
+
+            def do_GET(self):
+                if self.headers.get("Authorization") != "Bearer " + TOKEN:
+                    return self._respond(401, {"error": "unauthorised"})
+                agent.reads.append(self.path)
+                if self.path.startswith("/quote") and agent.ltp is not None:
+                    symbol = self.path.split("symbols=", 1)[1]
+                    return self._respond(200, {"quotes": {symbol: agent.ltp}})
+                self._respond(404, {"error": "not found"})
 
             def do_POST(self):
                 self._handle("POST")
@@ -534,3 +549,65 @@ def test_a_timed_out_order_still_counts_towards_the_rate_limit(slow_setup, monke
     codes = [client.post("/api/orders", json=ORDER).status_code for _ in range(3)]
 
     assert codes == [504, 504, 403]
+
+
+# ── pricing a market order ──────────────────────────────────────────────────
+
+@pytest.fixture
+def quoting(tmp_path, monkeypatch):
+    """A host whose agent answers /quote, as the real one does."""
+    path = str(tmp_path / "q.db")
+    migrate(connect(path))
+    monkeypatch.setenv("DASHBOARD_DB", path)
+
+    from app import main as main_mod
+    from app import store as store_mod
+    monkeypatch.setattr(store_mod, "REPO", REPO)
+    monkeypatch.setattr(main_mod, "REPO", REPO)
+
+    agent = RecordingAgent(ltp=3125.5)
+    port = agent.start()
+    wire(monkeypatch, {"rahul": port})
+
+    from fastapi.testclient import TestClient
+    from app import auth as auth_mod
+    from app.main import app
+
+    stored = auth_mod.hash_password("pw")
+    monkeypatch.setattr(auth_mod, "password_hash", lambda: stored)
+    monkeypatch.setattr(auth_mod, "cookie_secure", lambda: False)
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"password": "pw"})
+
+    yield client, agent, path
+    agent.stop()
+
+
+MARKET = {"account": "rahul", "symbol": "NSE:TCS-EQ", "side": "BUY", "qty": 1,
+          "product_type": "CNC", "order_type": "MARKET"}
+
+
+def test_a_market_order_is_valued_from_the_agents_quote(quoting):
+    """The agent normalises a quote to {"quotes": {symbol: price}}. Reading the
+    broker's own {"d": [{"v": {"lp": ...}}]} shape matched nothing, so every
+    market order on a symbol the account did not already hold was refused for
+    having no price."""
+    client, agent, _ = quoting
+
+    response = client.post("/api/orders", json=MARKET)
+
+    assert response.status_code == 200, response.text
+    assert any(path.startswith("/quote") for path in agent.reads)
+    assert [call["path"] for call in agent.calls] == ["/orders"]
+
+
+def test_the_quoted_price_is_what_the_limit_is_measured_against(quoting):
+    """One share of TCS at 3,125 passes a 5,000 cap; forty do not."""
+    client, _, _ = quoting
+    client.post("/api/limits", json={"account": "*", "name": "max_order_value",
+                                     "value": "5000"})
+
+    assert client.post("/api/orders", json=MARKET).status_code == 200
+    over = client.post("/api/orders", json=dict(MARKET, qty=40))
+    assert over.status_code == 403
+    assert "1,25,020" in over.json()["detail"]

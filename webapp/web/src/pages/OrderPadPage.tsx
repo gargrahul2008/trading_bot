@@ -10,7 +10,12 @@ import { money, num } from "../lib/format";
 import { Money } from "../lib/privacy";
 import type { AuditEntry, LimitsPayload, Overview, PlaceRequest } from "../lib/types";
 
-const PRODUCTS = ["BO", "CNC", "INTRADAY", "MARGIN", "MTF", "CO"] as const;
+/** BO and CO are gone — Fyers deprecated them as product types and refuses the
+ *  order outright ("-55 ... please use stopLoss and takeProfit fields"). An
+ *  order still carries its own exit; it rides on those fields now, which Fyers
+ *  acts on for INTRADAY and MARGIN. */
+const PRODUCTS = ["INTRADAY", "CNC", "MARGIN", "MTF"] as const;
+const BRACKET_PRODUCTS = ["INTRADAY", "MARGIN"];
 const TYPES = [
   { value: "MARKET", label: "Market" },
   { value: "LIMIT", label: "Limit" },
@@ -24,11 +29,12 @@ const TYPES = [
 const DEFAULT_PCT = 2;
 
 function needs(orderType: string, product: string) {
+  const bracket = BRACKET_PRODUCTS.includes(product);
   return {
     limit: orderType === "LIMIT" || orderType === "SL",
     stop: orderType === "SL" || orderType === "SL_M",
-    legs: product === "BO" || product === "CO",
-    target: product === "BO",
+    legs: bracket,
+    target: bracket,
   };
 }
 
@@ -64,7 +70,7 @@ export function OrderPadPage() {
   const [symbol, setSymbol] = useState("");
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   const [qty, setQty] = useState("");
-  const [product, setProduct] = useState<string>("BO");
+  const [product, setProduct] = useState<string>("INTRADAY");
   const [orderType, setOrderType] = useState("MARKET");
   const [limitPrice, setLimitPrice] = useState("");
   const [stopPrice, setStopPrice] = useState("");
@@ -177,8 +183,9 @@ export function OrderPadPage() {
   if (!Number.isInteger(quantity) || quantity <= 0) problems.push("quantity");
   if (want.limit && number(limitPrice) <= 0) problems.push("limit price");
   if (want.stop && number(stopPrice) <= 0) problems.push("trigger price");
-  if (want.legs && number(stopLoss) <= 0) problems.push("stop-loss");
-  if (want.target && number(takeProfit) <= 0) problems.push("target");
+  // Optional, not required: requiring both was a rule of the bracket product,
+  // and a plain intraday order is a legitimate thing to place. They are still
+  // prefilled, so leaving one off is a decision rather than an oversight.
   if (want.legs && reference > 0 && number(stopLoss) >= reference)
     problems.push("stop-loss must be points, not a price");
   if (want.target && reference > 0 && number(takeProfit) >= reference)
@@ -624,7 +631,10 @@ export function OrderPadPage() {
         BUY and SELL place immediately — there is no second confirmation, so the line above
         and the button text are the check. Stop-loss and target default to {DEFAULT_PCT}% of
         the price and are sent as points from the entry; typing over either one stops them
-        following the price.
+        following the price, and clearing one leaves the order without it. They ride on the
+        order itself — Fyers has deprecated bracket and cover products — and it acts on them
+        for {BRACKET_PRODUCTS.join(" and ")} only, so they are hidden on a delivery order
+        rather than sent and ignored.
       </p>
     </>
   );
