@@ -13,7 +13,8 @@ EnvironmentFile=/root/trading_bot/accounts/rahul/account.env
 # of account.env (which is per-account) and out of the repo.
 EnvironmentFile=/root/trading_bot/webapp/agent.env
 ExecStart=/root/trading_bot/env/bin/python -m webapp.agent.main \
-    --user rahul --port 9102 --per-min 60
+    --user rahul --port 9102 --per-min 60 \
+    --allow-trading
 Restart=always
 RestartSec=10
 SyslogIdentifier=agent-rahul
