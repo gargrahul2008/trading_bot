@@ -147,6 +147,12 @@ class Agent:
             fields["stop_price"] = payload["stop_price"]
         if payload.get("order_type") is not None:
             fields["order_type"] = payload["order_type"]
+        # Presence, not truthiness: an explicit null cancels that linked leg and
+        # leaves the parent order alone, so "absent" and "null" are different
+        # instructions and must not collapse into one.
+        for leg in ("stop_loss", "take_profit"):
+            if leg in payload:
+                fields[leg] = payload[leg]
         if not fields:
             raise AgentError(400, "nothing to modify")
 

@@ -85,13 +85,14 @@ def test_one_leg_alone_is_allowed():
                  stop_loss=10).stop_loss == Decimal("10")
 
 
-def test_legs_on_a_delivery_order_are_refused_rather_than_dropped():
-    """Fyers accepts them on CNC and acts on neither. An order that works while
-    its stop silently does not exist is worse than one that is refused."""
-    refuses("leaving the position unprotected", order_type="LIMIT",
-            limit_price=1465, product_type="CNC", stop_loss=5)
-    refuses("leaving the position unprotected", order_type="LIMIT",
-            limit_price=1465, product_type="MTF", take_profit=5)
+def test_every_product_type_takes_an_attached_exit():
+    """The exit is a property of the order, not of the product: Fyers documents
+    stopLoss and takeProfit for INTRADAY, CNC, MARGIN and MTF alike."""
+    for product in ("CNC", "INTRADAY", "MARGIN", "MTF"):
+        order = build(order_type="LIMIT", limit_price=1465, product_type=product,
+                      stop_loss=10, take_profit=25)
+        assert order.stop_loss == Decimal("10"), product
+        assert order.take_profit == Decimal("25"), product
 
 
 def test_a_leg_given_as_a_price_rather_than_points_is_caught():

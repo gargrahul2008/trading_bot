@@ -23,6 +23,7 @@ class TradingGateway(FakeGateway):
         super().__init__()
         self.placed = []
         self.cancelled = []
+        self.modified = []
 
     def place_order(self, request):
         self.placed.append(request)
@@ -33,6 +34,7 @@ class TradingGateway(FakeGateway):
         return {"s": "ok", "id": order_id}
 
     def modify_order(self, order_id, **fields):
+        self.modified.append((order_id, fields))
         return {"s": "ok", "id": order_id, "fields": fields}
 
     def exit_position(self, position_id):
@@ -193,3 +195,31 @@ def test_a_malformed_body_does_not_crash_the_agent(agent_server):
 def test_serve_refuses_without_a_token():
     with pytest.raises(ValueError, match="token is required"):
         serve(Agent(user="x", book=Book("x"), poller=None, gateway=None), port=0, token="")
+
+
+# ── the agent's half of cancelling a leg ────────────────────────────────────
+#
+# Fyers cancels a linked stop-loss or take-profit when that parameter arrives as
+# null, leaving the parent alone. The agent filtered its payload on
+# `is not None`, which turned "cancel this stop" into "you asked for nothing".
+
+
+@pytest.mark.parametrize("agent_server", [True], indirect=True)
+def test_the_agent_passes_a_null_leg_through(agent_server):
+    base, gateway = agent_server
+
+    status, _ = call(base, "/orders/NEW-1", method="PATCH", body={"stop_loss": None})
+
+    assert status == 200
+
+    assert gateway.modified[-1] == ("NEW-1", {"stop_loss": None})
+
+
+@pytest.mark.parametrize("agent_server", [True], indirect=True)
+def test_the_agent_leaves_an_unmentioned_leg_alone(agent_server):
+    """Amending a price must not silently strip the stop attached to it."""
+    base, gateway = agent_server
+
+    call(base, "/orders/NEW-1", method="PATCH", body={"limit_price": 1470})
+
+    assert gateway.modified[-1] == ("NEW-1", {"limit_price": 1470})

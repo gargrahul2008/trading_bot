@@ -10,6 +10,21 @@ from common.utils.logger import setup_logger
 
 LOG = setup_logger("fyers")
 
+
+class _Unset:
+    """"Not given", as distinct from "given as null".
+
+    Needed only where null is itself a meaningful value to send: FYERS cancels a
+    linked stop-loss or take-profit when that parameter arrives as null, so None
+    cannot also mean "leave it alone".
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNSET"
+
+
+UNSET = _Unset()
+
 try:
     from fyers_apiv3 import fyersModel  # type: ignore
 except Exception:
@@ -468,10 +483,19 @@ class FyersClient(Broker):
         limit_price: Optional[Decimal] = None,
         stop_price: Optional[Decimal] = None,
         order_type: Optional[str] = None,
+        stop_loss: Any = UNSET,
+        take_profit: Any = UNSET,
     ) -> Dict[str, Any]:
         """Amend a pending order. Only the fields passed are sent — FYERS treats
         an omitted field as unchanged, and sending a stale value for one we did
-        not mean to touch would silently move the order."""
+        not mean to touch would silently move the order.
+
+        The attached legs are the exception, and the reason UNSET exists: FYERS
+        cancels a linked take-profit or stop-loss when that parameter is sent as
+        null, leaving the parent order alone. None therefore has to mean "cancel
+        this leg", which leaves nothing to mean "do not touch it" — hence a
+        sentinel distinct from both.
+        """
         payload: Dict[str, Any] = {"id": str(order_id)}
         if qty is not None:
             payload["qty"] = int(qty)
@@ -481,6 +505,10 @@ class FyersClient(Broker):
             payload["stopPrice"] = float(stop_price)
         if order_type is not None:
             payload["type"] = 2 if str(order_type).upper() == "MARKET" else 1
+        if stop_loss is not UNSET:
+            payload["stopLoss"] = None if stop_loss is None else float(stop_loss)
+        if take_profit is not UNSET:
+            payload["takeProfit"] = None if take_profit is None else float(take_profit)
 
         def _call():
             try:

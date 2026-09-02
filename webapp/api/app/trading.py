@@ -47,8 +47,14 @@ def summarise(action: str, payload: Dict[str, Any]) -> str:
             bits.append("target %s pts" % payload["take_profit"])
         return " ".join(bits)
     if action == MODIFY:
-        changes = ", ".join("%s=%s" % (k, v) for k, v in sorted(payload.items())
-                            if k != "order_id" and v is not None)
+        # A null stop_loss or take_profit cancels that leg — the one change here
+        # most worth a log line, and the one a "drop the Nones" filter erased,
+        # leaving "order X -> nothing" for an order that lost its stop.
+        changes = ", ".join(
+            "%s=%s" % (k, "cancelled" if v is None else v)
+            for k, v in sorted(payload.items())
+            if k != "order_id" and (v is not None or k in ("stop_loss", "take_profit"))
+        )
         return "order %s -> %s" % (payload.get("order_id"), changes or "nothing")
     if action == CANCEL:
         return "cancel order %s" % payload.get("order_id")

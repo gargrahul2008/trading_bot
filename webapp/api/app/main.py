@@ -90,6 +90,10 @@ class ModifyBody(BaseModel):
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
     order_type: Optional[str] = None
+    # Sent as null to cancel that linked leg without touching the parent order.
+    # Which means null is an instruction here, not an absence — see the endpoint.
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
 
 
 class AccountBody(BaseModel):
@@ -605,7 +609,19 @@ def set_limit(body: LimitBody, _: str = Session) -> Dict[str, Any]:
 
 @app.patch("/api/orders/{order_id}")
 def modify_order(order_id: str, body: ModifyBody, _: str = Session) -> Dict[str, Any]:
+    """Amend a pending order, or cancel one of its attached legs.
+
+    Every other field is dropped when null, because null there means "not
+    given". The two legs are the exception: Fyers cancels a linked stop-loss or
+    take-profit when the parameter arrives as null, so for those, null is the
+    instruction. Which of the two it is comes from whether the client sent the
+    key at all, not from its value.
+    """
+    given = body.model_fields_set
     payload = {k: v for k, v in body.model_dump().items() if v is not None}
+    for leg in ("stop_loss", "take_profit"):
+        if leg in given:
+            payload[leg] = getattr(body, leg)
     account = payload.pop("account")
     return _act(trading.MODIFY, account, "/orders/%s" % order_id, "PATCH",
                 dict(payload, order_id=order_id), payload)

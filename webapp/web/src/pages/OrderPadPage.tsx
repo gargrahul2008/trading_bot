@@ -27,10 +27,6 @@ const PRODUCTS = ["BO", "INTRADAY", "CNC", "MARGIN", "MTF"] as const;
 
 /** Ours -> the broker's. Anything absent is sent as itself. */
 const SENT_AS: Record<string, string> = { BO: "INTRADAY" };
-
-/** Products on which Fyers acts on an attached stop and target. On a delivery
- *  order it accepts them and does nothing, which is worse than refusing. */
-const BRACKET_PRODUCTS = ["BO", "INTRADAY", "MARGIN"];
 const TYPES = [
   { value: "MARKET", label: "Market" },
   { value: "LIMIT", label: "Limit" },
@@ -44,14 +40,15 @@ const TYPES = [
 const DEFAULT_PCT = 2;
 
 function needs(orderType: string, product: string) {
-  const bracket = BRACKET_PRODUCTS.includes(product);
   return {
     limit: orderType === "LIMIT" || orderType === "SL",
     stop: orderType === "SL" || orderType === "SL_M",
-    legs: bracket,
-    target: bracket,
-    // A bracket without both legs is just an intraday order under a name that
-    // promises more. On INTRADAY and MARGIN they stay optional.
+    // Every product type takes an attached exit: the stop and target belong to
+    // the order, not to the product.
+    legs: true,
+    target: true,
+    // A bracket without both legs is an ordinary order under a name that
+    // promises more. Everywhere else they stay optional.
     legsRequired: product === "BO",
   };
 }
@@ -658,12 +655,12 @@ export function OrderPadPage() {
         BUY and SELL place immediately — there is no second confirmation, so the line above
         and the button text are the check. Stop-loss and target default to {DEFAULT_PCT}% of
         the price and are sent as points from the entry; typing over either one stops them
-        following the price. BO is ours, not the broker's: Fyers deprecated bracket and cover
-        as product types, so it is sent as {SENT_AS.BO} carrying the stop and target on the
-        order itself — which is what a bracket always was. It requires both legs; on plain
-        {" " + BRACKET_PRODUCTS.filter((p) => !SENT_AS[p]).join(" and ")} they are optional.
-        On a delivery order Fyers accepts them and acts on neither, so the boxes are hidden
-        rather than offering protection that would not exist.
+        following the price, and clearing one leaves the order without it. BO is ours, not
+        the broker's: Fyers deprecated bracket and cover as product types, so it is sent as
+        {" " + SENT_AS.BO} carrying the stop and target on the order itself — which is what a
+        bracket always was. It is the one product that requires both legs; every other takes
+        them and leaves them optional. Fyers links the legs to the parent, so cancelling the
+        order cancels them too.
       </p>
     </>
   );

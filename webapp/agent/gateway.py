@@ -70,12 +70,10 @@ ORDER_TYPES = ("MARKET", "LIMIT", "SL", "SL_M")
 #: "-55 BO and CO orders are deprecated. Please use stopLoss and takeProfit
 #: fields." An order still carries its own exit — through those fields on an
 #: ordinary order, not through a product type of its own.
+#:
+#: All four take an attached stop and target. The exit is a property of the
+#: order, not of the product.
 PRODUCT_TYPES = ("CNC", "INTRADAY", "MARGIN", "MTF")
-
-#: Products on which Fyers acts on an attached stopLoss/takeProfit. On a
-#: delivery order they are accepted and ignored, which is worse than refused:
-#: the order works and the protection silently does not exist.
-BRACKET_PRODUCTS = ("INTRADAY", "MARGIN")
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -388,15 +386,8 @@ def build_order_request(payload: Dict[str, Any]) -> PlaceOrderRequest:
         raise ValueError("a MARKET order takes no limit_price")
 
     # An attached exit rides on the order's stopLoss/takeProfit fields now that
-    # BO and CO are deprecated. Refused rather than dropped where the broker
-    # would ignore them: an order that works while its stop quietly does not
-    # exist is the worst of the available outcomes.
-    if (stop_loss > 0 or take_profit > 0) and product_type not in BRACKET_PRODUCTS:
-        raise ValueError(
-            "an attached stop-loss or target works on %s orders — on a %s order "
-            "Fyers ignores it, leaving the position unprotected"
-            % (" and ".join(BRACKET_PRODUCTS), product_type)
-        )
+    # BO and CO are deprecated. Every product type takes them, and Fyers links
+    # the resulting orders to the parent: cancelling the parent cancels them.
 
     # These are distances from the entry, not prices. Someone typing 1465 into
     # a stop-loss box meaning "stop at 1465" would place a stop 1,465 points

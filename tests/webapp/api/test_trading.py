@@ -611,3 +611,63 @@ def test_the_quoted_price_is_what_the_limit_is_measured_against(quoting):
     over = client.post("/api/orders", json=dict(MARKET, qty=40))
     assert over.status_code == 403
     assert "1,25,020" in over.json()["detail"]
+
+
+# ── cancelling one leg ──────────────────────────────────────────────────────
+#
+# Fyers cancels a linked take-profit or stop-loss when that parameter is sent as
+# null, leaving the parent order alone. Every layer here treated None as "not
+# provided" and dropped it, so the one instruction that needs a null could not
+# be expressed at all.
+
+
+def test_a_leg_is_cancelled_by_sending_it_as_null(setup):
+    client, agent, _ = setup
+
+    response = client.patch("/api/orders/NEW-1",
+                            json={"account": "rahul", "stop_loss": None})
+
+    assert response.status_code == 200
+    sent = agent.calls[0]["body"]
+    assert "stop_loss" in sent, "an omitted key means 'unchanged' — this is not that"
+    assert sent["stop_loss"] is None
+    assert "take_profit" not in sent, "the other leg was not mentioned; leave it alone"
+
+
+def test_both_legs_can_go_at_once(setup):
+    client, agent, _ = setup
+
+    client.patch("/api/orders/NEW-1",
+                 json={"account": "rahul", "stop_loss": None, "take_profit": None})
+
+    sent = agent.calls[0]["body"]
+    assert sent["stop_loss"] is None and sent["take_profit"] is None
+
+
+def test_a_modify_that_does_not_mention_a_leg_leaves_it_alone(setup):
+    """The distinction the whole sentinel exists for: amending a price must not
+    silently strip the stop that was attached to the order."""
+    client, agent, _ = setup
+
+    client.patch("/api/orders/NEW-1", json={"account": "rahul", "limit_price": 1470})
+
+    sent = agent.calls[0]["body"]
+    assert sent["limit_price"] == 1470
+    assert "stop_loss" not in sent and "take_profit" not in sent
+
+
+def test_cancelling_a_leg_is_audited_as_such(setup):
+    """A filter that drops nulls logged this as 'order X -> nothing' — for an
+    order that had just lost its stop."""
+    client, _, path = setup
+    client.patch("/api/orders/NEW-1", json={"account": "rahul", "stop_loss": None})
+
+    summary = audit_rows(path)[0]["summary"]
+    assert "stop_loss=cancelled" in summary
+
+
+def test_a_leg_can_also_be_moved_rather_than_cancelled(setup):
+    client, agent, _ = setup
+    client.patch("/api/orders/NEW-1", json={"account": "rahul", "take_profit": 30})
+
+    assert agent.calls[0]["body"]["take_profit"] == 30
