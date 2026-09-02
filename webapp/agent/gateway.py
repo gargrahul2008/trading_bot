@@ -75,6 +75,10 @@ ORDER_TYPES = ("MARKET", "LIMIT", "SL", "SL_M")
 #: order, not of the product.
 PRODUCT_TYPES = ("CNC", "INTRADAY", "MARGIN", "MTF")
 
+#: Products that cannot be sold short: the stock has to be owned first. MTF is
+#: margin funding for a delivery buy, not a way to go short.
+DELIVERY_PRODUCTS = ("CNC", "MTF")
+
 
 def _f(value: Any, default: float = 0.0) -> float:
     try:
@@ -163,10 +167,17 @@ def normalise_position(row: Dict[str, Any]) -> Dict[str, Any]:
     # Fyers segment 10 is the cash market, 11 the derivatives one.
     segment = _first(row, "segment")
 
-    # A negative CNC equity position is a sale of holdings awaiting settlement,
-    # not a short — you cannot short on delivery. Calling it SHORT on screen
-    # would read as an open risk position that has to be bought back.
-    delivery_sale = net < 0 and product == "CNC" and segment != SEGMENT_DERIVATIVES
+    # A negative cash-segment position on a delivery product is a sale of
+    # holdings awaiting settlement, not a short: neither CNC nor MTF can be sold
+    # short, so the stock must have been owned. Calling it SHORT on screen reads
+    # as an open risk that has to be bought back, and puts the broker's
+    # mark-to-market of a phantom short where the trade's realised P&L belongs.
+    #
+    # MTF was missing from this test, which is exactly where it bit: the bots
+    # buy on MTF, so every sale out of an MTF holding appeared as a short.
+    # INTRADAY is not here on purpose — a cash-segment intraday short is real.
+    delivery_sale = (net < 0 and segment != SEGMENT_DERIVATIVES
+                     and product in DELIVERY_PRODUCTS)
 
     return {
         "position_id": str(_first(row, "id") or ""),

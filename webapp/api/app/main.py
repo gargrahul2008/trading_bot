@@ -33,6 +33,7 @@ from app.auth import (
 from app.config import REPO, agent_ports, get_settings, known_accounts
 from app.store import (
     store_exclusions,
+    consolidate,
     store_entry_times,
     store_limits,
     rms_mod,
@@ -347,13 +348,12 @@ def _holding_as_position(holding: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-@app.get("/api/positions")
-def get_positions(_: str = Session) -> Dict[str, Any]:
-    """Everything open right now, across every account, as one list.
+def _open_rows() -> tuple:
+    """Every open row across every account, with its entry date.
 
     Positions *and* holdings: the broker separates them, the trader does not.
-    Flattened deliberately — the point of this dashboard is to see six accounts
-    at once, and a per-account grouping would put that back behind six clicks.
+    Returns (rows, unreachable accounts, delivery sales), because two endpoints
+    need the same gather and doing it twice would double the fan-out.
     """
     client = AgentClient()
     names = known_accounts()
@@ -414,11 +414,42 @@ def get_positions(_: str = Session) -> Dict[str, Any]:
     # Biggest mover first — the row you would act on is the one furthest from
     # where you wanted it, in either direction.
     rows.sort(key=lambda r: abs(float(r.get("unrealised") or 0)), reverse=True)
+    return rows, names, missing, sold
+
+
+@app.get("/api/positions")
+def get_positions(_: str = Session) -> Dict[str, Any]:
+    """Everything open right now, across every account, as one list.
+
+    Flattened deliberately — the point of this dashboard is to see six accounts
+    at once, and a per-account grouping would put that back behind six clicks.
+    """
+    rows, names, missing, sold = _open_rows()
     # Every account queried, not just those with something open. Letting the
     # client infer the columns from the rows makes an account with nothing open
     # vanish, which is indistinguishable from one that could not be read.
     return {"positions": rows, "accounts": names, "accounts_missing": missing,
             "sold_today": sold}
+
+
+@app.get("/api/recent")
+def get_recent(limit: int = 20, _: str = Session) -> Dict[str, Any]:
+    """What has been traded lately: one line per position, not one per fill.
+
+    A hundred-share order fills in whatever pieces the exchange gives it and
+    FIFO matches each piece separately. Both are right, and together they turn
+    one trade into a dozen rows nobody can add up by eye.
+    """
+    if consolidate is None:
+        return {"lines": [], "available": False}
+    rows, names, missing, _sold = _open_rows()
+    trades = store_trades(limit=500).get("trades", [])
+    return {
+        "lines": consolidate.recent(rows, trades, closed_limit=limit),
+        "accounts": names,
+        "accounts_missing": missing,
+        "available": True,
+    }
 
 
 @app.get("/api/trades")

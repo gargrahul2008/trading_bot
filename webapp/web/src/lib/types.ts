@@ -330,3 +330,45 @@ export interface LimitsPayload {
   rules: Record<string, string>;
   available: boolean;
 }
+
+
+/** One position, not one fill.
+ *
+ *  A hundred-share order fills in pieces and FIFO matches each piece; both are
+ *  right and together they turn one trade into a dozen rows. The server
+ *  collapses them to one line per scrip — per day as well, once closed — with
+ *  the price actually paid across it. Money is a decimal string, as everywhere.
+ */
+export interface RecentLine {
+  state: "open" | "closed";
+  account: string;
+  symbol: string;
+  direction: string;
+  /** intraday | positional, on a closed line. Null while open — it is not
+   *  decided until the position is closed. */
+  trade_kind: string | null;
+  /** Entry day while open, exit day once closed. */
+  day: string | null;
+  /** "CNC+MTF" where one position spans both of the broker's books. */
+  product_type: string;
+  qty: string;
+  entry_price: string;
+  exit_price: string;
+  /** Unrealised while open, realised before charges once closed. */
+  gross: string;
+  charges: string | null;
+  /** Net of charges. Null when the day's charges are not in — never a
+   *  confident zero. */
+  net: string | null;
+  pct: string | null;
+  at: string;
+  /** How many fills or matches went into this line. */
+  fills: number;
+}
+
+export interface RecentPayload {
+  lines: RecentLine[];
+  accounts: string[];
+  accounts_missing: string[];
+  available: boolean;
+}

@@ -297,3 +297,18 @@ def test_positions_and_holdings_are_told_apart(client_with_holdings):
             client_with_holdings.get("/api/positions").json()["positions"]}
     assert rows["NSE:CROMPTON26SEPFUT"]["book"] == "position"
     assert rows["NSE:INDOTHAI-EQ"]["book"] == "holding"
+
+
+# ── the pad's Recent list ───────────────────────────────────────────────────
+
+def test_recent_returns_one_line_per_scrip(client):
+    """Not one per fill, and not one per broker book."""
+    lines = client.get("/api/recent").json()["lines"]
+
+    symbols = [line["symbol"] for line in lines if line["state"] == "open"]
+    assert len(symbols) == len(set(symbols)), "a scrip must appear once while open"
+
+
+def test_recent_needs_a_session(client):
+    client.post("/api/auth/logout")
+    assert client.get("/api/recent").status_code == 401

@@ -80,6 +80,23 @@ def test_a_cnc_equity_sale_is_not_reported_as_a_short():
     assert position["is_derivative"] is False
 
 
+def test_an_mtf_sale_is_a_delivery_sale_too():
+    """MTF is margin funding for a delivery buy, not a way to go short — so a
+    negative MTF equity row is stock that was owned and has been sold. It was
+    missing from this test, which is where it bit: the bots buy on MTF, so every
+    sale out of an MTF holding was shown as a short with a phantom P&L."""
+    sold = dict(SHRINGARMS, productType="MTF")
+    assert normalise_position(sold)["delivery_sale"] is True
+
+
+def test_a_cash_intraday_short_is_a_real_short():
+    """The one negative equity row that is genuine: INTRADAY can be sold short
+    and must be bought back before the close."""
+    short = dict(SHRINGARMS, productType="INTRADAY")
+    assert normalise_position(short)["delivery_sale"] is False
+    assert normalise_position(short)["direction"] == "SHORT"
+
+
 def test_a_short_future_is_not_mistaken_for_a_delivery_sale():
     assert normalise_position(CROMPTON)["delivery_sale"] is False
     assert normalise_position(CROMPTON)["is_derivative"] is True

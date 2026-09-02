@@ -22,6 +22,7 @@ LOG = logging.getLogger("api.store")
 try:
     from webapp.history.importer import realised_total
     from webapp.pnl import charges as charges_mod
+    from webapp.pnl import consolidate
     from webapp.pnl import portfolio as portfolio_mod
     from webapp.pnl import rms as rms_mod
     from webapp.history import symbols as symbols_mod
@@ -38,6 +39,7 @@ except Exception as exc:  # pragma: no cover - only if the tree is broken
     portfolio_mod = None  # type: ignore
     rms_mod = None  # type: ignore
     charges_mod = None  # type: ignore
+    consolidate = None  # type: ignore
     matched_trades = None  # type: ignore
     open_lots_by_position = None  # type: ignore
     realised_by_scrip = None  # type: ignore
