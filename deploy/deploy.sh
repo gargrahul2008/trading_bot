@@ -38,6 +38,31 @@ run() {
   if [ "$APPLY" = "1" ]; then "$@"; else say "would run: $*"; fi
 }
 
+# ── is what is running older than the code on disk? ──────────────────────────
+#
+# Asked of the filesystem, never of "what did this invocation pull". Pulling by
+# hand and then running this script is a normal thing to do, and a deploy that
+# decides what to restart from its own git diff does nothing at all in that
+# case — while reporting success, which is the failure that hides itself.
+
+newest() {   # newest mtime, in epoch seconds, under the given paths
+  find "$@" -type f -not -path '*/node_modules/*' -not -name '*.pyc' \
+       -printf '%T@\n' 2>/dev/null | sort -n | tail -1 | cut -d. -f1
+}
+
+started() {  # when a unit last entered active, in epoch seconds; 0 if it is not
+  stamp="$(systemctl show -p ActiveEnterTimestamp --value "$1" 2>/dev/null)"
+  [ -n "$stamp" ] && date -d "$stamp" +%s 2>/dev/null || echo 0
+}
+
+stale() {    # unit $1 is running code older than the newest file under $2...
+  unit="$1"; shift
+  since="$(started "$unit")"
+  [ "$since" = "0" ] && return 1          # not running: not this check's problem
+  code="$(newest "$@")"
+  [ -n "$code" ] && [ "$code" -gt "$since" ]
+}
+
 [ "$APPLY" = "1" ] || printf '%sDry run — nothing will change. Add --apply to act.%s\n' "$Y" "$Z"
 
 # ── 1. pull ──────────────────────────────────────────────────────────────────
@@ -139,10 +164,20 @@ done
 # reports success and the browser shows the old dashboard, which is the worst
 # combination of the two.
 step "Dashboard UI"
+UI_SRC="webapp/web/src webapp/web/index.html webapp/web/package.json webapp/web/package-lock.json"
+ui_stale=0
+if [ ! -f webapp/web/dist/index.html ]; then
+  ui_stale=1
+else
+  built="$(stat -c %Y webapp/web/dist/index.html 2>/dev/null || echo 0)"
+  src="$(newest $UI_SRC)"
+  [ -n "$src" ] && [ "$src" -gt "$built" ] && ui_stale=1
+fi
+
 if [ ! -d webapp/web ]; then
   say "no webapp/web — nothing to build"
-elif [ -d webapp/web/dist ] && [ -z "$changed" ] && ! touches '^webapp/web/'; then
-  say "no change under webapp/web/ — keeping the built bundle"
+elif [ "$ui_stale" = "0" ]; then
+  say "the built bundle is newer than every source file — nothing to build"
 elif ! command -v npm >/dev/null 2>&1; then
   warn "npm not found — the dashboard will serve whatever was built last"
 else
@@ -152,7 +187,7 @@ else
   if [ "$APPLY" = "1" ] && [ ! -f webapp/web/dist/index.html ]; then
     die "the UI build produced no dist/index.html — not restarting onto a broken bundle"
   fi
-  did "built webapp/web/dist"
+  [ "$APPLY" = "1" ] && did "built webapp/web/dist"
 fi
 
 # ── 5. restart what changed ──────────────────────────────────────────────────
@@ -161,16 +196,19 @@ step "Agents"
 # for code an agent actually runs. Everything under webapp/web/ is served by the
 # dashboard and never imported by an agent — restarting them for a changed
 # button is a cost paid for nothing, and during market hours it is a real one.
-agent_code="$(printf '%s' "$changed" | grep '^webapp/' | grep -v '^webapp/web/' | grep -v '^webapp/api/')"
-if [ -n "$agent_code" ] || [ "$agents_changed" = "1" ]; then
-  units="$(ls deploy/systemd/generated/agent-*.service 2>/dev/null \
-           | xargs -n1 basename | sed 's/\.service$//' | tr '\n' ' ')"
+AGENT_CODE="webapp/agent webapp/store webapp/pnl webapp/history"
+units="$(ls deploy/systemd/generated/agent-*.service 2>/dev/null \
+         | xargs -n1 basename | sed 's/\.service$//' | tr '\n' ' ')"
+agents_stale=0
+for unit in $units; do
+  stale "$unit" $AGENT_CODE && agents_stale=1
+done
+
+if [ "$agents_stale" = "1" ] || [ "$agents_changed" = "1" ]; then
   did "restarting: $units"
   run systemctl restart $units
-elif [ -n "$changed" ]; then
-  say "nothing an agent imports has changed — leaving them polling"
 else
-  say "nothing new — leaving them polling"
+  say "every agent is running the code on disk — leaving them polling"
 fi
 
 step "Dashboard"
@@ -182,11 +220,11 @@ if ! systemctl is-enabled dashboard.service >/dev/null 2>&1; then
   else
     say "dashboard.service not enabled — see docs/dashboard_https.md"
   fi
-elif touches '^webapp/' || [ "$units_changed" = "1" ]; then
+elif stale dashboard.service webapp || [ "$units_changed" = "1" ] || [ "$ui_stale" = "1" ]; then
   did "restarting: dashboard"
   run systemctl restart dashboard
 else
-  say "no change under webapp/ — dashboard left running"
+  say "the dashboard is running the code on disk — left alone"
 fi
 
 if touches '^deploy/cron/'; then
