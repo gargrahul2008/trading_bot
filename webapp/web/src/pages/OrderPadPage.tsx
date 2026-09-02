@@ -10,12 +10,27 @@ import { money, num } from "../lib/format";
 import { Money } from "../lib/privacy";
 import type { AuditEntry, LimitsPayload, Overview, PlaceRequest } from "../lib/types";
 
-/** BO and CO are gone — Fyers deprecated them as product types and refuses the
- *  order outright ("-55 ... please use stopLoss and takeProfit fields"). An
- *  order still carries its own exit; it rides on those fields now, which Fyers
- *  acts on for INTRADAY and MARGIN. */
-const PRODUCTS = ["INTRADAY", "CNC", "MARGIN", "MTF"] as const;
-const BRACKET_PRODUCTS = ["INTRADAY", "MARGIN"];
+/** BO is ours, not the broker's.
+ *
+ *  Fyers deprecated BO and CO as product types — an order sent with one is
+ *  refused outright ("-55 ... please use stopLoss and takeProfit fields"). The
+ *  fields themselves were never the problem and were always being sent, so the
+ *  bracket survives as what it always meant: an intraday order that carries its
+ *  own stop and target. Picking it sends INTRADAY and requires both legs.
+ *
+ *  Kept as a name rather than dropped because it states an intention that
+ *  INTRADAY does not: entry, stop and target decided together, before the
+ *  position exists. The review line names the product actually sent, so the
+ *  convenience never becomes a lie about what went to the broker.
+ */
+const PRODUCTS = ["BO", "INTRADAY", "CNC", "MARGIN", "MTF"] as const;
+
+/** Ours -> the broker's. Anything absent is sent as itself. */
+const SENT_AS: Record<string, string> = { BO: "INTRADAY" };
+
+/** Products on which Fyers acts on an attached stop and target. On a delivery
+ *  order it accepts them and does nothing, which is worse than refusing. */
+const BRACKET_PRODUCTS = ["BO", "INTRADAY", "MARGIN"];
 const TYPES = [
   { value: "MARKET", label: "Market" },
   { value: "LIMIT", label: "Limit" },
@@ -35,6 +50,9 @@ function needs(orderType: string, product: string) {
     stop: orderType === "SL" || orderType === "SL_M",
     legs: bracket,
     target: bracket,
+    // A bracket without both legs is just an intraday order under a name that
+    // promises more. On INTRADAY and MARGIN they stay optional.
+    legsRequired: product === "BO",
   };
 }
 
@@ -70,7 +88,7 @@ export function OrderPadPage() {
   const [symbol, setSymbol] = useState("");
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   const [qty, setQty] = useState("");
-  const [product, setProduct] = useState<string>("INTRADAY");
+  const [product, setProduct] = useState<string>("BO");
   const [orderType, setOrderType] = useState("MARKET");
   const [limitPrice, setLimitPrice] = useState("");
   const [stopPrice, setStopPrice] = useState("");
@@ -183,9 +201,8 @@ export function OrderPadPage() {
   if (!Number.isInteger(quantity) || quantity <= 0) problems.push("quantity");
   if (want.limit && number(limitPrice) <= 0) problems.push("limit price");
   if (want.stop && number(stopPrice) <= 0) problems.push("trigger price");
-  // Optional, not required: requiring both was a rule of the bracket product,
-  // and a plain intraday order is a legitimate thing to place. They are still
-  // prefilled, so leaving one off is a decision rather than an oversight.
+  if (want.legsRequired && number(stopLoss) <= 0) problems.push("stop-loss");
+  if (want.legsRequired && number(takeProfit) <= 0) problems.push("target");
   if (want.legs && reference > 0 && number(stopLoss) >= reference)
     problems.push("stop-loss must be points, not a price");
   if (want.target && reference > 0 && number(takeProfit) >= reference)
@@ -197,7 +214,7 @@ export function OrderPadPage() {
     symbol: symbol.trim().toUpperCase(),
     side,
     qty: quantity,
-    product_type: product,
+    product_type: SENT_AS[product] ?? product,
     order_type: orderType,
     limit_price: want.limit ? toTick(number(limitPrice), tick) : 0,
     stop_price: want.stop ? toTick(number(stopPrice), tick) : 0,
@@ -493,7 +510,17 @@ export function OrderPadPage() {
             ) : (
               <span>
                 <strong>{side}</strong> {quantity} <strong>{request.symbol}</strong> ·{" "}
-                {product} {TYPES.find((t) => t.value === orderType)?.label}
+                {product}
+                {SENT_AS[product] && (
+                  <span
+                    className="text-[var(--ink-muted)]"
+                    title="BO is ours — Fyers no longer has it as a product type"
+                  >
+                    {" "}
+                    (sent as {SENT_AS[product]})
+                  </span>
+                )}{" "}
+                {TYPES.find((t) => t.value === orderType)?.label}
                 {want.limit && ` @ ${money(request.limit_price!)}`}
                 {want.stop && ` trigger ${money(request.stop_price!)}`}
                 {want.legs && ` · SL ${request.stop_loss} pts`}
@@ -631,10 +658,12 @@ export function OrderPadPage() {
         BUY and SELL place immediately — there is no second confirmation, so the line above
         and the button text are the check. Stop-loss and target default to {DEFAULT_PCT}% of
         the price and are sent as points from the entry; typing over either one stops them
-        following the price, and clearing one leaves the order without it. They ride on the
-        order itself — Fyers has deprecated bracket and cover products — and it acts on them
-        for {BRACKET_PRODUCTS.join(" and ")} only, so they are hidden on a delivery order
-        rather than sent and ignored.
+        following the price. BO is ours, not the broker's: Fyers deprecated bracket and cover
+        as product types, so it is sent as {SENT_AS.BO} carrying the stop and target on the
+        order itself — which is what a bracket always was. It requires both legs; on plain
+        {" " + BRACKET_PRODUCTS.filter((p) => !SENT_AS[p]).join(" and ")} they are optional.
+        On a delivery order Fyers accepts them and acts on neither, so the boxes are hidden
+        rather than offering protection that would not exist.
       </p>
     </>
   );
