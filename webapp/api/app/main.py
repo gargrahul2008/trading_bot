@@ -131,19 +131,44 @@ def _audit_conn():
 
 def _act(action: str, account: str, path: str, method: str,
          payload: Dict[str, Any], body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Run one order action against one account's agent, audited either way."""
+    """Run one order action against one account's agent, audited either way.
+
+    The trade timeout, not the read one. A read is answered from the agent's
+    memory, so slowness means it is wedged; a trade is the agent waiting on the
+    broker, where slowness is normal. Giving up early never stopped an order —
+    it only stopped us learning what became of it.
+    """
     if account not in agent_ports():
         raise HTTPException(status.HTTP_404_NOT_FOUND, "no such account: %s" % account)
 
     conn = _audit_conn()
     audit_id = trading.begin(conn, action, account, payload) if conn else None
     try:
-        result = AgentClient().call(account, path, method=method, body=body)
+        result = AgentClient().call(
+            account, path, method=method, body=body,
+            timeout=get_settings().agent_trade_timeout)
     except Exception as exc:
         if conn:
             trading.finish(conn, audit_id, False, str(exc))
             conn.close()
         raise
+
+    if result.timed_out:
+        # Not a failure. The order may be live at the broker, and the one thing
+        # that must not happen next is a retry — which is exactly what the word
+        # "failed" invites. Recorded as unknown, and said plainly.
+        message = (
+            "%s timed out after %gs waiting for %s. The order may have reached "
+            "the broker — check Orders before trying again."
+            % (action, get_settings().agent_trade_timeout, account)
+        )
+        if conn:
+            trading.finish(conn, audit_id, False, "unknown: " + (result.error or "timed out"))
+            if audit_id is not None:
+                conn.execute("UPDATE audit SET result = 'unknown' WHERE id = ?", (audit_id,))
+                conn.commit()
+            conn.close()
+        raise HTTPException(status.HTTP_504_GATEWAY_TIMEOUT, message)
 
     if not result.ok:
         if conn:
@@ -405,7 +430,7 @@ def _reference_price(account: str, body: PlaceBody,
     if body.stop_price:
         return body.stop_price
 
-    result = AgentClient().call(account, "/quote?symbols=%s" % body.symbol)
+    result = AgentClient().call(account, "/quote?symbols=%s" % body.symbol, timeout=1.5)
     if result.ok:
         for row in ((result.data or {}).get("d") or []):
             price = ((row or {}).get("v") or {}).get("lp")
@@ -464,7 +489,9 @@ def _check_risk(account: str, body: PlaceBody) -> None:
         return
 
     limits = rms_mod.resolve(store_limits(), account)
-    result = AgentClient().call(account, "/book")
+    # Reads, on the read timeout, and both have a fallback — the risk check sits
+    # in front of a trade and must not spend the trade's patience getting there.
+    result = AgentClient().call(account, "/book", timeout=1.5)
     book = result.data if result.ok else store_book(account)
 
     price = _reference_price(account, body, book)

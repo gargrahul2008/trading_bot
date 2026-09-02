@@ -20,9 +20,12 @@ from tests.webapp.api.conftest import TOKEN, wire  # noqa: E402
 class RecordingAgent:
     """Stands in for one account's agent, recording what reached it."""
 
-    def __init__(self, allow_trading=True):
+    def __init__(self, allow_trading=True, delay=0.0):
         self.calls = []
         self.allow_trading = allow_trading
+        # Seconds the agent spends waiting on the broker before answering. The
+        # point of the delay is that the order still goes through.
+        self.delay = delay
 
     def start(self):
         import json as _json
@@ -52,6 +55,9 @@ class RecordingAgent:
                 raw = self.rfile.read(length) if length else b""
                 body = _json.loads(raw) if raw else {}
                 agent.calls.append({"method": method, "path": self.path, "body": body})
+                if agent.delay:
+                    import time as _time
+                    _time.sleep(agent.delay)
                 if not agent.allow_trading:
                     return self._respond(403, {"error": "this agent is read-only"})
                 self._respond(200, {"order_id": "NEW-1"})
@@ -424,3 +430,107 @@ def test_setting_limits_requires_a_session(setup):
     assert client.post("/api/limits", json={"name": "max_order_value", "value": "1"}
                        ).status_code == 401
     assert client.get("/api/limits").status_code == 401
+
+
+# ── a slow broker ───────────────────────────────────────────────────────────
+#
+# The regression this exists for: every agent call shared one 2.5s timeout,
+# chosen for the concurrent read fan-out that polls all accounts at once. A read
+# is answered from the agent's memory, so slowness there means it is wedged. A
+# trade is the agent waiting on Fyers, where slowness is ordinary — and giving
+# up early never stopped an order, it only stopped us learning what became of
+# it. A live order was reported to the user as "timed out", which reads as
+# "it did not go" and invites the retry that opens the position twice.
+
+
+@pytest.fixture
+def slow_setup(tmp_path, monkeypatch):
+    path = str(tmp_path / "slow.db")
+    migrate(connect(path))
+    monkeypatch.setenv("DASHBOARD_DB", path)
+
+    from app import main as main_mod
+    from app import store as store_mod
+    monkeypatch.setattr(store_mod, "REPO", REPO)
+    monkeypatch.setattr(main_mod, "REPO", REPO)
+
+    agent = RecordingAgent(delay=0.6)
+    port = agent.start()
+    wire(monkeypatch, {"rahul": port})
+
+    from fastapi.testclient import TestClient
+    from app import auth as auth_mod
+    from app.main import app
+
+    stored = auth_mod.hash_password("pw")
+    monkeypatch.setattr(auth_mod, "password_hash", lambda: stored)
+    monkeypatch.setattr(auth_mod, "cookie_secure", lambda: False)
+    client = TestClient(app)
+    client.post("/api/auth/login", json={"password": "pw"})
+
+    yield client, agent, path
+    agent.stop()
+
+
+def test_a_slow_broker_does_not_fail_the_order(slow_setup, monkeypatch):
+    """An agent that takes longer than a read timeout is doing its job."""
+    from app import config
+
+    settings = config.get_settings()
+    monkeypatch.setattr(settings, "agent_timeout", 0.2)      # would have failed
+    monkeypatch.setattr(settings, "agent_trade_timeout", 5.0)
+
+    client, agent, _ = slow_setup
+    response = client.post("/api/orders", json=ORDER)
+
+    assert response.status_code == 200
+    assert len(agent.calls) == 1
+
+
+def test_a_timeout_is_reported_as_unknown_not_failed(slow_setup, monkeypatch):
+    """The order reached the agent. Calling that a failure invites a retry, and
+    a retry after a timeout is how one intention becomes two positions."""
+    from app import config
+
+    settings = config.get_settings()
+    monkeypatch.setattr(settings, "agent_trade_timeout", 0.2)
+
+    client, agent, _ = slow_setup
+    response = client.post("/api/orders", json=ORDER)
+
+    assert response.status_code == 504, "not 502 — nothing refused this order"
+    detail = response.json()["detail"]
+    assert "may have reached the broker" in detail
+    assert "check Orders" in detail
+    assert agent.calls, "the order did reach the agent, which is the whole problem"
+
+
+def test_a_timed_out_order_is_audited_as_unknown(slow_setup, monkeypatch):
+    """'error' and 'unknown' must not look alike in the log: one says the order
+    is not there, the other says nobody knows whether it is."""
+    from app import config
+
+    monkeypatch.setattr(config.get_settings(), "agent_trade_timeout", 0.2)
+
+    client, _, path = slow_setup
+    client.post("/api/orders", json=ORDER)
+
+    rows = audit_rows(path)
+    assert len(rows) == 1
+    assert rows[0]["result"] == "unknown"
+    assert "timed out" in rows[0]["message"]
+
+
+def test_a_timed_out_order_still_counts_towards_the_rate_limit(slow_setup, monkeypatch):
+    """It may be live. Not counting it would let a retry loop past the limit at
+    exactly the moment the limit matters most."""
+    from app import config
+
+    monkeypatch.setattr(config.get_settings(), "agent_trade_timeout", 0.2)
+
+    client, _, _ = slow_setup
+    client.post("/api/limits", json={"account": "*", "name": "max_orders_per_minute",
+                                     "value": "2"})
+    codes = [client.post("/api/orders", json=ORDER).status_code for _ in range(3)]
+
+    assert codes == [504, 504, 403]

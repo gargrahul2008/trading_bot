@@ -16,9 +16,17 @@ AGENT_PORTS = REPO / "deploy" / "agent_ports.json"
 AGENT_ENV = REPO / "webapp" / "agent.env"
 ACCOUNTS_DIR = REPO / "accounts"
 
-# An agent answers from memory, so a slow reply means it is wedged, not busy.
-# Short enough that one bad agent cannot hold up the page.
+# An agent answers a READ from memory, so a slow reply means it is wedged, not
+# busy. Short enough that one bad agent cannot hold up the page.
 AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "2.5"))
+
+# A trade is the opposite case: the agent is waiting on the broker, so a slow
+# reply is the normal one. Placing an order through Fyers routinely takes longer
+# than a read timeout allows, and giving up early does not stop the order — it
+# only stops us finding out what happened to it, which is the worst outcome
+# available. Long enough to outlast a slow broker, bounded so a wedged agent
+# still eventually returns.
+AGENT_TRADE_TIMEOUT_SECONDS = float(os.getenv("AGENT_TRADE_TIMEOUT_SECONDS", "20"))
 
 
 def _read_env_file(path: Path) -> Dict[str, str]:
@@ -71,6 +79,7 @@ class Settings:
     def __init__(self) -> None:
         self.agent_host = os.getenv("AGENT_HOST", "127.0.0.1")
         self.agent_timeout = AGENT_TIMEOUT_SECONDS
+        self.agent_trade_timeout = AGENT_TRADE_TIMEOUT_SECONDS
         self.cors_origins = [
             origin.strip()
             for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")

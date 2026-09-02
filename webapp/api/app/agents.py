@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -32,11 +33,16 @@ class AgentResult:
         data: Optional[Any] = None,
         error: Optional[str] = None,
         reachable: bool = True,
+        timed_out: bool = False,
     ) -> None:
         self.account = account
         self.data = data
         self.error = error
         self.reachable = reachable
+        # We gave up waiting. Distinct from every other failure, because the
+        # thing asked for may have happened anyway — on a trade, that is the
+        # difference between "it did not go" and "nobody knows".
+        self.timed_out = timed_out
 
     @property
     def ok(self) -> bool:
@@ -48,7 +54,18 @@ class AgentResult:
             "data": self.data,
             "error": self.error,
             "reachable": self.reachable,
+            "timed_out": self.timed_out,
         }
+
+
+def _is_timeout(exc: Any) -> bool:
+    """Whether this failure was us giving up, rather than a refusal.
+
+    On Python 3.9 socket.timeout and TimeoutError are distinct classes; from
+    3.10 the former is an alias of the latter. Both are checked so the
+    distinction survives whichever the host runs.
+    """
+    return isinstance(exc, (socket.timeout, TimeoutError))
 
 
 class AgentClient:
@@ -70,6 +87,7 @@ class AgentClient:
         *,
         method: str = "GET",
         body: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
     ) -> AgentResult:
         url = self.url(account, path)
         if url is None:
@@ -86,7 +104,8 @@ class AgentClient:
             request.add_header("Content-Type", "application/json")
 
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(
+                    request, timeout=self.timeout if timeout is None else timeout) as response:
                 raw = response.read().decode("utf-8")
             return AgentResult(account, data=json.loads(raw) if raw else None)
         except urllib.error.HTTPError as exc:
@@ -98,10 +117,20 @@ class AgentClient:
             # The agent answered, so it is up — it just refused this call.
             return AgentResult(account, error="agent %s: %s" % (exc.code, detail))
         except urllib.error.URLError as exc:
+            if _is_timeout(exc.reason):
+                return AgentResult(account, error="timed out after %.1fs"
+                                   % (self.timeout if timeout is None else timeout),
+                                   reachable=True, timed_out=True)
             return AgentResult(
                 account, error="agent unreachable: %s" % exc.reason, reachable=False
             )
         except Exception as exc:  # a malformed reply must not 500 the page
+            if _is_timeout(exc):
+                # Reached the agent and gave up waiting. Not the same as
+                # unreachable: whatever was asked for may well have happened.
+                return AgentResult(account, error="timed out after %.1fs"
+                                   % (self.timeout if timeout is None else timeout),
+                                   reachable=True, timed_out=True)
             LOG.warning("%s: unexpected agent failure: %s", account, exc)
             return AgentResult(account, error=str(exc), reachable=False)
 

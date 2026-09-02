@@ -208,6 +208,10 @@ export function OrderPadPage() {
   const tradingOff = chosen && !chosen.allow_trading;
   const error =
     place.error instanceof ApiError ? place.error.message : place.error ? String(place.error) : null;
+  // A timeout is not a rejection. The order may be live at the broker, and the
+  // one thing that must not happen next is a reflexive retry — which is what a
+  // red "failed" box invites.
+  const unknown = place.error instanceof ApiError && place.error.status === 504;
 
   return (
     <>
@@ -520,8 +524,12 @@ export function OrderPadPage() {
           {error && (
             <div
               className="mt-3 rounded border px-3 py-2 text-sm"
-              style={{ borderColor: "var(--status-critical)", color: "var(--status-critical)" }}
+              style={{
+                borderColor: unknown ? "var(--status-warning)" : "var(--status-critical)",
+                color: unknown ? "var(--ink)" : "var(--status-critical)",
+              }}
             >
+              {unknown && <strong>Outcome unknown. </strong>}
               {error}
             </div>
           )}
@@ -572,15 +580,24 @@ export function OrderPadPage() {
                           ? "var(--status-good)"
                           : entry.result === "error"
                             ? "var(--status-critical)"
-                            : "var(--ink-muted)",
+                            : entry.result === "unknown"
+                              ? "var(--status-warning)"
+                              : "var(--ink-muted)",
                     }}
                   >
                     {entry.result}
                   </span>
                 </div>
                 <div className="text-[var(--ink-secondary)]">{entry.summary}</div>
-                {entry.result === "error" && entry.message && (
-                  <div className="text-[var(--status-critical)]">
+                {(entry.result === "error" || entry.result === "unknown") && entry.message && (
+                  <div
+                    style={{
+                      color:
+                        entry.result === "unknown"
+                          ? "var(--status-warning)"
+                          : "var(--status-critical)",
+                    }}
+                  >
                     {entry.message.slice(0, 110)}
                   </div>
                 )}
