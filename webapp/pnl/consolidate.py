@@ -22,6 +22,8 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional
 
+from webapp.timestamps import to_iso
+
 D0 = Decimal("0")
 
 #: A weighted average divides, so it produces as many digits as Decimal will
@@ -105,8 +107,9 @@ def closed(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "net": None if net is None else str(net),
             "pct": _as_str(_round(_pct(net if net is not None else gross, cost), PERCENT)),
             # What it is sorted by. The latest exit in the group, so a scrip
-            # traded twice in a day sits where its last trade puts it.
-            "at": max(str(m.get("closed_at") or "") for m in members),
+            # traded twice in a day sits where its last trade puts it. Parsed,
+            # because the broker's own form sorts August after September.
+            "at": max(to_iso(m.get("closed_at")) for m in members),
             "fills": len(members),
         })
     return out
@@ -188,8 +191,14 @@ def recent(open_rows: Iterable[Dict[str, Any]], closed_rows: Iterable[Dict[str, 
 def _order(line: Dict[str, Any]) -> tuple:
     """Newest first, with a stable tie-break.
 
-    Without the tie-break two trades closed in the same second swap places
-    between refreshes, which is how a list becomes unreadable while being read.
+    The trading day leads, and the timestamp only separates rows within one.
+    Leading with the timestamp put every row whose stamp could not be read at
+    the bottom regardless of its date, which is how one block of closed trades
+    ended up above the open positions and another below them.
+
+    Without the final tie-break, two trades closed in the same second swap
+    places between refreshes — which is how a list becomes unreadable while it
+    is being read.
     """
-    return (str(line.get("at") or ""), str(line.get("day") or ""),
+    return (str(line.get("day") or ""), str(line.get("at") or ""),
             str(line.get("symbol") or ""), str(line.get("account") or ""))

@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from common.broker.interfaces import PlaceOrderRequest, to_decimal
 from webapp.agent.credentials import is_auth_error
+from webapp.timestamps import to_iso
 
 LOG = logging.getLogger("agent.gateway")
 
@@ -251,7 +252,10 @@ def normalise_trade(row: Dict[str, Any]) -> Dict[str, Any]:
         "value": _f(_first(row, "tradeValue", "orderValue")) or (qty * price),
         "product_type": product,
         "kind": product_kind(product),
-        "traded_at": _first(row, "orderDateTime", "tradeDateTime"),
+        # ISO, not the broker's day-first form: "31-Aug-2026" sorts after
+        # "03-Sep-2026" as text, and this field is what execution order is
+        # decided by. The original stays in `raw`.
+        "traded_at": to_iso(_first(row, "orderDateTime", "tradeDateTime")),
         "raw": row,
     }
 

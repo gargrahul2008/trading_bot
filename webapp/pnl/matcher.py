@@ -24,6 +24,8 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from webapp.timestamps import to_iso
+
 D0 = Decimal("0")
 
 BUY = "BUY"
@@ -119,10 +121,15 @@ def _sort_key(fill: Dict[str, Any]) -> Tuple[str, str, str]:
     wrong entry against an exit changes the P&L of both. Day first, then the
     timestamp, then the trade id as a stable tie-break for fills that share a
     timestamp — which they routinely do when one order fills in many pieces.
+
+    The timestamp is parsed rather than compared as text: Fyers writes
+    "31-Aug-2026 10:15:23", which sorts after "03-Sep-2026" as a string. The day
+    comes first here so that never reordered anything across days, but two
+    fills within one day whose stamps arrived in different shapes could.
     """
     return (
         str(fill.get("trading_day") or ""),
-        str(fill.get("traded_at") or ""),
+        to_iso(fill.get("traded_at")),
         str(fill.get("trade_id") or ""),
     )
 
