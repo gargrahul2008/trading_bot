@@ -114,7 +114,7 @@ class Match:
         }
 
 
-def _sort_key(fill: Dict[str, Any]) -> Tuple[str, str, str]:
+def _sort_key(fill: Dict[str, Any]) -> Tuple[str, str, str, str]:
     """Execution order.
 
     The tradebook does not come back in any guaranteed order, and matching the
@@ -126,10 +126,15 @@ def _sort_key(fill: Dict[str, Any]) -> Tuple[str, str, str]:
     "31-Aug-2026 10:15:23", which sorts after "03-Sep-2026" as a string. The day
     comes first here so that never reordered anything across days, but two
     fills within one day whose stamps arrived in different shapes could.
+
+    The raw string follows the parsed one, so a stamp that carries a time and no
+    date — "09:20" against "14:20" — still orders correctly among its own kind
+    instead of collapsing to a tie and falling through to the trade id.
     """
     return (
         str(fill.get("trading_day") or ""),
         to_iso(fill.get("traded_at")),
+        str(fill.get("traded_at") or ""),
         str(fill.get("trade_id") or ""),
     )
 
@@ -142,15 +147,118 @@ def book_key(fill: Dict[str, Any]) -> Tuple[str, str, str]:
     )
 
 
-def match_fills(fills: Iterable[Dict[str, Any]]) -> Tuple[List[Match], Dict[Tuple[str, str, str], List[Lot]]]:
-    """Match every fill FIFO within its own book.
+def _weighted(fills: List[Dict[str, Any]]) -> Tuple[Decimal, Decimal]:
+    """Total quantity and the average price paid or got across it."""
+    qty = sum((abs(_dec(f.get("qty"))) for f in fills), D0)
+    if qty == 0:
+        return D0, D0
+    value = sum((abs(_dec(f.get("qty"))) * _dec(f.get("price")) for f in fills), D0)
+    return qty, value / qty
 
-    Returns the closed round trips and whatever remains open. Open lots are part
-    of the answer, not a leftover: they are the position still carrying risk, and
-    their cost basis is what the next exit will be matched against.
+
+def net_same_day(fills: Iterable[Dict[str, Any]]
+                 ) -> Tuple[List[Match], List[Dict[str, Any]]]:
+    """Pair each day's buys against its sells before anything is carried.
+
+    This is the Indian treatment, and it is not a rounding of FIFO — it is a
+    different and more correct answer. What is bought and sold on one day is an
+    intraday trade whatever product it was booked under, and only the *net* of a
+    day touches the carried position. The charges module has always costed
+    trades this way; the P&L now agrees with it.
+
+    It matters most where it was most wrong. A grid bot buys and sells the same
+    scrip all day against a position held for months. Under plain FIFO every one
+    of those sells reached back and closed a lot from months ago: a day's
+    churning was reported as dozens of *positional* round trips, the carried
+    position's average price and entry date drifted with every trade, and once
+    the old lots ran out the next sell opened a short in a scrip that had only
+    ever been bought. Netting the day first leaves the carried position
+    untouched, which is what actually happened to it.
+
+    Returns the intraday round trips, and the residual fills — one per day per
+    book, for the net excess — to be carried into FIFO.
+    """
+    groups: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
+    for fill in fills:
+        side = str(fill.get("side") or "").upper()
+        if side not in (BUY, SELL) or abs(_dec(fill.get("qty"))) <= 0:
+            continue
+        key = book_key(fill) + (str(fill.get("trading_day") or ""),)
+        groups.setdefault(key, []).append(fill)
+
+    matches: List[Match] = []
+    residual: List[Dict[str, Any]] = []
+
+    for (account, symbol, product, day), group in groups.items():
+        buys = [f for f in group if str(f.get("side")).upper() == BUY]
+        sells = [f for f in group if str(f.get("side")).upper() == SELL]
+        buy_qty, avg_buy = _weighted(buys)
+        sell_qty, avg_sell = _weighted(sells)
+
+        if buy_qty == 0 or sell_qty == 0:
+            # Nothing round-tripped; the whole day carries.
+            residual.extend(group)
+            continue
+
+        matched = min(buy_qty, sell_qty)
+        ordered = sorted(group, key=_sort_key)
+        opened_first = str(ordered[0].get("side")).upper() == BUY
+
+        # One expression for both directions: bought low and sold high is a
+        # gain whichever leg came first.
+        matches.append(Match(
+            account=account, symbol=symbol, product_type=product,
+            direction=LONG if opened_first else SHORT,
+            qty=matched,
+            entry_price=avg_buy if opened_first else avg_sell,
+            exit_price=avg_sell if opened_first else avg_buy,
+            entry_trade_id=str(ordered[0].get("trade_id") or ""),
+            exit_trade_id=str(ordered[-1].get("trade_id") or ""),
+            entry_order_id=str(ordered[0].get("order_id") or ""),
+            exit_order_id=str(ordered[-1].get("order_id") or ""),
+            opened_day=day, closed_day=day,
+            opened_at=ordered[0].get("traded_at"),
+            closed_at=ordered[-1].get("traded_at"),
+            gross=matched * (avg_sell - avg_buy),
+        ))
+
+        excess = buy_qty - sell_qty
+        if excess == 0:
+            continue
+
+        # The net of the day, at that side's average, as one fill. Stamped with
+        # the last execution on that side so it sorts after the day's activity
+        # and can still be traced back to a real trade id.
+        side = BUY if excess > 0 else SELL
+        last = sorted([f for f in group if str(f.get("side")).upper() == side],
+                      key=_sort_key)[-1]
+        residual.append(dict(
+            last,
+            qty=str(abs(excess)),
+            price=str(avg_buy if excess > 0 else avg_sell),
+            trade_id="net:%s:%s" % (day, last.get("trade_id") or ""),
+        ))
+
+    return matches, residual
+
+
+def match_fills(fills: Iterable[Dict[str, Any]], net_days: bool = True
+                ) -> Tuple[List[Match], Dict[Tuple[str, str, str], List[Lot]]]:
+    """Match every fill, and report what is left open.
+
+    Each day is netted first (see `net_same_day`), then the net of each day is
+    matched FIFO against what was carried. Open lots are part of the answer, not
+    a leftover: they are the position still carrying risk, and their cost basis
+    is what the next exit will be matched against.
+
+    `net_days=False` matches every fill FIFO in sequence, ignoring the day. Only
+    for tests that are about FIFO itself.
     """
     books: Dict[Tuple[str, str, str], List[Lot]] = {}
     matches: List[Match] = []
+
+    if net_days:
+        matches, fills = net_same_day(fills)
 
     for fill in sorted(fills, key=_sort_key):
         qty = abs(_dec(fill.get("qty")))

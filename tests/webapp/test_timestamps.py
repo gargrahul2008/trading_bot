@@ -80,3 +80,16 @@ def test_a_row_with_no_readable_time_still_sorts_by_its_day():
                         match("2026-08-01", "01-Aug-2026 10:00:00", "NSE:OLD-EQ")])
 
     assert [line["symbol"] for line in lines] == ["NSE:NEW-EQ", "NSE:OLD-EQ"]
+
+
+def test_a_time_without_a_date_still_orders_among_its_own():
+    """to_iso cannot turn "09:20" into a full stamp and returns "". The sort key
+    keeps the raw string after the parsed one so those rows still order against
+    each other instead of collapsing to a tie and falling through to trade id —
+    which silently reversed a short round trip into a long one."""
+    from webapp.pnl.matcher import _sort_key
+
+    early = {"trading_day": "2026-09-02", "traded_at": "09:20", "trade_id": "s"}
+    late = {"trading_day": "2026-09-02", "traded_at": "14:20", "trade_id": "b"}
+
+    assert _sort_key(early) < _sort_key(late), "despite 's' sorting after 'b'"
