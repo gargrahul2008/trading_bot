@@ -32,7 +32,12 @@ class MarketDataLoader:
             raise ValueError(f"Unsupported file format: {source.suffix}")
         return self.prepare(frame)
 
-    def prepare(self, frame: pd.DataFrame, filter_session: bool = True) -> pd.DataFrame:
+    def prepare(
+        self,
+        frame: pd.DataFrame,
+        filter_session: bool = True,
+        validate_missing_candles: bool = True,
+    ) -> pd.DataFrame:
         missing_columns = REQUIRED_COLUMNS.difference(frame.columns)
         if missing_columns:
             raise ValueError(f"Missing required columns: {sorted(missing_columns)}")
@@ -51,7 +56,9 @@ class MarketDataLoader:
             prepared = prepared.loc[session_mask].reset_index(drop=True)
 
         self._validate_duplicates(prepared)
-        if filter_session:
+        # validate_missing_candles=False tolerates partial/special sessions (e.g.
+        # Diwali Muhurat) that legitimately lack the full 09:15–15:30 candle set.
+        if filter_session and validate_missing_candles:
             self._validate_missing_candles(prepared)
         self._validate_ohlcv(prepared)
         return prepared

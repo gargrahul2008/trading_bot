@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import time, timedelta
 from pathlib import Path
-from typing import Callable, Iterable, Literal
+from typing import Callable, Iterable, Literal, Optional
 
 import pandas as pd
 
@@ -20,6 +20,24 @@ from .types import CombinedSignal, InstrumentSpec, Position, SignalSide, Trade
 
 
 SignalFilter = Callable[[list[CombinedSignal], pd.DataFrame], tuple[list[CombinedSignal], list[dict[str, object]]]]
+
+
+@dataclass
+class _ChandelierState:
+    """Per-trade state for the ATR Chandelier trailing stop.
+
+    Two-phase per bar (same no-lookahead contract as the 44ma implementation):
+      Phase 1 — check_exit: judge bar against ``stop`` set by ALL PRIOR bars.
+      Phase 2 — update:     fold this bar into run-up extreme and ratchet stop
+                             for the NEXT bar only.
+    """
+    direction: str      # "LONG" | "SHORT"
+    entry_price: float
+    r_value: float      # 1R in price points (initial_stop distance)
+    stop: float         # the stop the NEXT bar will be judged against
+    highest_high: float # run-up extreme since entry (longs)
+    lowest_low: float   # run-down extreme since entry (shorts)
+    activated: bool = False
 
 
 @dataclass
@@ -58,6 +76,14 @@ class BacktestConfig:
     cooldown_minutes_after_exit: int = 0
     no_reentry_same_side_until_new_signal: bool = False
     use_trailing_stop: bool = False
+    # ── ATR Chandelier trailing stop (replaces milestone trail when True) ─────
+    # Requires 'atr' column in featured bars (FeatureEngine provides this).
+    # When armed (after chandelier_trail_after_R × 1R profit), stop =
+    # run_up_high - chandelier_atr_multiplier × ATR, ratcheting only upward.
+    use_chandelier_trail: bool = False
+    chandelier_atr_multiplier: float = 3.0   # stop hangs N×ATR below run-up high
+    chandelier_trail_after_R: float = 1.0    # arm after N × initial-risk profit
+    chandelier_breakeven: bool = True        # jump stop to entry on arming
     minimum_signal_score: float = 0.0
     minimum_reward_to_risk: float = 0.0
     minimum_signal_score_by_strategy: dict[str, float] = field(default_factory=dict)
@@ -172,7 +198,12 @@ class IntradayBacktester:
                 if position.symbol == row.symbol
             ]
             for position_key, position in open_position_items:
-                exit_decision = self._resolve_exit(position, row, config.time_exit_minutes, square_off_cutoff, config.session_end, config.use_trailing_stop, config.continuous_session)
+                exit_decision = self._resolve_exit(
+                    position, row, config.time_exit_minutes, square_off_cutoff, config.session_end,
+                    config.use_trailing_stop, config.continuous_session,
+                    config.use_chandelier_trail, config.chandelier_atr_multiplier,
+                    config.chandelier_trail_after_R, config.chandelier_breakeven,
+                )
                 if exit_decision is None:
                     continue
                 exit_price, exit_reason = exit_decision
@@ -266,6 +297,15 @@ class IntradayBacktester:
                             strategy_name=pe["strategy_name"],
                             trail_milestones=list(pe["milestones"]),
                         )
+                        if config.use_chandelier_trail and pe["stop"] is not None:
+                            _pos = open_positions[pk]
+                            _long = _pos.side is SignalSide.LONG
+                            _r = max(abs(fill_price - float(pe["stop"])), 1e-8)
+                            _pos.chandelier_state = _ChandelierState(
+                                direction="LONG" if _long else "SHORT",
+                                entry_price=fill_price, r_value=_r, stop=float(pe["stop"]),
+                                highest_high=fill_price, lowest_low=fill_price,
+                            )
                         symbol_trade_counts_by_day[(trade_date, row.symbol)] = (
                             symbol_trade_counts_by_day.get((trade_date, row.symbol), 0) + 1)
                         strategy_trade_counts_by_day[(trade_date, row.symbol, pe["strategy_name"])] = (
@@ -373,6 +413,16 @@ class IntradayBacktester:
                         strategy_name=signal.strategy_name,
                         trail_milestones=list(signal.trail_milestones),
                     )
+                    if config.use_chandelier_trail and signal.stop_price is not None:
+                        _pos = open_positions[position_key]
+                        _long = _pos.side is SignalSide.LONG
+                        _r = max(abs(float(signal.price) - float(signal.stop_price)), 1e-8)
+                        _pos.chandelier_state = _ChandelierState(
+                            direction="LONG" if _long else "SHORT",
+                            entry_price=float(signal.price), r_value=_r,
+                            stop=float(signal.stop_price),
+                            highest_high=float(signal.price), lowest_low=float(signal.price),
+                        )
                     symbol_trade_counts_by_day[(trade_date, row.symbol)] = (
                         symbol_trade_counts_by_day.get((trade_date, row.symbol), 0) + 1
                     )
@@ -605,6 +655,75 @@ class IntradayBacktester:
         return converted
 
     @staticmethod
+    def _resolve_chandelier(
+        position: Position,
+        row,
+        time_exit_minutes: Optional[int],
+        square_off_cutoff: timedelta,
+        session_end: time,
+        continuous_session: bool,
+        atr_mult: float,
+        trail_after_R: float,
+        use_breakeven: bool,
+    ) -> tuple[float, str] | None:
+        """ATR Chandelier exit logic. Strict two-phase, no lookahead:
+        Phase 1 — judge bar against stop from prior bars.
+        Phase 2 — fold this bar in and set stop for the NEXT bar."""
+        state: _ChandelierState = position.chandelier_state  # type: ignore[assignment]
+        long = state.direction == "LONG"
+
+        # Phase 1: exit check
+        breached = (float(row.low) <= state.stop) if long else (float(row.high) >= state.stop)
+        if breached:
+            return float(state.stop), "trail_stop" if state.activated else "stop_loss"
+
+        # Fixed Fib target still applies
+        if position.target_price is not None:
+            if (long and float(row.high) >= position.target_price) or \
+               (not long and float(row.low) <= position.target_price):
+                return float(position.target_price), "target"
+
+        # Time exit
+        if time_exit_minutes is not None:
+            holding_minutes = int((row.timestamp - position.entry_time).total_seconds() // 60)
+            if holding_minutes >= time_exit_minutes:
+                return float(row.close), "time_exit"
+
+        # Force square off (equity sessions)
+        if not continuous_session:
+            session_close = row.timestamp.normalize() + pd.Timedelta(
+                hours=session_end.hour, minutes=session_end.minute)
+            if row.timestamp >= session_close - square_off_cutoff:
+                return float(row.close), "force_square_off"
+
+        # Phase 2: update run-up extreme, arm, ratchet stop for the NEXT bar
+        state.highest_high = max(state.highest_high, float(row.high))
+        state.lowest_low = min(state.lowest_low, float(row.low))
+
+        if not state.activated:
+            trigger = state.r_value * trail_after_R
+            reached = (
+                float(row.high) >= state.entry_price + trigger if long
+                else float(row.low) <= state.entry_price - trigger
+            )
+            if reached:
+                state.activated = True
+                if use_breakeven:
+                    be = state.entry_price
+                    state.stop = max(state.stop, be) if long else min(state.stop, be)
+
+        if state.activated:
+            atr = getattr(row, "atr", None)
+            if atr is not None and not pd.isna(float(atr)):
+                atr_stop = (
+                    state.highest_high - atr_mult * float(atr) if long
+                    else state.lowest_low + atr_mult * float(atr)
+                )
+                state.stop = max(state.stop, atr_stop) if long else min(state.stop, atr_stop)
+
+        return None
+
+    @staticmethod
     def _resolve_exit(
         position: Position,
         row: pd.Series,
@@ -613,6 +732,10 @@ class IntradayBacktester:
         session_end: time,
         use_trailing_stop: bool = False,
         continuous_session: bool = False,
+        use_chandelier_trail: bool = False,
+        chandelier_atr_multiplier: float = 3.0,
+        chandelier_trail_after_R: float = 1.0,
+        chandelier_breakeven: bool = True,
     ) -> tuple[float, str] | None:
         # Carry-over guard: if the position's entry date != the current bar's trade_date, the
         # position was not squared off before the previous session ended (e.g. data gap or the
@@ -624,6 +747,14 @@ class IntradayBacktester:
             pos_date = pd.Timestamp(position.entry_time).tz_convert("Asia/Kolkata").date()
             if row_date != pos_date:
                 return float(row.close), "force_square_off"
+
+        # ATR Chandelier trail — replaces milestone trail / pending-stop logic when active.
+        if use_chandelier_trail and position.chandelier_state is not None:
+            return IntradayBacktester._resolve_chandelier(
+                position, row, time_exit_minutes, square_off_cutoff, session_end,
+                continuous_session, chandelier_atr_multiplier,
+                chandelier_trail_after_R, chandelier_breakeven,
+            )
 
         # Step 1: Apply pending stop from the previous bar (one-bar delay avoids same-bar exits).
         if position.stop_pending is not None:

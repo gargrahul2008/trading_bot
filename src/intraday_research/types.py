@@ -63,6 +63,7 @@ class Position:
     trail_milestone_idx: int = 0         # index of next milestone to watch
     stop_pending: Optional[float] = None # stop to apply on the NEXT bar (one-bar delay)
     partial_exit_done: bool = False      # True once 50% has been booked at the target
+    chandelier_state: Optional[object] = None  # _ChandelierState when ATR chandelier trail is active
 
 
 @dataclass(frozen=True)
