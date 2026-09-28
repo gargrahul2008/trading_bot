@@ -26,6 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--format", choices=["csv", "parquet"], default="parquet", help="Output file format")
     parser.add_argument("--chunk-days", type=int, default=30, help="Chunk size for FYERS history requests")
     parser.add_argument(
+        "--resolution",
+        default="1",
+        help="FYERS history resolution. Use 1/5/15 for intraday or D for daily positional "
+             "research — pair with --output-dir data/fyers_daily to match what "
+             "prepare_symbol_bars_for_scan / load_symbol_daily_data read from.",
+    )
+    parser.add_argument(
         "--refresh-auth-before-fetch",
         action="store_true",
         help="Refresh FYERS auth for the selected user before fetching the universe",
@@ -59,6 +66,8 @@ def main() -> int:
         args.format,
         "--chunk-days",
         str(args.chunk_days),
+        "--resolution",
+        args.resolution,
     ]
     if args.refresh_auth_before_fetch:
         command.append("--refresh-auth-before-fetch")

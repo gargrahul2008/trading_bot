@@ -1,0 +1,1268 @@
+{
+  "name": "nifty_fo_stocks_current",
+  "description": "Every stock with a currently-listed F&O contract on NSE (from the official market-lot file). Used to restrict SHORT signals to names that can actually be shorted \u2014 spot equities generally can't be shorted without an F&O market to borrow via. Refresh via scripts/build_fno_universe.py.",
+  "benchmark_symbol": "NSE:NIFTY50-INDEX",
+  "data_mode": "spot_proxy",
+  "symbols": [
+    {
+      "underlying": "360 ONE WAM LIMITED",
+      "symbol": "NSE:360ONE-EQ",
+      "data_symbol": "NSE:360ONE-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "ABB INDIA LIMITED",
+      "symbol": "NSE:ABB-EQ",
+      "data_symbol": "NSE:ABB-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "ADITYA BIRLA CAPITAL LTD.",
+      "symbol": "NSE:ABCAPITAL-EQ",
+      "data_symbol": "NSE:ABCAPITAL-EQ",
+      "lot_size": 3100
+    },
+    {
+      "underlying": "ADANI ENERGY SOLUTION LTD",
+      "symbol": "NSE:ADANIENSOL-EQ",
+      "data_symbol": "NSE:ADANIENSOL-EQ",
+      "lot_size": 675
+    },
+    {
+      "underlying": "ADANI ENTERPRISES LIMITED",
+      "symbol": "NSE:ADANIENT-EQ",
+      "data_symbol": "NSE:ADANIENT-EQ",
+      "lot_size": 309
+    },
+    {
+      "underlying": "ADANI GREEN ENERGY LTD",
+      "symbol": "NSE:ADANIGREEN-EQ",
+      "data_symbol": "NSE:ADANIGREEN-EQ",
+      "lot_size": 600
+    },
+    {
+      "underlying": "ADANI PORT & SEZ LTD",
+      "symbol": "NSE:ADANIPORTS-EQ",
+      "data_symbol": "NSE:ADANIPORTS-EQ",
+      "lot_size": 475
+    },
+    {
+      "underlying": "ADANI POWER LTD",
+      "symbol": "NSE:ADANIPOWER-EQ",
+      "data_symbol": "NSE:ADANIPOWER-EQ",
+      "lot_size": 3550
+    },
+    {
+      "underlying": "ALKEM LABORATORIES LTD.",
+      "symbol": "NSE:ALKEM-EQ",
+      "data_symbol": "NSE:ALKEM-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "AMBER ENTERPRISES (I) LTD",
+      "symbol": "NSE:AMBER-EQ",
+      "data_symbol": "NSE:AMBER-EQ",
+      "lot_size": 100
+    },
+    {
+      "underlying": "AMBUJA CEMENTS LTD",
+      "symbol": "NSE:AMBUJACEM-EQ",
+      "data_symbol": "NSE:AMBUJACEM-EQ",
+      "lot_size": 1200
+    },
+    {
+      "underlying": "ANGEL ONE LIMITED",
+      "symbol": "NSE:ANGELONE-EQ",
+      "data_symbol": "NSE:ANGELONE-EQ",
+      "lot_size": 2500
+    },
+    {
+      "underlying": "APL APOLLO TUBES LTD",
+      "symbol": "NSE:APLAPOLLO-EQ",
+      "data_symbol": "NSE:APLAPOLLO-EQ",
+      "lot_size": 350
+    },
+    {
+      "underlying": "APOLLO HOSPITALS ENTER. L",
+      "symbol": "NSE:APOLLOHOSP-EQ",
+      "data_symbol": "NSE:APOLLOHOSP-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "ASHOK LEYLAND LTD",
+      "symbol": "NSE:ASHOKLEY-EQ",
+      "data_symbol": "NSE:ASHOKLEY-EQ",
+      "lot_size": 5000
+    },
+    {
+      "underlying": "ASIAN PAINTS LIMITED",
+      "symbol": "NSE:ASIANPAINT-EQ",
+      "data_symbol": "NSE:ASIANPAINT-EQ",
+      "lot_size": 250
+    },
+    {
+      "underlying": "ASTRAL LIMITED",
+      "symbol": "NSE:ASTRAL-EQ",
+      "data_symbol": "NSE:ASTRAL-EQ",
+      "lot_size": 425
+    },
+    {
+      "underlying": "ATHER ENERGY LIMITED",
+      "symbol": "NSE:ATHERENERG-EQ",
+      "data_symbol": "NSE:ATHERENERG-EQ",
+      "lot_size": 375
+    },
+    {
+      "underlying": "AU SMALL FINANCE BANK LTD",
+      "symbol": "NSE:AUBANK-EQ",
+      "data_symbol": "NSE:AUBANK-EQ",
+      "lot_size": 1000
+    },
+    {
+      "underlying": "AUROBINDO PHARMA LTD",
+      "symbol": "NSE:AUROPHARMA-EQ",
+      "data_symbol": "NSE:AUROPHARMA-EQ",
+      "lot_size": 550
+    },
+    {
+      "underlying": "AXIS BANK LIMITED",
+      "symbol": "NSE:AXISBANK-EQ",
+      "data_symbol": "NSE:AXISBANK-EQ",
+      "lot_size": 625
+    },
+    {
+      "underlying": "BAJAJ AUTO LIMITED",
+      "symbol": "NSE:BAJAJ-AUTO-EQ",
+      "data_symbol": "NSE:BAJAJ-AUTO-EQ",
+      "lot_size": 75
+    },
+    {
+      "underlying": "BAJAJ FINSERV LTD.",
+      "symbol": "NSE:BAJAJFINSV-EQ",
+      "data_symbol": "NSE:BAJAJFINSV-EQ",
+      "lot_size": 300
+    },
+    {
+      "underlying": "BAJAJ HOLDINGS & INVS LTD",
+      "symbol": "NSE:BAJAJHLDNG-EQ",
+      "data_symbol": "NSE:BAJAJHLDNG-EQ",
+      "lot_size": 75
+    },
+    {
+      "underlying": "BAJAJ FINANCE LIMITED",
+      "symbol": "NSE:BAJFINANCE-EQ",
+      "data_symbol": "NSE:BAJFINANCE-EQ",
+      "lot_size": 750
+    },
+    {
+      "underlying": "BANDHAN BANK LIMITED",
+      "symbol": "NSE:BANDHANBNK-EQ",
+      "data_symbol": "NSE:BANDHANBNK-EQ",
+      "lot_size": 3600
+    },
+    {
+      "underlying": "BANK OF BARODA",
+      "symbol": "NSE:BANKBARODA-EQ",
+      "data_symbol": "NSE:BANKBARODA-EQ",
+      "lot_size": 2925
+    },
+    {
+      "underlying": "BANK OF INDIA",
+      "symbol": "NSE:BANKINDIA-EQ",
+      "data_symbol": "NSE:BANKINDIA-EQ",
+      "lot_size": 5200
+    },
+    {
+      "underlying": "BHARAT DYNAMICS LIMITED",
+      "symbol": "NSE:BDL-EQ",
+      "data_symbol": "NSE:BDL-EQ",
+      "lot_size": 425
+    },
+    {
+      "underlying": "BHARAT ELECTRONICS LTD",
+      "symbol": "NSE:BEL-EQ",
+      "data_symbol": "NSE:BEL-EQ",
+      "lot_size": 1425
+    },
+    {
+      "underlying": "BHARAT FORGE LTD",
+      "symbol": "NSE:BHARATFORG-EQ",
+      "data_symbol": "NSE:BHARATFORG-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "BHARTI AIRTEL LIMITED",
+      "symbol": "NSE:BHARTIARTL-EQ",
+      "data_symbol": "NSE:BHARTIARTL-EQ",
+      "lot_size": 475
+    },
+    {
+      "underlying": "BHEL",
+      "symbol": "NSE:BHEL-EQ",
+      "data_symbol": "NSE:BHEL-EQ",
+      "lot_size": 2625
+    },
+    {
+      "underlying": "BIOCON LIMITED.",
+      "symbol": "NSE:BIOCON-EQ",
+      "data_symbol": "NSE:BIOCON-EQ",
+      "lot_size": 2500
+    },
+    {
+      "underlying": "BLUE STAR LIMITED",
+      "symbol": "NSE:BLUESTARCO-EQ",
+      "data_symbol": "NSE:BLUESTARCO-EQ",
+      "lot_size": 325
+    },
+    {
+      "underlying": "BOSCH LIMITED",
+      "symbol": "NSE:BOSCHLTD-EQ",
+      "data_symbol": "NSE:BOSCHLTD-EQ",
+      "lot_size": 25
+    },
+    {
+      "underlying": "BHARAT PETROLEUM CORP  LT",
+      "symbol": "NSE:BPCL-EQ",
+      "data_symbol": "NSE:BPCL-EQ",
+      "lot_size": 1975
+    },
+    {
+      "underlying": "BRITANNIA INDUSTRIES LTD",
+      "symbol": "NSE:BRITANNIA-EQ",
+      "data_symbol": "NSE:BRITANNIA-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "BSE LIMITED",
+      "symbol": "NSE:BSE-EQ",
+      "data_symbol": "NSE:BSE-EQ",
+      "lot_size": 200
+    },
+    {
+      "underlying": "COMPUTER AGE MNGT SER LTD",
+      "symbol": "NSE:CAMS-EQ",
+      "data_symbol": "NSE:CAMS-EQ",
+      "lot_size": 825
+    },
+    {
+      "underlying": "CANARA BANK",
+      "symbol": "NSE:CANBK-EQ",
+      "data_symbol": "NSE:CANBK-EQ",
+      "lot_size": 6750
+    },
+    {
+      "underlying": "CENTRAL DEPO SER (I) LTD",
+      "symbol": "NSE:CDSL-EQ",
+      "data_symbol": "NSE:CDSL-EQ",
+      "lot_size": 475
+    },
+    {
+      "underlying": "CG POWER AND IND SOL LTD",
+      "symbol": "NSE:CGPOWER-EQ",
+      "data_symbol": "NSE:CGPOWER-EQ",
+      "lot_size": 850
+    },
+    {
+      "underlying": "CHOLAMANDALAM IN & FIN CO",
+      "symbol": "NSE:CHOLAFIN-EQ",
+      "data_symbol": "NSE:CHOLAFIN-EQ",
+      "lot_size": 625
+    },
+    {
+      "underlying": "CIPLA LTD",
+      "symbol": "NSE:CIPLA-EQ",
+      "data_symbol": "NSE:CIPLA-EQ",
+      "lot_size": 425
+    },
+    {
+      "underlying": "COAL INDIA LTD",
+      "symbol": "NSE:COALINDIA-EQ",
+      "data_symbol": "NSE:COALINDIA-EQ",
+      "lot_size": 1350
+    },
+    {
+      "underlying": "COCHIN SHIPYARD LIMITED",
+      "symbol": "NSE:COCHINSHIP-EQ",
+      "data_symbol": "NSE:COCHINSHIP-EQ",
+      "lot_size": 400
+    },
+    {
+      "underlying": "COFORGE LIMITED",
+      "symbol": "NSE:COFORGE-EQ",
+      "data_symbol": "NSE:COFORGE-EQ",
+      "lot_size": 475
+    },
+    {
+      "underlying": "COLGATE PALMOLIVE LTD.",
+      "symbol": "NSE:COLPAL-EQ",
+      "data_symbol": "NSE:COLPAL-EQ",
+      "lot_size": 275
+    },
+    {
+      "underlying": "CONTAINER CORP OF IND LTD",
+      "symbol": "NSE:CONCOR-EQ",
+      "data_symbol": "NSE:CONCOR-EQ",
+      "lot_size": 1250
+    },
+    {
+      "underlying": "CROMPT GREA CON ELEC LTD",
+      "symbol": "NSE:CROMPTON-EQ",
+      "data_symbol": "NSE:CROMPTON-EQ",
+      "lot_size": 2150
+    },
+    {
+      "underlying": "CUMMINS INDIA LTD",
+      "symbol": "NSE:CUMMINSIND-EQ",
+      "data_symbol": "NSE:CUMMINSIND-EQ",
+      "lot_size": 200
+    },
+    {
+      "underlying": "DABUR INDIA LTD",
+      "symbol": "NSE:DABUR-EQ",
+      "data_symbol": "NSE:DABUR-EQ",
+      "lot_size": 1250
+    },
+    {
+      "underlying": "DELHIVERY LIMITED",
+      "symbol": "NSE:DELHIVERY-EQ",
+      "data_symbol": "NSE:DELHIVERY-EQ",
+      "lot_size": 2075
+    },
+    {
+      "underlying": "DIVI S LABORATORIES LTD",
+      "symbol": "NSE:DIVISLAB-EQ",
+      "data_symbol": "NSE:DIVISLAB-EQ",
+      "lot_size": 100
+    },
+    {
+      "underlying": "DIXON TECHNO (INDIA) LTD",
+      "symbol": "NSE:DIXON-EQ",
+      "data_symbol": "NSE:DIXON-EQ",
+      "lot_size": 50
+    },
+    {
+      "underlying": "DLF LIMITED",
+      "symbol": "NSE:DLF-EQ",
+      "data_symbol": "NSE:DLF-EQ",
+      "lot_size": 950
+    },
+    {
+      "underlying": "AVENUE SUPERMARTS LIMITED",
+      "symbol": "NSE:DMART-EQ",
+      "data_symbol": "NSE:DMART-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "DR. REDDY S LABORATORIES",
+      "symbol": "NSE:DRREDDY-EQ",
+      "data_symbol": "NSE:DRREDDY-EQ",
+      "lot_size": 625
+    },
+    {
+      "underlying": "EICHER MOTORS LTD",
+      "symbol": "NSE:EICHERMOT-EQ",
+      "data_symbol": "NSE:EICHERMOT-EQ",
+      "lot_size": 100
+    },
+    {
+      "underlying": "ETERNAL LIMITED",
+      "symbol": "NSE:ETERNAL-EQ",
+      "data_symbol": "NSE:ETERNAL-EQ",
+      "lot_size": 2425
+    },
+    {
+      "underlying": "FEDERAL BANK LTD",
+      "symbol": "NSE:FEDERALBNK-EQ",
+      "data_symbol": "NSE:FEDERALBNK-EQ",
+      "lot_size": 2500
+    },
+    {
+      "underlying": "FORCE MOTORS LIMITED",
+      "symbol": "NSE:FORCEMOT-EQ",
+      "data_symbol": "NSE:FORCEMOT-EQ",
+      "lot_size": 25
+    },
+    {
+      "underlying": "FORTIS HEALTHCARE LTD",
+      "symbol": "NSE:FORTIS-EQ",
+      "data_symbol": "NSE:FORTIS-EQ",
+      "lot_size": 775
+    },
+    {
+      "underlying": "GAIL (INDIA) LTD",
+      "symbol": "NSE:GAIL-EQ",
+      "data_symbol": "NSE:GAIL-EQ",
+      "lot_size": 3550
+    },
+    {
+      "underlying": "GLENMARK PHARMACEUTICALS",
+      "symbol": "NSE:GLENMARK-EQ",
+      "data_symbol": "NSE:GLENMARK-EQ",
+      "lot_size": 375
+    },
+    {
+      "underlying": "GMR AIRPORTS LIMITED",
+      "symbol": "NSE:GMRAIRPORT-EQ",
+      "data_symbol": "NSE:GMRAIRPORT-EQ",
+      "lot_size": 6975
+    },
+    {
+      "underlying": "GODFREY PHILLIPS INDIA LT",
+      "symbol": "NSE:GODFRYPHLP-EQ",
+      "data_symbol": "NSE:GODFRYPHLP-EQ",
+      "lot_size": 275
+    },
+    {
+      "underlying": "GODREJ CONSUMER PRODUCTS",
+      "symbol": "NSE:GODREJCP-EQ",
+      "data_symbol": "NSE:GODREJCP-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "GODREJ PROPERTIES LTD",
+      "symbol": "NSE:GODREJPROP-EQ",
+      "data_symbol": "NSE:GODREJPROP-EQ",
+      "lot_size": 325
+    },
+    {
+      "underlying": "GRASIM INDUSTRIES LTD",
+      "symbol": "NSE:GRASIM-EQ",
+      "data_symbol": "NSE:GRASIM-EQ",
+      "lot_size": 250
+    },
+    {
+      "underlying": "GE VERNOVA T&D INDIA LTD",
+      "symbol": "NSE:GVT&D-EQ",
+      "data_symbol": "NSE:GVT&D-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "HINDUSTAN AERONAUTICS LTD",
+      "symbol": "NSE:HAL-EQ",
+      "data_symbol": "NSE:HAL-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "HAVELLS INDIA LIMITED",
+      "symbol": "NSE:HAVELLS-EQ",
+      "data_symbol": "NSE:HAVELLS-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "HCL TECHNOLOGIES LTD",
+      "symbol": "NSE:HCLTECH-EQ",
+      "data_symbol": "NSE:HCLTECH-EQ",
+      "lot_size": 400
+    },
+    {
+      "underlying": "HDFC AMC LIMITED",
+      "symbol": "NSE:HDFCAMC-EQ",
+      "data_symbol": "NSE:HDFCAMC-EQ",
+      "lot_size": 300
+    },
+    {
+      "underlying": "HDFC BANK LTD",
+      "symbol": "NSE:HDFCBANK-EQ",
+      "data_symbol": "NSE:HDFCBANK-EQ",
+      "lot_size": 650
+    },
+    {
+      "underlying": "HDFC LIFE INS CO LTD",
+      "symbol": "NSE:HDFCLIFE-EQ",
+      "data_symbol": "NSE:HDFCLIFE-EQ",
+      "lot_size": 1100
+    },
+    {
+      "underlying": "HERO MOTOCORP LIMITED",
+      "symbol": "NSE:HEROMOTOCO-EQ",
+      "data_symbol": "NSE:HEROMOTOCO-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "HINDALCO  INDUSTRIES  LTD",
+      "symbol": "NSE:HINDALCO-EQ",
+      "data_symbol": "NSE:HINDALCO-EQ",
+      "lot_size": 700
+    },
+    {
+      "underlying": "HINDUSTAN PETROLEUM CORP",
+      "symbol": "NSE:HINDPETRO-EQ",
+      "data_symbol": "NSE:HINDPETRO-EQ",
+      "lot_size": 2025
+    },
+    {
+      "underlying": "HINDUSTAN UNILEVER LTD.",
+      "symbol": "NSE:HINDUNILVR-EQ",
+      "data_symbol": "NSE:HINDUNILVR-EQ",
+      "lot_size": 300
+    },
+    {
+      "underlying": "HINDUSTAN ZINC LIMITED",
+      "symbol": "NSE:HINDZINC-EQ",
+      "data_symbol": "NSE:HINDZINC-EQ",
+      "lot_size": 1225
+    },
+    {
+      "underlying": "HYUNDAI MOTOR INDIA LTD",
+      "symbol": "NSE:HYUNDAI-EQ",
+      "data_symbol": "NSE:HYUNDAI-EQ",
+      "lot_size": 275
+    },
+    {
+      "underlying": "ICICI BANK LTD.",
+      "symbol": "NSE:ICICIBANK-EQ",
+      "data_symbol": "NSE:ICICIBANK-EQ",
+      "lot_size": 700
+    },
+    {
+      "underlying": "ICICI LOMBARD GIC LIMITED",
+      "symbol": "NSE:ICICIGI-EQ",
+      "data_symbol": "NSE:ICICIGI-EQ",
+      "lot_size": 325
+    },
+    {
+      "underlying": "ICICI PRU LIFE INS CO LTD",
+      "symbol": "NSE:ICICIPRULI-EQ",
+      "data_symbol": "NSE:ICICIPRULI-EQ",
+      "lot_size": 925
+    },
+    {
+      "underlying": "VODAFONE IDEA LIMITED",
+      "symbol": "NSE:IDEA-EQ",
+      "data_symbol": "NSE:IDEA-EQ",
+      "lot_size": 71475
+    },
+    {
+      "underlying": "IDFC FIRST BANK LIMITED",
+      "symbol": "NSE:IDFCFIRSTB-EQ",
+      "data_symbol": "NSE:IDFCFIRSTB-EQ",
+      "lot_size": 9275
+    },
+    {
+      "underlying": "INDIAN ENERGY EXC LTD",
+      "symbol": "NSE:IEX-EQ",
+      "data_symbol": "NSE:IEX-EQ",
+      "lot_size": 4350
+    },
+    {
+      "underlying": "THE INDIAN HOTELS CO. LTD",
+      "symbol": "NSE:INDHOTEL-EQ",
+      "data_symbol": "NSE:INDHOTEL-EQ",
+      "lot_size": 1000
+    },
+    {
+      "underlying": "INDIAN BANK",
+      "symbol": "NSE:INDIANB-EQ",
+      "data_symbol": "NSE:INDIANB-EQ",
+      "lot_size": 1000
+    },
+    {
+      "underlying": "INTERGLOBE AVIATION LTD",
+      "symbol": "NSE:INDIGO-EQ",
+      "data_symbol": "NSE:INDIGO-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "INDUSIND BANK LIMITED",
+      "symbol": "NSE:INDUSINDBK-EQ",
+      "data_symbol": "NSE:INDUSINDBK-EQ",
+      "lot_size": 700
+    },
+    {
+      "underlying": "INDUS TOWERS LIMITED",
+      "symbol": "NSE:INDUSTOWER-EQ",
+      "data_symbol": "NSE:INDUSTOWER-EQ",
+      "lot_size": 1700
+    },
+    {
+      "underlying": "INFOSYS LIMITED",
+      "symbol": "NSE:INFY-EQ",
+      "data_symbol": "NSE:INFY-EQ",
+      "lot_size": 400
+    },
+    {
+      "underlying": "INOX WIND LIMITED",
+      "symbol": "NSE:INOXWIND-EQ",
+      "data_symbol": "NSE:INOXWIND-EQ",
+      "lot_size": 6400
+    },
+    {
+      "underlying": "INDIAN OIL CORP LTD",
+      "symbol": "NSE:IOC-EQ",
+      "data_symbol": "NSE:IOC-EQ",
+      "lot_size": 4875
+    },
+    {
+      "underlying": "INDIAN RENEWABLE ENERGY",
+      "symbol": "NSE:IREDA-EQ",
+      "data_symbol": "NSE:IREDA-EQ",
+      "lot_size": 4525
+    },
+    {
+      "underlying": "INDIAN RAILWAY FIN CORP L",
+      "symbol": "NSE:IRFC-EQ",
+      "data_symbol": "NSE:IRFC-EQ",
+      "lot_size": 5425
+    },
+    {
+      "underlying": "ITC LTD",
+      "symbol": "NSE:ITC-EQ",
+      "data_symbol": "NSE:ITC-EQ",
+      "lot_size": 1725
+    },
+    {
+      "underlying": "JINDAL STEEL LIMITED",
+      "symbol": "NSE:JINDALSTEL-EQ",
+      "data_symbol": "NSE:JINDALSTEL-EQ",
+      "lot_size": 625
+    },
+    {
+      "underlying": "JIO FIN SERVICES LTD",
+      "symbol": "NSE:JIOFIN-EQ",
+      "data_symbol": "NSE:JIOFIN-EQ",
+      "lot_size": 2350
+    },
+    {
+      "underlying": "JSW ENERGY LIMITED",
+      "symbol": "NSE:JSWENERGY-EQ",
+      "data_symbol": "NSE:JSWENERGY-EQ",
+      "lot_size": 1075
+    },
+    {
+      "underlying": "JSW STEEL LIMITED",
+      "symbol": "NSE:JSWSTEEL-EQ",
+      "data_symbol": "NSE:JSWSTEEL-EQ",
+      "lot_size": 675
+    },
+    {
+      "underlying": "JUBILANT FOODWORKS LTD",
+      "symbol": "NSE:JUBLFOOD-EQ",
+      "data_symbol": "NSE:JUBLFOOD-EQ",
+      "lot_size": 1250
+    },
+    {
+      "underlying": "KALYAN JEWELLERS IND LTD",
+      "symbol": "NSE:KALYANKJIL-EQ",
+      "data_symbol": "NSE:KALYANKJIL-EQ",
+      "lot_size": 1350
+    },
+    {
+      "underlying": "KAYNES TECHNOLOGY IND LTD",
+      "symbol": "NSE:KAYNES-EQ",
+      "data_symbol": "NSE:KAYNES-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "KEI INDUSTRIES LTD.",
+      "symbol": "NSE:KEI-EQ",
+      "data_symbol": "NSE:KEI-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "KFIN TECHNOLOGIES LIMITED",
+      "symbol": "NSE:KFINTECH-EQ",
+      "data_symbol": "NSE:KFINTECH-EQ",
+      "lot_size": 575
+    },
+    {
+      "underlying": "KOTAK MAHINDRA BANK LTD",
+      "symbol": "NSE:KOTAKBANK-EQ",
+      "data_symbol": "NSE:KOTAKBANK-EQ",
+      "lot_size": 2000
+    },
+    {
+      "underlying": "KPIT TECHNOLOGIES LIMITED",
+      "symbol": "NSE:KPITTECH-EQ",
+      "data_symbol": "NSE:KPITTECH-EQ",
+      "lot_size": 775
+    },
+    {
+      "underlying": "LAURUS LABS LIMITED",
+      "symbol": "NSE:LAURUSLABS-EQ",
+      "data_symbol": "NSE:LAURUSLABS-EQ",
+      "lot_size": 850
+    },
+    {
+      "underlying": "LIC HOUSING FINANCE LTD",
+      "symbol": "NSE:LICHSGFIN-EQ",
+      "data_symbol": "NSE:LICHSGFIN-EQ",
+      "lot_size": 1000
+    },
+    {
+      "underlying": "LIFE INSURA CORP OF INDIA",
+      "symbol": "NSE:LICI-EQ",
+      "data_symbol": "NSE:LICI-EQ",
+      "lot_size": 1400
+    },
+    {
+      "underlying": "LODHA DEVELOPERS LIMITED",
+      "symbol": "NSE:LODHA-EQ",
+      "data_symbol": "NSE:LODHA-EQ",
+      "lot_size": 625
+    },
+    {
+      "underlying": "LARSEN & TOUBRO LTD.",
+      "symbol": "NSE:LT-EQ",
+      "data_symbol": "NSE:LT-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "L&T FINANCE LIMITED",
+      "symbol": "NSE:LTF-EQ",
+      "data_symbol": "NSE:LTF-EQ",
+      "lot_size": 2250
+    },
+    {
+      "underlying": "LTM LIMITED",
+      "symbol": "NSE:LTM-EQ",
+      "data_symbol": "NSE:LTM-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "LUPIN LIMITED",
+      "symbol": "NSE:LUPIN-EQ",
+      "data_symbol": "NSE:LUPIN-EQ",
+      "lot_size": 425
+    },
+    {
+      "underlying": "MAHINDRA & MAHINDRA LTD",
+      "symbol": "NSE:M&M-EQ",
+      "data_symbol": "NSE:M&M-EQ",
+      "lot_size": 200
+    },
+    {
+      "underlying": "BANK OF MAHARASHTRA",
+      "symbol": "NSE:MAHABANK-EQ",
+      "data_symbol": "NSE:MAHABANK-EQ",
+      "lot_size": 6500
+    },
+    {
+      "underlying": "MANAPPURAM FINANCE LTD",
+      "symbol": "NSE:MANAPPURAM-EQ",
+      "data_symbol": "NSE:MANAPPURAM-EQ",
+      "lot_size": 3000
+    },
+    {
+      "underlying": "MANKIND PHARMA LIMITED",
+      "symbol": "NSE:MANKIND-EQ",
+      "data_symbol": "NSE:MANKIND-EQ",
+      "lot_size": 250
+    },
+    {
+      "underlying": "MARICO LIMITED",
+      "symbol": "NSE:MARICO-EQ",
+      "data_symbol": "NSE:MARICO-EQ",
+      "lot_size": 1200
+    },
+    {
+      "underlying": "MARUTI SUZUKI INDIA LTD.",
+      "symbol": "NSE:MARUTI-EQ",
+      "data_symbol": "NSE:MARUTI-EQ",
+      "lot_size": 50
+    },
+    {
+      "underlying": "MAX HEALTHCARE INS LTD",
+      "symbol": "NSE:MAXHEALTH-EQ",
+      "data_symbol": "NSE:MAXHEALTH-EQ",
+      "lot_size": 525
+    },
+    {
+      "underlying": "MAZAGON DOCK SHIPBUIL LTD",
+      "symbol": "NSE:MAZDOCK-EQ",
+      "data_symbol": "NSE:MAZDOCK-EQ",
+      "lot_size": 225
+    },
+    {
+      "underlying": "MULTI COMMODITY EXCHANGE",
+      "symbol": "NSE:MCX-EQ",
+      "data_symbol": "NSE:MCX-EQ",
+      "lot_size": 225
+    },
+    {
+      "underlying": "MAX FINANCIAL SERV LTD",
+      "symbol": "NSE:MFSL-EQ",
+      "data_symbol": "NSE:MFSL-EQ",
+      "lot_size": 400
+    },
+    {
+      "underlying": "SAMVRDHNA MTHRSN INTL LTD",
+      "symbol": "NSE:MOTHERSON-EQ",
+      "data_symbol": "NSE:MOTHERSON-EQ",
+      "lot_size": 6150
+    },
+    {
+      "underlying": "MOTILAL OSWAL FIN LTD",
+      "symbol": "NSE:MOTILALOFS-EQ",
+      "data_symbol": "NSE:MOTILALOFS-EQ",
+      "lot_size": 775
+    },
+    {
+      "underlying": "MPHASIS LIMITED",
+      "symbol": "NSE:MPHASIS-EQ",
+      "data_symbol": "NSE:MPHASIS-EQ",
+      "lot_size": 275
+    },
+    {
+      "underlying": "MUTHOOT FINANCE LIMITED",
+      "symbol": "NSE:MUTHOOTFIN-EQ",
+      "data_symbol": "NSE:MUTHOOTFIN-EQ",
+      "lot_size": 275
+    },
+    {
+      "underlying": "NIPPON L I A M LTD",
+      "symbol": "NSE:NAM-INDIA-EQ",
+      "data_symbol": "NSE:NAM-INDIA-EQ",
+      "lot_size": 625
+    },
+    {
+      "underlying": "NATIONAL ALUMINIUM CO LTD",
+      "symbol": "NSE:NATIONALUM-EQ",
+      "data_symbol": "NSE:NATIONALUM-EQ",
+      "lot_size": 1875
+    },
+    {
+      "underlying": "INFO EDGE (I) LTD",
+      "symbol": "NSE:NAUKRI-EQ",
+      "data_symbol": "NSE:NAUKRI-EQ",
+      "lot_size": 550
+    },
+    {
+      "underlying": "NBCC (INDIA) LIMITED",
+      "symbol": "NSE:NBCC-EQ",
+      "data_symbol": "NSE:NBCC-EQ",
+      "lot_size": 6500
+    },
+    {
+      "underlying": "NESTLE INDIA LIMITED",
+      "symbol": "NSE:NESTLEIND-EQ",
+      "data_symbol": "NSE:NESTLEIND-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "NHPC LTD",
+      "symbol": "NSE:NHPC-EQ",
+      "data_symbol": "NSE:NHPC-EQ",
+      "lot_size": 6950
+    },
+    {
+      "underlying": "NMDC LTD.",
+      "symbol": "NSE:NMDC-EQ",
+      "data_symbol": "NSE:NMDC-EQ",
+      "lot_size": 6750
+    },
+    {
+      "underlying": "NTPC LTD",
+      "symbol": "NSE:NTPC-EQ",
+      "data_symbol": "NSE:NTPC-EQ",
+      "lot_size": 1500
+    },
+    {
+      "underlying": "FSN E COMMERCE VENTURES",
+      "symbol": "NSE:NYKAA-EQ",
+      "data_symbol": "NSE:NYKAA-EQ",
+      "lot_size": 3125
+    },
+    {
+      "underlying": "OBEROI REALTY LIMITED",
+      "symbol": "NSE:OBEROIRLTY-EQ",
+      "data_symbol": "NSE:OBEROIRLTY-EQ",
+      "lot_size": 350
+    },
+    {
+      "underlying": "ORACLE FIN SERV SOFT LTD.",
+      "symbol": "NSE:OFSS-EQ",
+      "data_symbol": "NSE:OFSS-EQ",
+      "lot_size": 100
+    },
+    {
+      "underlying": "OIL INDIA LTD",
+      "symbol": "NSE:OIL-EQ",
+      "data_symbol": "NSE:OIL-EQ",
+      "lot_size": 1400
+    },
+    {
+      "underlying": "OIL AND NATURAL GAS CORP.",
+      "symbol": "NSE:ONGC-EQ",
+      "data_symbol": "NSE:ONGC-EQ",
+      "lot_size": 2250
+    },
+    {
+      "underlying": "PAGE INDUSTRIES LTD",
+      "symbol": "NSE:PAGEIND-EQ",
+      "data_symbol": "NSE:PAGEIND-EQ",
+      "lot_size": 20
+    },
+    {
+      "underlying": "PATANJALI FOODS LIMITED",
+      "symbol": "NSE:PATANJALI-EQ",
+      "data_symbol": "NSE:PATANJALI-EQ",
+      "lot_size": 1075
+    },
+    {
+      "underlying": "ONE 97 COMMUNICATIONS LTD",
+      "symbol": "NSE:PAYTM-EQ",
+      "data_symbol": "NSE:PAYTM-EQ",
+      "lot_size": 725
+    },
+    {
+      "underlying": "PERSISTENT SYSTEMS LTD",
+      "symbol": "NSE:PERSISTENT-EQ",
+      "data_symbol": "NSE:PERSISTENT-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "PETRONET LNG LIMITED",
+      "symbol": "NSE:PETRONET-EQ",
+      "data_symbol": "NSE:PETRONET-EQ",
+      "lot_size": 1900
+    },
+    {
+      "underlying": "POWER FIN CORP LTD.",
+      "symbol": "NSE:PFC-EQ",
+      "data_symbol": "NSE:PFC-EQ",
+      "lot_size": 1300
+    },
+    {
+      "underlying": "PG ELECTROPLAST LTD",
+      "symbol": "NSE:PGEL-EQ",
+      "data_symbol": "NSE:PGEL-EQ",
+      "lot_size": 950
+    },
+    {
+      "underlying": "THE PHOENIX MILLS LTD",
+      "symbol": "NSE:PHOENIXLTD-EQ",
+      "data_symbol": "NSE:PHOENIXLTD-EQ",
+      "lot_size": 350
+    },
+    {
+      "underlying": "PIDILITE INDUSTRIES LTD",
+      "symbol": "NSE:PIDILITIND-EQ",
+      "data_symbol": "NSE:PIDILITIND-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "PI INDUSTRIES LTD",
+      "symbol": "NSE:PIIND-EQ",
+      "data_symbol": "NSE:PIIND-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "PUNJAB NATIONAL BANK",
+      "symbol": "NSE:PNB-EQ",
+      "data_symbol": "NSE:PNB-EQ",
+      "lot_size": 8000
+    },
+    {
+      "underlying": "PNB HOUSING FIN LTD.",
+      "symbol": "NSE:PNBHOUSING-EQ",
+      "data_symbol": "NSE:PNBHOUSING-EQ",
+      "lot_size": 650
+    },
+    {
+      "underlying": "PB FINTECH LIMITED",
+      "symbol": "NSE:POLICYBZR-EQ",
+      "data_symbol": "NSE:POLICYBZR-EQ",
+      "lot_size": 350
+    },
+    {
+      "underlying": "POLYCAB INDIA LIMITED",
+      "symbol": "NSE:POLYCAB-EQ",
+      "data_symbol": "NSE:POLYCAB-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "POWER GRID CORP. LTD.",
+      "symbol": "NSE:POWERGRID-EQ",
+      "data_symbol": "NSE:POWERGRID-EQ",
+      "lot_size": 1900
+    },
+    {
+      "underlying": "HITACHI ENERGY INDIA LTD",
+      "symbol": "NSE:POWERINDIA-EQ",
+      "data_symbol": "NSE:POWERINDIA-EQ",
+      "lot_size": 25
+    },
+    {
+      "underlying": "PREMIER ENERGIES LIMITED",
+      "symbol": "NSE:PREMIERENE-EQ",
+      "data_symbol": "NSE:PREMIERENE-EQ",
+      "lot_size": 650
+    },
+    {
+      "underlying": "PRESTIGE ESTATE LTD",
+      "symbol": "NSE:PRESTIGE-EQ",
+      "data_symbol": "NSE:PRESTIGE-EQ",
+      "lot_size": 450
+    },
+    {
+      "underlying": "RADICO KHAITAN LTD",
+      "symbol": "NSE:RADICO-EQ",
+      "data_symbol": "NSE:RADICO-EQ",
+      "lot_size": 150
+    },
+    {
+      "underlying": "RBL BANK LIMITED",
+      "symbol": "NSE:RBLBANK-EQ",
+      "data_symbol": "NSE:RBLBANK-EQ",
+      "lot_size": 3175
+    },
+    {
+      "underlying": "REC LIMITED",
+      "symbol": "NSE:RECLTD-EQ",
+      "data_symbol": "NSE:RECLTD-EQ",
+      "lot_size": 1575
+    },
+    {
+      "underlying": "RELIANCE INDUSTRIES LTD",
+      "symbol": "NSE:RELIANCE-EQ",
+      "data_symbol": "NSE:RELIANCE-EQ",
+      "lot_size": 500
+    },
+    {
+      "underlying": "RAIL VIKAS NIGAM LIMITED",
+      "symbol": "NSE:RVNL-EQ",
+      "data_symbol": "NSE:RVNL-EQ",
+      "lot_size": 1925
+    },
+    {
+      "underlying": "SAGILITY LIMITED",
+      "symbol": "NSE:SAGILITY-EQ",
+      "data_symbol": "NSE:SAGILITY-EQ",
+      "lot_size": 12000
+    },
+    {
+      "underlying": "STEEL AUTHORITY OF INDIA",
+      "symbol": "NSE:SAIL-EQ",
+      "data_symbol": "NSE:SAIL-EQ",
+      "lot_size": 4700
+    },
+    {
+      "underlying": "SBI CARDS & PAY SER LTD",
+      "symbol": "NSE:SBICARD-EQ",
+      "data_symbol": "NSE:SBICARD-EQ",
+      "lot_size": 800
+    },
+    {
+      "underlying": "SBI LIFE INSURANCE CO LTD",
+      "symbol": "NSE:SBILIFE-EQ",
+      "data_symbol": "NSE:SBILIFE-EQ",
+      "lot_size": 375
+    },
+    {
+      "underlying": "STATE BANK OF INDIA",
+      "symbol": "NSE:SBIN-EQ",
+      "data_symbol": "NSE:SBIN-EQ",
+      "lot_size": 750
+    },
+    {
+      "underlying": "SHREE CEMENT LIMITED",
+      "symbol": "NSE:SHREECEM-EQ",
+      "data_symbol": "NSE:SHREECEM-EQ",
+      "lot_size": 25
+    },
+    {
+      "underlying": "SHRIRAM FINANCE LIMITED",
+      "symbol": "NSE:SHRIRAMFIN-EQ",
+      "data_symbol": "NSE:SHRIRAMFIN-EQ",
+      "lot_size": 825
+    },
+    {
+      "underlying": "SIEMENS LTD",
+      "symbol": "NSE:SIEMENS-EQ",
+      "data_symbol": "NSE:SIEMENS-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "SOLAR INDUSTRIES (I) LTD",
+      "symbol": "NSE:SOLARINDS-EQ",
+      "data_symbol": "NSE:SOLARINDS-EQ",
+      "lot_size": 50
+    },
+    {
+      "underlying": "SONA BLW PRECISION FRGS L",
+      "symbol": "NSE:SONACOMS-EQ",
+      "data_symbol": "NSE:SONACOMS-EQ",
+      "lot_size": 1225
+    },
+    {
+      "underlying": "SRF LTD",
+      "symbol": "NSE:SRF-EQ",
+      "data_symbol": "NSE:SRF-EQ",
+      "lot_size": 200
+    },
+    {
+      "underlying": "SUN PHARMACEUTICAL IND L",
+      "symbol": "NSE:SUNPHARMA-EQ",
+      "data_symbol": "NSE:SUNPHARMA-EQ",
+      "lot_size": 350
+    },
+    {
+      "underlying": "SUPREME INDUSTRIES LTD",
+      "symbol": "NSE:SUPREMEIND-EQ",
+      "data_symbol": "NSE:SUPREMEIND-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "SUZLON ENERGY LIMITED",
+      "symbol": "NSE:SUZLON-EQ",
+      "data_symbol": "NSE:SUZLON-EQ",
+      "lot_size": 12700
+    },
+    {
+      "underlying": "SWIGGY LIMITED",
+      "symbol": "NSE:SWIGGY-EQ",
+      "data_symbol": "NSE:SWIGGY-EQ",
+      "lot_size": 1825
+    },
+    {
+      "underlying": "TATA CONSUMER PRODUCT LTD",
+      "symbol": "NSE:TATACONSUM-EQ",
+      "data_symbol": "NSE:TATACONSUM-EQ",
+      "lot_size": 550
+    },
+    {
+      "underlying": "TATA ELXSI LIMITED",
+      "symbol": "NSE:TATAELXSI-EQ",
+      "data_symbol": "NSE:TATAELXSI-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "TATA POWER CO LTD",
+      "symbol": "NSE:TATAPOWER-EQ",
+      "data_symbol": "NSE:TATAPOWER-EQ",
+      "lot_size": 1450
+    },
+    {
+      "underlying": "TATA STEEL LIMITED",
+      "symbol": "NSE:TATASTEEL-EQ",
+      "data_symbol": "NSE:TATASTEEL-EQ",
+      "lot_size": 2750
+    },
+    {
+      "underlying": "TATA CONSULTANCY SERV LT",
+      "symbol": "NSE:TCS-EQ",
+      "data_symbol": "NSE:TCS-EQ",
+      "lot_size": 225
+    },
+    {
+      "underlying": "TECH MAHINDRA LIMITED",
+      "symbol": "NSE:TECHM-EQ",
+      "data_symbol": "NSE:TECHM-EQ",
+      "lot_size": 600
+    },
+    {
+      "underlying": "TUBE INVEST OF INDIA LTD",
+      "symbol": "NSE:TIINDIA-EQ",
+      "data_symbol": "NSE:TIINDIA-EQ",
+      "lot_size": 200
+    },
+    {
+      "underlying": "TITAN COMPANY LIMITED",
+      "symbol": "NSE:TITAN-EQ",
+      "data_symbol": "NSE:TITAN-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "TATA MOTORS PASS VEH LTD",
+      "symbol": "NSE:TMPV-EQ",
+      "data_symbol": "NSE:TMPV-EQ",
+      "lot_size": 1600
+    },
+    {
+      "underlying": "TORRENT PHARMACEUTICALS L",
+      "symbol": "NSE:TORNTPHARM-EQ",
+      "data_symbol": "NSE:TORNTPHARM-EQ",
+      "lot_size": 125
+    },
+    {
+      "underlying": "TRENT LTD",
+      "symbol": "NSE:TRENT-EQ",
+      "data_symbol": "NSE:TRENT-EQ",
+      "lot_size": 225
+    },
+    {
+      "underlying": "TVS MOTOR COMPANY  LTD",
+      "symbol": "NSE:TVSMOTOR-EQ",
+      "data_symbol": "NSE:TVSMOTOR-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "ULTRATECH CEMENT LIMITED",
+      "symbol": "NSE:ULTRACEMCO-EQ",
+      "data_symbol": "NSE:ULTRACEMCO-EQ",
+      "lot_size": 50
+    },
+    {
+      "underlying": "UNION BANK OF INDIA",
+      "symbol": "NSE:UNIONBANK-EQ",
+      "data_symbol": "NSE:UNIONBANK-EQ",
+      "lot_size": 4425
+    },
+    {
+      "underlying": "UNITED SPIRITS LIMITED",
+      "symbol": "NSE:UNITDSPR-EQ",
+      "data_symbol": "NSE:UNITDSPR-EQ",
+      "lot_size": 400
+    },
+    {
+      "underlying": "UNO MINDA LIMITED",
+      "symbol": "NSE:UNOMINDA-EQ",
+      "data_symbol": "NSE:UNOMINDA-EQ",
+      "lot_size": 550
+    },
+    {
+      "underlying": "UPL LIMITED",
+      "symbol": "NSE:UPL-EQ",
+      "data_symbol": "NSE:UPL-EQ",
+      "lot_size": 1355
+    },
+    {
+      "underlying": "VARUN BEVERAGES LIMITED",
+      "symbol": "NSE:VBL-EQ",
+      "data_symbol": "NSE:VBL-EQ",
+      "lot_size": 1275
+    },
+    {
+      "underlying": "VEDANTA LIMITED",
+      "symbol": "NSE:VEDL-EQ",
+      "data_symbol": "NSE:VEDL-EQ",
+      "lot_size": 1150
+    },
+    {
+      "underlying": "VISHAL MEGA MART LIMITED",
+      "symbol": "NSE:VMM-EQ",
+      "data_symbol": "NSE:VMM-EQ",
+      "lot_size": 4850
+    },
+    {
+      "underlying": "VOLTAS LTD",
+      "symbol": "NSE:VOLTAS-EQ",
+      "data_symbol": "NSE:VOLTAS-EQ",
+      "lot_size": 375
+    },
+    {
+      "underlying": "WAAREE ENERGIES LIMITED",
+      "symbol": "NSE:WAAREEENER-EQ",
+      "data_symbol": "NSE:WAAREEENER-EQ",
+      "lot_size": 175
+    },
+    {
+      "underlying": "WIPRO LTD",
+      "symbol": "NSE:WIPRO-EQ",
+      "data_symbol": "NSE:WIPRO-EQ",
+      "lot_size": 3000
+    },
+    {
+      "underlying": "YES BANK LIMITED",
+      "symbol": "NSE:YESBANK-EQ",
+      "data_symbol": "NSE:YESBANK-EQ",
+      "lot_size": 31100
+    },
+    {
+      "underlying": "ZYDUS LIFESCIENCES LTD",
+      "symbol": "NSE:ZYDUSLIFE-EQ",
+      "data_symbol": "NSE:ZYDUSLIFE-EQ",
+      "lot_size": 900
+    }
+  ]
+}
