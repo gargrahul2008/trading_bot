@@ -65,10 +65,11 @@ def _sizing_warning(cfg) -> "str | None":
     return None
 
 
-def run(as_of: "date | None" = None, *, notify: bool = True) -> list[dict]:
+def run(as_of: "date | None" = None, *, notify: bool = True,
+        start_date: "date | None" = None) -> list[dict]:
     t0 = time.time()
     as_of = as_of or date.today()
-    setup = load_live_scan_setup(end_date=as_of)
+    setup = load_live_scan_setup(end_date=as_of, start_date=start_date)
     cfg = setup.config
 
     warnings = []
@@ -132,6 +133,14 @@ def run(as_of: "date | None" = None, *, notify: bool = True) -> list[dict]:
                 "timestamp": cand["current_touch_time"],
                 "open": cand["signal_open"], "high": cand["signal_high"],
                 "low": cand["signal_low"], "close": cand["signal_close"],
+                # enrich_touches_with_setup_quality reads the touch-sequence
+                # times off this row (see its docstring: it expects
+                # scan_history's own qualifying-touch columns), so pass them
+                # through rather than only the renamed "timestamp".
+                "current_touch_time": cand["current_touch_time"],
+                "previous_touch_time": cand["previous_touch_time"],
+                "first_interaction_time": cand["first_interaction_time"],
+                "bars_since_previous_touch": cand["bars_since_previous_touch"],
             }])
             enriched = enrich_touches_with_setup_quality(
                 bars, event_row,
@@ -180,10 +189,15 @@ def run(as_of: "date | None" = None, *, notify: bool = True) -> list[dict]:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Post-market 44-SMA actionable-signal scan + Telegram summary")
     ap.add_argument("--as-of", default=None, help="ISO date (default: today)")
+    ap.add_argument("--start-date", default=None,
+                    help="override the notebook's START_DATE (default: whatever the notebook has). "
+                         "Shortens the scan window -- note the touch-sequence counter then starts "
+                         "from this date, so touch_count can differ from the notebook's.")
     ap.add_argument("--no-notify", action="store_true", help="skip sending the Telegram summary")
     args = ap.parse_args()
     as_of = date.fromisoformat(args.as_of) if args.as_of else None
-    run(as_of, notify=not args.no_notify)
+    start_date = date.fromisoformat(args.start_date) if args.start_date else None
+    run(as_of, notify=not args.no_notify, start_date=start_date)
 
 
 if __name__ == "__main__":

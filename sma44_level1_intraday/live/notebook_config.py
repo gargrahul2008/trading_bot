@@ -47,7 +47,8 @@ def _find(cells: list[str], prefix: str) -> str:
 
 
 def load_live_scan_setup(
-    *, end_date: "date | str | None" = None, notebook_path: Path = NOTEBOOK_PATH,
+    *, end_date: "date | str | None" = None, start_date: "date | str | None" = None,
+    notebook_path: Path = NOTEBOOK_PATH,
 ) -> LiveScanSetup:
     """Executes the notebook's own repo-root / imports / params / config-build
     cells verbatim (same technique used throughout this codebase's own
@@ -72,6 +73,12 @@ def load_live_scan_setup(
         exec(cells[0], ns)   # repo root
         exec(cells[1], ns)   # imports
         params_src = _find(cells, "# NIFTY Total Market")
+        if start_date is not None:
+            start_str = start_date.isoformat() if hasattr(start_date, "isoformat") else str(start_date)
+            new_src, n = re.subn(r"START_DATE\s*=\s*'[^']*'", f"START_DATE = '{start_str}'", params_src, count=1)
+            if n != 1:
+                raise ValueError("could not find START_DATE assignment to override in the params cell")
+            params_src = new_src
         if end_date is not None:
             end_str = end_date.isoformat() if hasattr(end_date, "isoformat") else str(end_date)
             new_src, n = re.subn(r"END_DATE\s*=\s*'[^']*'", f"END_DATE   = '{end_str}'", params_src, count=1)
