@@ -480,6 +480,7 @@ def _generate_candidates_for_ma(
             signal_candle_cfg.allow_hammer_exception,
             signal_candle_cfg.hammer_max_opposite_wick_ratio,
             signal_candle_cfg.hammer_max_body_ratio,
+            signal_candle_cfg.skip_close_position_check_for_same_color_candle,
         ),
         axis=1,
     )

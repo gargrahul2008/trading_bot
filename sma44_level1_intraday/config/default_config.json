@@ -19,6 +19,7 @@
     "touch_tolerance_mode": "atr",
     "touch_tolerance_pct": 0.6,
     "touch_tolerance_atr_multiplier": 0.2,
+    "require_ma_within_signal_range": true,
     "ma_slope_lookback": 5,
     "min_ma_slope_pct": 0.0,
     "move_away_mode": "atr",
@@ -42,7 +43,8 @@
     "min_close_position": 0.6,
     "allow_hammer_exception": true,
     "hammer_max_opposite_wick_ratio": 0.15,
-    "hammer_max_body_ratio": 0.30
+    "hammer_max_body_ratio": 0.30,
+    "skip_close_position_check_for_same_color_candle": false
   },
 
   "ma200_filter": {

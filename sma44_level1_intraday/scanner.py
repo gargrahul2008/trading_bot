@@ -270,30 +270,37 @@ def is_strong_directional_candle(
     allow_hammer_exception: bool = False,
     hammer_max_opposite_wick_ratio: float = 0.15,
     hammer_max_body_ratio: float = 0.30,
+    skip_close_position_check_for_same_color_candle: bool = False,
 ) -> bool:
     """A single-bar 'strong' bullish (LONG) / bearish (SHORT) candle. True if
     EITHER:
       - the plain directional check: closes on the right side of its own open
-        AND closes within `min_close_position` of its own high (LONG) / low
-        (SHORT) — the close-position check is what disqualifies a
+        AND (unless skip_close_position_check_for_same_color_candle) closes
+        within `min_close_position` of its own high (LONG) / low (SHORT) —
+        the close-position check is what disqualifies a
         technically-green-but-weak candle, e.g. a green inverted hammer:
         close > open, but the close still sits near the bar's LOW under a
         long upper wick showing the rally got rejected. `close > open` alone
         can't tell that apart from a candle that closed strongly near its
-        high; close_position can. OR
+        high; close_position can. With the flag set, a same-colour candle
+        (green for LONG / red for SHORT) is ALWAYS strong regardless of
+        where it closed in its own range — the position/wick checks then
+        only ever apply below, to the OPPOSITE-colour hammer case. OR
       - (if `allow_hammer_exception`) the hammer exception — see
         _is_hammer_exception: a candle on the "wrong" side of its own open
         that's still a genuine rejection hammer/shooting-star, with a
         SMALL body (<= hammer_max_body_ratio of its own range) — a "proper"
-        hammer, not just a fat-bodied candle with a long-ish wick.
+        hammer, not just a fat-bodied candle with a long-ish wick. This
+        path's own min_close_position check is NEVER skipped by the flag
+        above — it only ever relaxes the SAME-colour case.
     """
     pos = close_position(open_, high, low, close)
     if np.isnan(pos):
         return False
     if direction == "LONG":
-        plain = close > open_ and pos >= min_close_position
+        plain = (close > open_) if skip_close_position_check_for_same_color_candle else (close > open_ and pos >= min_close_position)
     else:
-        plain = close < open_ and pos <= (1.0 - min_close_position)
+        plain = (close < open_) if skip_close_position_check_for_same_color_candle else (close < open_ and pos <= (1.0 - min_close_position))
     if plain or not allow_hammer_exception:
         return plain
     return _is_hammer_exception(
@@ -400,6 +407,17 @@ def process_touch_state(
             in_touch_zone_arr = adj_touch_diff_price <= (config.touch_tolerance_atr_multiplier * atr)
         else:
             in_touch_zone_arr = adj_touch_distance <= config.touch_tolerance_pct
+
+    # Extra floor (see ScannerConfig.require_ma_within_signal_range): the
+    # tolerance check above alone can be trivially satisfied by a candle
+    # that GAPPED clean past the SMA (most common on indices/intraday
+    # timeframes) without the candle's own range ever being near the MA --
+    # it exists to also accept a genuine deep break-through as a touch, and
+    # can't tell that apart from an opening gap. Require the SMA to actually
+    # sit inside, or be crossed by, the candle's own high-low range.
+    if config.require_ma_within_signal_range:
+        ma_within_range = (high >= sma) if direction == "LONG" else (low <= sma)
+        in_touch_zone_arr = in_touch_zone_arr & ma_within_range
 
     # Rule 5 (revised): the SMA's own slope no longer gates touch
     # recognition at all — a touch is a touch regardless of what the MA is

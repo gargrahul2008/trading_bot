@@ -59,6 +59,20 @@ class ScannerConfig:
     touch_tolerance_pct: float = 0.5
     touch_tolerance_atr_multiplier: float = 0.2
 
+    # A touch-zone check based purely on distance-vs-tolerance can be
+    # trivially satisfied by a candle that GAPPED clean past the SMA (an
+    # overnight/opening gap, most common on indices and intraday timeframes)
+    # without any part of the candle's own range ever being near the MA --
+    # see NSE:NIFTY50-INDEX 2026-09-18 09:15 5min: the SMA sat ~57 points
+    # below the candle's high and ~13 points below even its LOW, yet the
+    # tolerance formula alone (which also has to accept a genuine deep
+    # break-through as a valid touch) called it a SHORT touch. This adds a
+    # floor: the SMA must actually sit inside, or be crossed by, the
+    # candle's own high-low range -- high >= sma for LONG, low <= sma for
+    # SHORT -- not just be somewhere outside a candle the tolerance math
+    # happens to accept. True (default) = the fix; False = old behaviour.
+    require_ma_within_signal_range: bool = True
+
     # Rule 5: rising/falling SMA test, normalized by price so it is comparable
     # across symbols/timeframes. rising (long) needs slope_pct > min_ma_slope_pct;
     # falling (short) needs slope_pct < -min_ma_slope_pct.
@@ -214,6 +228,17 @@ class SignalCandleConfig:
     allow_hammer_exception: bool = True
     hammer_max_opposite_wick_ratio: float = 0.15
     hammer_max_body_ratio: float = 0.30
+
+    # False (default: the ORIGINAL rule above -- a same-colour candle still
+    # needs its close within min_close_position of its own extreme).
+    # True: skip that close-position check entirely for a same-colour candle
+    # (green on a LONG touch / red on a SHORT touch) -- ANY green candle is
+    # "strong" for a LONG regardless of where it closed in its own range.
+    # min_close_position (and the wick/body ratios) then only ever apply to
+    # the OPPOSITE-colour hammer-exception case -- i.e. "only check
+    # strength when we're looking for a bullish/bearish hammer on the
+    # 'wrong'-coloured candle", not on an already-favourable-coloured one.
+    skip_close_position_check_for_same_color_candle: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.min_close_position <= 1.0:

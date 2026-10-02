@@ -410,6 +410,47 @@ def test_is_strong_directional_candle_hammer_exception_does_not_apply_to_a_weak_
     ) is False
 
 
+# ── skip_close_position_check_for_same_color_candle ─────────────────────────
+
+def test_skip_close_position_check_rescues_a_weak_green_candle_for_long():
+    # The exact green-inverted-hammer fixture above, which the DEFAULT rule
+    # rejects -- with the flag on, ANY green candle is strong for a LONG,
+    # regardless of where it closed in its own range.
+    assert is_strong_directional_candle(
+        "LONG", open_=100.0, high=110, low=99.9, close=100.1, min_close_position=0.6,
+        skip_close_position_check_for_same_color_candle=True,
+    ) is True
+
+
+def test_skip_close_position_check_rescues_a_weak_red_candle_for_short():
+    assert is_strong_directional_candle(
+        "SHORT", open_=100.0, high=100.1, low=90, close=99.9, min_close_position=0.6,
+        skip_close_position_check_for_same_color_candle=True,
+    ) is True
+
+
+def test_skip_close_position_check_still_rejects_the_opposite_color_candle():
+    # The flag only ever relaxes the SAME-colour case -- a red candle on a
+    # LONG touch is still never "strong" just because the flag is on.
+    assert is_strong_directional_candle(
+        "LONG", open_=105, high=110, low=99, close=101, min_close_position=0.6,
+        skip_close_position_check_for_same_color_candle=True,
+    ) is False
+
+
+def test_skip_close_position_check_does_not_relax_the_hammer_exception_path():
+    # The hammer exception (opposite-colour candle) keeps its OWN
+    # min_close_position / wick-ratio checks even with the flag on -- it only
+    # ever relaxes the plain SAME-colour check, never the hammer path.
+    # A fat-bodied red candle with a weak close position on a LONG touch:
+    # fails the hammer exception's own body-ratio check regardless of the flag.
+    assert is_strong_directional_candle(
+        "LONG", open_=100.0, high=110.0, low=90.0, close=95.0, min_close_position=0.6,
+        allow_hammer_exception=True, hammer_max_body_ratio=0.30,
+        skip_close_position_check_for_same_color_candle=True,
+    ) is False
+
+
 # ── Valid Scenario 1: second touch ───────────────────────────────────────────
 
 def test_valid_scenario_second_touch_is_recognized():
@@ -468,6 +509,61 @@ def test_valid_scenario_wick_below_sma_still_counts_as_a_valid_touch():
     assert qualifying.iloc[0]["close"] > qualifying.iloc[0]["sma_44"]   # close still held above
 
 
+# ── require_ma_within_signal_range: a gap clean past the SMA is not a touch ──
+
+def test_gap_up_entirely_above_sma_is_not_a_short_touch():
+    """NSE:NIFTY50-INDEX 2026-09-18 09:15 5min: the prior session closed well
+    below the SMA, and the next session's opening candle gapped up so hard
+    that even its LOW sat above the SMA -- the tolerance formula alone
+    (which also has to accept a genuine deep break-through as a touch)
+    can't tell that apart from a real approach, and called it a SHORT
+    touch. require_ma_within_signal_range adds the floor: the SMA must
+    actually be inside (or crossed by) the candle's own range."""
+    cfg = _cfg(sma_length=44)
+    s = _PullbackSeries(cfg.sma_length, "SHORT").warmup(_warmup_bars(cfg) - (cfg.sma_length - 1))
+    s.touch().away(3.0, 5)   # anchor + armed, price approaching from below as SHORT expects
+
+    df = s.to_frame()
+    close_before_gap = df["close"].iloc[-1]
+    sma_before_gap = calculate_indicators(df, cfg.sma_length)["sma_44"].iloc[-1]
+    # A gap-up bar whose entire range (even its low) sits comfortably above
+    # the SMA -- exactly the NIFTY50 shape (SMA ~57pts below the high, ~13pts
+    # below even the low).
+    gap_low = sma_before_gap + 5.0
+    gap_high = gap_low + 20.0
+    gap_row = pd.DataFrame([{
+        "timestamp": df["timestamp"].iloc[-1] + pd.Timedelta(days=1),
+        "open": gap_low + 15.0, "high": gap_high, "low": gap_low,
+        "close": gap_low + 5.0, "volume": 100_000.0,
+    }])
+    df = pd.concat([df, gap_row], ignore_index=True)
+    assert df["low"].iloc[-1] > sma_before_gap   # confirms the gap: even the low cleared the SMA
+
+    ann, events = process_touch_state(calculate_indicators(df, cfg.sma_length), cfg, "SHORT")
+    gap_bar = ann.iloc[-1]
+    assert gap_bar["low"] > gap_bar["sma_44"]
+    assert not any(e.qualifies and e.current_touch_time == df["timestamp"].iloc[-1] for e in events)
+
+
+def test_require_ma_within_signal_range_false_restores_old_gap_through_behaviour():
+    cfg = _cfg(sma_length=44, require_ma_within_signal_range=False)
+    s = _PullbackSeries(cfg.sma_length, "SHORT").warmup(_warmup_bars(cfg) - (cfg.sma_length - 1))
+    s.touch().away(3.0, 5)
+
+    df = s.to_frame()
+    sma_before_gap = calculate_indicators(df, cfg.sma_length)["sma_44"].iloc[-1]
+    gap_low = sma_before_gap + 5.0
+    gap_row = pd.DataFrame([{
+        "timestamp": df["timestamp"].iloc[-1] + pd.Timedelta(days=1),
+        "open": gap_low + 15.0, "high": gap_low + 20.0, "low": gap_low,
+        "close": gap_low + 5.0, "volume": 100_000.0,
+    }])
+    df = pd.concat([df, gap_row], ignore_index=True)
+
+    _ann, events = process_touch_state(calculate_indicators(df, cfg.sma_length), cfg, "SHORT")
+    assert any(e.qualifies and e.current_touch_time == df["timestamp"].iloc[-1] for e in events)
+
+
 # ── Invalid Scenario 1: a SUSTAINED closing breach resets the sequence ──────
 
 def test_invalid_scenario_sustained_closing_breach_resets_the_sequence():
@@ -483,16 +579,18 @@ def test_invalid_scenario_sustained_closing_breach_resets_the_sequence():
     df = s.to_frame()
     ann, events = process_touch_state(calculate_indicators(df, cfg.sma_length), cfg, "LONG")
     assert (ann["reject_reason"] == "sustained_close_breach").any()
-    # The first of the two breach bars is itself deep enough to register as
-    # touch #2 (a wick/close well below the SMA still counts as a touch —
-    # see the "wick below SMA" scenario above) BEFORE the second breach bar
-    # confirms the breach is sustained and resets the sequence — the reset
-    # cannot retroactively un-qualify an event that already fired, it only
-    # stops anything AFTER it from qualifying.
+    # Neither breach bar qualifies as a touch: .breach() (unlike .touch()'s
+    # deliberately wide wick) gives each bar only its default TINY wick
+    # (close +/- 0.05), so a bar whose CLOSE has dropped ~7% below the SMA
+    # has its HIGH well below the SMA too -- require_ma_within_signal_range
+    # (see ScannerConfig) means the SMA was never actually inside this
+    # candle's own range, so it's not a touch at all, just a violent bar
+    # that helps trigger the sustained-breach reset below. Contrast with the
+    # "wick below SMA" scenario above, whose wick is explicitly engineered
+    # to still reach the SMA while its close holds above it.
     qualifying = [e for e in events if e.qualifies]
-    assert [e.touch_count for e in qualifying] == [2]
-    reset_idx = ann.index[ann["reject_reason"] == "sustained_close_breach"][0]
-    assert all(e.timestamp < ann.loc[reset_idx, "timestamp"] for e in qualifying)
+    assert qualifying == []
+    assert (ann["reject_reason"] == "sustained_close_breach").sum() >= 1
 
 
 def test_valid_scenario_a_single_deep_breach_bar_does_not_reset_the_sequence():
@@ -534,10 +632,7 @@ def test_invalid_scenario_move_from_below_only_reanchors_never_counts_as_second_
     ann, _events = process_touch_state(calculate_indicators(df, cfg.sma_length), cfg, "LONG")
     # The final (rebuild-from-below) bar only RE-ANCHORS (touch_count=1,
     # is_new_event=True) -- it never jumps straight to touch_count=2 on its
-    # own. (The FIRST breach bar transiently registering a touch_count=2 of
-    # its OWN, before the second breach bar's reset kicks in, is a separate,
-    # already-confirmed mechanic -- see
-    # test_invalid_scenario_sustained_closing_breach_resets_the_sequence.)
+    # own.
     last = ann.iloc[-1]
     assert last["touch_count"] == 1
     assert bool(last["is_new_event"]) is True
