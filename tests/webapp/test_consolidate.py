@@ -183,3 +183,41 @@ def test_the_order_is_by_time_and_is_stable():
     lines = recent([], closes)
     assert [line["symbol"] for line in lines] == ["NSE:B-EQ", "NSE:A-EQ"]
     assert recent([], list(reversed(closes))) == lines, "input order must not matter"
+
+
+def test_open_sits_above_every_close_however_old_it_is():
+    """The pad's question is "what am I already in". A position still carrying
+    risk below a trade that finished last week is the wrong answer, and sorting
+    the two together by date gave exactly that."""
+    opens = [position(100, 1300, 1310, 1000, symbol="NSE:HELD-EQ",
+                      day="2026-08-01", at="2026-08-01 10:00:00")]
+    closes = [match(10, 1300, 1310, 100, day="2026-09-30", at="2026-09-30 10:00:00",
+                    symbol="NSE:RECENT-EQ")]
+
+    lines = recent(opens, closes, today="2026-09-30")
+    assert [line["symbol"] for line in lines] == ["NSE:HELD-EQ", "NSE:RECENT-EQ"]
+
+
+def test_todays_closes_come_before_older_ones():
+    closes = [match(10, 1300, 1310, 100, day="2026-09-28", at="2026-09-28 10:00:00",
+                    symbol="NSE:OLD-EQ"),
+              match(10, 1300, 1320, 200, day="2026-09-30", at="2026-09-30 09:30:00",
+                    symbol="NSE:TODAY-EQ")]
+
+    lines = recent([], closes, today="2026-09-30")
+    assert [line["symbol"] for line in lines] == ["NSE:TODAY-EQ", "NSE:OLD-EQ"]
+
+
+def test_the_cap_never_drops_todays_closes():
+    """Today's exits are the other half of today. Capping after the split would
+    let a run of older trades push them off the list."""
+    closes = [match(10, 1300, 1310, 100, day="2026-09-30",
+                    at="2026-09-30 10:0%d:00" % i, symbol="NSE:T%d-EQ" % i)
+              for i in range(3)]
+    closes += [match(10, 1300, 1310, 100, day="2026-09-01",
+                     at="2026-09-01 10:0%d:00" % i, symbol="NSE:O%d-EQ" % i)
+               for i in range(10)]
+
+    lines = recent([], closes, closed_limit=3, today="2026-09-30")
+    assert all(line["day"] == "2026-09-30" for line in lines)
+    assert len(lines) == 3

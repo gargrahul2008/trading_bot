@@ -70,6 +70,86 @@ class FyersClient(Broker):
 
         return with_retries(_call, max_retries=4, base_sleep=0.4, max_sleep=3.0, logger=LOG)
 
+    def get_day_ohlc(self, symbols: List[str]) -> Dict[str, Dict[str, Decimal]]:
+        """The session's own open/high/low plus the last price, per symbol —
+        the SAME /quotes response get_ltps reads, which carries open_price /
+        high_price / low_price alongside lp. get_ltps keeps only lp; anything
+        that needs the day's true range must not rebuild it from repeated lp
+        samples, because a spike between two polls is invisible that way
+        (that bug cost a live entry alert on 2026-09-29: the broker's own
+        high was 42.40, the lp-reconstructed high 41.40, and the 42.15
+        trigger was never seen). Returns {symbol: {"open","high","low","close"}}
+        with close = lp. A symbol whose payload lacks any of the four is
+        omitted rather than half-filled, so callers can fall back per symbol.
+        """
+        sym_str = ",".join(symbols)
+
+        def _call():
+            resp = self._fyers.quotes({"symbols": sym_str})
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Quotes error: {resp!r}", resp=resp)
+            out: Dict[str, Dict[str, Decimal]] = {}
+            for item in (resp.get("d") or []):
+                if not isinstance(item, dict):
+                    continue
+                sym = str(item.get("n") or item.get("symbol") or "")
+                v = item.get("v") or {}
+                vals = (v.get("open_price"), v.get("high_price"), v.get("low_price"), v.get("lp"))
+                if not sym or any(x is None for x in vals):
+                    continue
+                o, h, l, lp = (to_decimal(x) for x in vals)
+                out[sym] = {"open": o, "high": h, "low": l, "close": lp}
+            return out
+
+        return with_retries(_call, max_retries=4, base_sleep=0.4, max_sleep=3.0, logger=LOG)
+
+    def get_day_change(self, symbols: List[str]) -> Dict[str, Dict[str, Decimal]]:
+        """Each symbol's move since the previous close.
+
+        The SAME /quotes response get_ltps and get_day_ohlc read — it carries
+        `prev_close_price` and the broker's own `ch`/`chp` alongside `lp`, and
+        both of those callers throw them away. Nothing in a positions or holdings
+        payload has a day change in it, so this is the only source for "what
+        moved today" short of storing yesterday's closes ourselves.
+
+        Returns {symbol: {"ltp", "prev_close", "change", "change_pct"}}. `ch` and
+        `chp` are preferred where the broker sends them and derived from
+        prev_close where it does not; a symbol with neither is omitted rather
+        than reported as flat, because 0.00% and "unknown" are different answers.
+        """
+        if not symbols:
+            return {}
+        sym_str = ",".join(symbols)
+
+        def _call():
+            resp = self._fyers.quotes({"symbols": sym_str})
+            if not isinstance(resp, dict) or resp.get("s") != "ok":
+                raise BrokerError(f"Quotes error: {resp!r}", resp=resp)
+            out: Dict[str, Dict[str, Decimal]] = {}
+            for item in (resp.get("d") or []):
+                if not isinstance(item, dict):
+                    continue
+                sym = str(item.get("n") or item.get("symbol") or "")
+                v = item.get("v") or {}
+                lp, prev = v.get("lp"), v.get("prev_close_price")
+                if not sym or lp is None:
+                    continue
+                ltp = to_decimal(lp)
+                change = to_decimal(v["ch"]) if v.get("ch") is not None else None
+                pct = to_decimal(v["chp"]) if v.get("chp") is not None else None
+                prev_close = to_decimal(prev) if prev is not None else None
+                if change is None and prev_close is not None:
+                    change = ltp - prev_close
+                if pct is None and prev_close is not None and prev_close != 0:
+                    pct = (ltp - prev_close) / prev_close * Decimal("100")
+                if change is None or pct is None:
+                    continue
+                out[sym] = {"ltp": ltp, "prev_close": prev_close if prev_close is not None else ltp - change,
+                            "change": change, "change_pct": pct}
+            return out
+
+        return with_retries(_call, max_retries=4, base_sleep=0.4, max_sleep=3.0, logger=LOG)
+
     # FYERS order types. 3 and 4 are the stop variants: 3 triggers and fills at
     # market, 4 triggers and then works as a limit.
     _ORDER_TYPES = {"LIMIT": 1, "MARKET": 2, "SL_M": 3, "SL": 4}

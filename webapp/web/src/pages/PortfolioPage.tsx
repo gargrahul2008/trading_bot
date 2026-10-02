@@ -1,10 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 
-import { Card, ErrorNote, Loading, PageHeader, Stat } from "../components/ui";
+import { Card, ErrorNote, Loading, PageHeader } from "../components/ui";
 import { AccountStatus, Chip } from "../components/StatusChip";
 import { RiskLimits } from "../components/RiskLimits";
 import { api } from "../lib/api";
-import { age, compact, count, money, num, percent, pnlClass, signed } from "../lib/format";
+import { age, count, money, num, percent, pnlClass, signed } from "../lib/format";
 import { Money, usePrivacy } from "../lib/privacy";
 import type { AccountRow, Overview, Portfolio, PortfolioRow } from "../lib/types";
 
@@ -193,13 +193,11 @@ export function PortfolioPage() {
   });
 
   if (book.isError) return <ErrorNote error={book.error} />;
-  if (book.isLoading || !book.data) return <Loading what="portfolio" />;
+  if (book.isLoading || !book.data) return <Loading what="accounts" />;
   if (!book.data.totals) return <ErrorNote error="No accounts configured." />;
 
   const data = book.data;
   const t = data.totals!;
-  const pnl = num(t.pnl);
-  const ret = num(t.return_pct);
   const aside = t.excluded;
   const byAccount = new Map(
     (overview.data?.accounts ?? []).map((row) => [row.account, row]),
@@ -211,7 +209,7 @@ export function PortfolioPage() {
   return (
     <>
       <PageHeader
-        title="Portfolio"
+        title="Accounts"
         subtitle={
           <>
             {t.accounts} accounts as one book · since {data.fy_start} ·{" "}
@@ -281,37 +279,10 @@ export function PortfolioPage() {
         </div>
       )}
 
-      <div className="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat
-          label="Capital in"
-          value={<Money>{compact(num(t.capital_in))}</Money>}
-          note={
-            <>
-              <Money>{compact(num(t.free))}</Money> free ·{" "}
-              <Money>{compact(num(t.deployed))}</Money> deployed at cost
-            </>
-          }
-        />
-        <Stat
-          label="Realised — year to date"
-          value={<Money>{compact(num(t.realised))}</Money>}
-          tone={pnlClass(num(t.realised))}
-          note="broker's own figure, net of charges"
-        />
-        <Stat
-          label="Unrealised"
-          value={<Money>{compact(num(t.unrealised))}</Money>}
-          tone={pnlClass(num(t.unrealised))}
-          note={<><Money>{compact(num(t.market_value))}</Money> at market</>}
-        />
-        <Stat
-          label="Total P&L"
-          value={<Money>{compact(pnl)}</Money>}
-          tone={pnlClass(pnl)}
-          note={ret === null ? "no capital recorded" : `${percent(ret)} on capital in`}
-        />
-      </div>
-
+      {/* The page-level totals — capital in, realised, unrealised, total P&L —
+          moved to the Dashboard, which is where the whole-book question is now
+          asked. This page is per account, and repeating the sums above the cards
+          only invited the two pages to disagree. */}
       {data.accounts.map((row) => (
         <AccountCard key={row.account} row={row} live={byAccount.get(row.account)} />
       ))}

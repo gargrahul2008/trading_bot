@@ -372,3 +372,42 @@ export interface RecentPayload {
   accounts_missing: string[];
   available: boolean;
 }
+
+/** One open position on the dashboard, with both percentages.
+ *
+ *  `day_change_pct` is null when the broker would not price the symbol — a flat
+ *  day and an unknown one must not render the same.
+ */
+export interface DashboardLine {
+  account: string;
+  symbol: string;
+  direction: string | null;
+  product_type: string | null;
+  qty: number;
+  avg_price: number;
+  ltp: number;
+  invested: number;
+  market_value: number;
+  unrealised: number;
+  unrealised_pct: number | null;
+  day_change: number | null;
+  day_change_pct: number | null;
+}
+
+export interface DashboardPayload {
+  totals: {
+    invested: number;
+    market_value: number;
+    unrealised: number;
+    realised: number;
+    realised_available: boolean;
+    positions: number;
+  };
+  threshold: number;
+  alerts: DashboardLine[];
+  gainers: DashboardLine[];
+  losers: DashboardLine[];
+  day_change_available: boolean;
+  accounts: string[];
+  accounts_missing: string[];
+}

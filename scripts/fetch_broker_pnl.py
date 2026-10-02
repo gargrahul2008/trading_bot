@@ -28,7 +28,7 @@ import json
 import sys
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -125,21 +125,101 @@ def collect_bot_states(account: str) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def seed_from_holdings(holdings: List[Any], trades: List[dict]) -> tuple[Dict[str, Dict[str, Any]], str]:
+    """Starting basis for an account with no bot: the broker's own holdings, rewound behind the
+    trades we already have.
+
+    An account that no strategy runs has no state.json, so collect_bot_states finds nothing and
+    the seed would be empty — which makes the replay sell from an empty lot book and report a
+    realized figure that is pure fiction. The broker's holdings are the real cost basis.
+
+    But holdings are *current*, i.e. already net of today's trades, while the replay skips every
+    trade dated on or before seed_date. Seeding today's holdings at today's date therefore drops
+    today's realized entirely (observed on jhalak: a 300-share exit worth -5,186 reported as
+    0.0). So rewind the book behind the accumulated trades —
+
+        pre_qty = remaining_qty + sells - buys
+
+    — and date the seed one day before the earliest of them, so they all replay.
+
+    Returns (by_symbol, seed_date). Cruder than a bot seed, unavoidably: a holding is one
+    weighted-average lot, not a lot structure, and the broker exposes no realized history. LIFO
+    against a single averaged lot equals FIFO against it, so whole-position exits are exact and
+    only partial ones approximate.
+
+    A symbol sold before the seed date and absent from holdings has no recoverable cost basis —
+    it is skipped, and its realized cannot be reconstructed from the API alone.
+    """
+    delta: Dict[str, Decimal] = {}
+    for t in trades or []:
+        sym = t.get("symbol") or ""
+        if not sym:
+            continue
+        q = _D(t.get("qty"))
+        if q <= 0:
+            continue
+        # Undo the trade: a sell had reduced the holding, a buy had increased it.
+        delta[sym] = delta.get(sym, D0) + (q if t.get("side") == "SELL" else -q)
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for h in holdings or []:
+        sym = getattr(h, "symbol", "") or ""
+        if not sym:
+            continue
+        price = _D(getattr(h, "cost_price", 0))
+        qty = _D(getattr(h, "remaining_qty", 0)) + delta.pop(sym, D0)
+        if qty <= 0:
+            continue
+        e = out.setdefault(sym, {"lots": [], "borrowed_qty": 0.0,
+                                 "borrowed_avg_sell": 0.0, "realized_start": 0.0})
+        # HLD and T1 arrive as separate rows for the same scrip; keep them as separate lots.
+        e["lots"].append({"qty": float(qty), "price": float(price)})
+
+    for sym, q in delta.items():
+        if q > 0:
+            LOG_SKIPPED.append(sym)
+
+    dates = sorted(d for d in (t.get("date") or "" for t in trades or []) if d)
+    if dates:
+        first = dt.date.fromisoformat(dates[0]) - dt.timedelta(days=1)
+        seed_date = first.isoformat()
+    else:
+        seed_date = _today()
+    return out, seed_date
+
+
+LOG_SKIPPED: List[str] = []
+
+
 def load_or_create_seed(seed_path: Path, bot_states: Dict[str, Dict[str, Any]],
-                        seed_date: str) -> Dict[str, Any]:
-    """First run: snapshot the bot's lots/borrowed/realized as the broker-ledger starting basis.
-    Trades on/before seed_date are already reflected in that realized, so the replay skips them."""
+                        seed_date: str, holdings: Optional[List[Any]] = None,
+                        trades: Optional[List[dict]] = None) -> Dict[str, Any]:
+    """First run: snapshot the starting basis for the broker-side ledger.
+
+    Prefers the bot's lots/borrowed/realized. Falls back to the broker's holdings when the
+    account runs no strategies, so a bot-less account still gets a real cost basis instead of
+    an empty one. Trades on/before seed_date are already reflected in that basis, so the replay
+    skips them."""
     if seed_path.exists():
         return json.loads(seed_path.read_text())
-    seed = {"seed_date": seed_date, "by_symbol": {}}
-    for sym, s in bot_states.items():
-        seed["by_symbol"][sym] = {
-            "lots": [{"qty": float(_D(l.get("qty"))), "price": float(_D(l.get("price") or l.get("avg_price")))}
-                     for l in s["lots"] if isinstance(l, dict)],
-            "borrowed_qty": float(_D(s["borrowed_qty"])),
-            "borrowed_avg_sell": float(_D(s["borrowed_avg_sell"])),
-            "realized_start": float(_D(s["realized_pnl"])),
+
+    if bot_states:
+        source = "bot_state"
+        by_symbol = {
+            sym: {
+                "lots": [{"qty": float(_D(l.get("qty"))), "price": float(_D(l.get("price") or l.get("avg_price")))}
+                         for l in s["lots"] if isinstance(l, dict)],
+                "borrowed_qty": float(_D(s["borrowed_qty"])),
+                "borrowed_avg_sell": float(_D(s["borrowed_avg_sell"])),
+                "realized_start": float(_D(s["realized_pnl"])),
+            }
+            for sym, s in bot_states.items()
         }
+    else:
+        source = "broker_holdings"
+        by_symbol, seed_date = seed_from_holdings(holdings or [], trades or [])
+
+    seed = {"seed_date": seed_date, "seed_source": source, "by_symbol": by_symbol}
     seed_path.write_text(json.dumps(seed, indent=2) + "\n")
     return seed
 
@@ -219,7 +299,17 @@ def main() -> int:
     all_trades, added = accumulate(reports / "trades_all.jsonl", new_trades)
 
     bot_states = collect_bot_states(args.account)
-    seed = load_or_create_seed(reports / "pnl_seed.json", bot_states, _today())
+
+    # Only needed to seed a bot-less account, and only on the very first run — so don't spend a
+    # broker call on it once the seed exists or the bot's own state can provide the basis.
+    holdings: List[Any] = []
+    if not bot_states and not (reports / "pnl_seed.json").exists():
+        try:
+            holdings = broker.holdings()
+        except Exception as e:
+            errors["holdings"] = str(e)
+
+    seed = load_or_create_seed(reports / "pnl_seed.json", bot_states, _today(), holdings, all_trades)
     broker_realized = replay_realized(seed, all_trades)
     charges = compute_charges(all_trades)
 

@@ -60,9 +60,17 @@ def position(symbol, opened):
             "opened_day": opened}
 
 
-def test_the_recent_list_is_in_date_order_across_a_month_boundary():
-    """The reported symptom: closed trades from 31 August above open positions
-    from 2 September, and closed trades from 3 September below them."""
+def test_the_closed_tail_is_in_date_order_across_a_month_boundary():
+    """The reported symptom was one block of closed trades above the open
+    positions and another below them, because "31-Aug" sorts after "03-Sep" as
+    text. `to_iso` is the fix, and this is what it buys: within the closed group,
+    September leads August.
+
+    The open position now heads the list outright rather than ranking by date —
+    `recent()` groups before it sorts, so a held position can no longer be
+    sandwiched by history at all. That supersedes the original date-order
+    assertion while keeping the symptom impossible.
+    """
     lines = recent(
         [position("NSE:OPEN-EQ", "2026-09-02")],
         [match("2026-08-31", "31-Aug-2026 10:15:23", "NSE:AUG-EQ"),
@@ -70,7 +78,7 @@ def test_the_recent_list_is_in_date_order_across_a_month_boundary():
     )
 
     assert [line["symbol"] for line in lines] == [
-        "NSE:SEP-EQ", "NSE:OPEN-EQ", "NSE:AUG-EQ"]
+        "NSE:OPEN-EQ", "NSE:SEP-EQ", "NSE:AUG-EQ"]
 
 
 def test_a_row_with_no_readable_time_still_sorts_by_its_day():

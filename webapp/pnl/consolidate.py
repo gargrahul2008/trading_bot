@@ -19,6 +19,7 @@ Two groupings are kept apart deliberately rather than netted:
 """
 from __future__ import annotations
 
+import datetime as dt
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -175,17 +176,37 @@ def _as_str(value: Optional[Decimal]) -> Optional[str]:
     return None if value is None else str(value)
 
 
-def recent(open_rows: Iterable[Dict[str, Any]], closed_rows: Iterable[Dict[str, Any]],
-           closed_limit: int = 20) -> List[Dict[str, Any]]:
-    """Everything open, and the latest closes, newest first.
+def _ist_today() -> str:
+    """Today's trading day. Computed here rather than imported from the store so
+    the P&L layer keeps no dependency on it."""
+    stamp = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5, minutes=30)
+    return stamp.date().isoformat()
 
-    Every open position is kept however long the list gets — they are what is
-    held, and dropping one to make room for history would hide live money. Only
-    the closed tail is capped.
+
+def recent(open_rows: Iterable[Dict[str, Any]], closed_rows: Iterable[Dict[str, Any]],
+           closed_limit: int = 20, today: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Three groups, in this order: everything open, today's closes, then older.
+
+    Open first because the pad's question is "what am I already in" — a position
+    still carrying risk must never sit below a trade that finished last week.
+    Sorting open and closed together by date did exactly that: a position opened
+    a month ago and still held ranked below yesterday's exit.
+
+    Today's closes come next because they are the other half of today — what was
+    just taken off. The rest follow as history.
+
+    Within each group, newest first. Every open position is kept however long the
+    list gets; they are what is held, and dropping one to make room for history
+    would hide live money. Only the closed tail is capped, and because it is
+    capped before the split, today's closes are never the ones dropped.
     """
-    lines = open_positions(open_rows)
+    opens = sorted(open_positions(open_rows), key=_order, reverse=True)
     tail = sorted(closed(closed_rows), key=_order, reverse=True)[:closed_limit]
-    return sorted(lines + tail, key=_order, reverse=True)
+
+    day = _ist_today() if today is None else today
+    closed_today = [line for line in tail if str(line.get("day") or "") == day]
+    closed_before = [line for line in tail if str(line.get("day") or "") != day]
+    return opens + closed_today + closed_before
 
 
 def _order(line: Dict[str, Any]) -> tuple:

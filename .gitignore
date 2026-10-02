@@ -22,6 +22,9 @@ secrets/
 .env.*
 *.env
 fyers_auth.json
+# ...and every backup/copy of it. The bare name above does not match fyers_auth.json.bak.*,
+# so timestamped backups of a file full of live tokens were sitting visible to `git add -A`.
+fyers_auth.json*
 dashboard_access.json
 
 # Logs

@@ -75,7 +75,7 @@ trading_bot/
   deploy/
     build_account_configs.py # regenerate accounts/*/*/config.json from live strategies/ configs
     gen_systemd_units.py     # emit per-run bot + per-user auth units into systemd/generated/
-    systemd/generated/       # bot-<user>-<strat>.service, fyers-auth-<user>.service
+    systemd/generated/       # bot-<user>-<strat>.service, agent-<user>.service, dashboard
     proxy/                   # proxy setup notes
   docs/
     multi_account_architecture.md   ← this file
@@ -95,7 +95,11 @@ per-demat, not per-strategy. Change the IP once, every run of that user follows.
   `strategies/` configs (converging auth to `json`, repointing `paths`). Re-run before a
   cutover to snapshot current live params. The `MAPPING` at its top is the live-run registry.
 - `deploy/gen_systemd_units.py` — scans `accounts/` and emits one `bot-<user>-<strat>.service`
-  per run + one `fyers-auth-<user>.service` per user. Re-run after adding/removing a run.
+  per run, one `agent-<user>.service` per account, and `dashboard.service`. Re-run after
+  adding/removing a run. Token refresh is NOT a unit — see below.
+- `deploy/accounts.py` — the account register (reads `fyers_auth.json`); prints each account's
+  user_key, status, egress IP and agent port. `deploy/onboard.py` creates what a new entry
+  needs; `deploy/preflight.sh` verifies the host end-to-end, egress IPs included.
 
 Current live runs: **rahul** → reliance, vikaseco; **pratibha** → shishind, indothai,
 coolcaps, arl. (The many other `strategies/*/config.*.json` are dead/legacy or MEXC — not
@@ -135,10 +139,16 @@ Auth is selected by `broker.auth_mode` in the config:
   This is the current cross-VPS distribution method.
 - **`db`** — legacy traderealm MySQL lookup by `user_id`.
 
-**Per-user IP-bound auth:** run token refresh **per user** (`fyers_auto_auth.py --user-key
-<u>`) in a process that carries that user's `HTTPS_PROXY`, so the login/token exchange also
-exits through the account's whitelisted IP. **Do not use `--enabled-only`** (it refreshes
-all users in one process → one shared IP). See the generated `fyers-auth-<user>.service`.
+**Per-user IP-bound auth:** token refresh runs **per account**, each in a process carrying
+that account's `HTTPS_PROXY`, so the login/token exchange also exits through the account's
+whitelisted IP. **Never `--enabled-only`** — that refreshes every user in one process, so they
+would all share whichever proxy the environment happened to hold.
+
+This is a **daily cron one-shot**, `deploy/cron/refresh_tokens.sh` (03:00 UTC / 08:30 IST),
+not a systemd unit; the old always-on `fyers-auth-*` units are gone. It iterates the register
+(`deploy/accounts.py`), so a newly added account is picked up with no edit — that generality
+exists because the previous hardcoded version meant a new account silently never got a token
+and its agent died at the next expiry.
 
 ## 6. State & resume (why the bot picks up where it left off)
 

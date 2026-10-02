@@ -4,10 +4,10 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 
 const NAV = [
-  { to: "/portfolio", label: "Portfolio" },
+  { to: "/dashboard", label: "Dashboard" },
+  { to: "/accounts", label: "Accounts" },
   { to: "/positions", label: "Positions" },
   { to: "/trades", label: "Trades" },
-  { to: "/orders", label: "Orders" },
   { to: "/place", label: "Place" },
 ];
 

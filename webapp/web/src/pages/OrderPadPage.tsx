@@ -34,10 +34,34 @@ const TYPES = [
   { value: "SL_M", label: "SL-M" },
 ] as const;
 
-/** Stop and target start here, as a percentage of the price, and are converted
- *  to the points Fyers actually takes. Typed over freely — a default is a
- *  starting point, not a policy. */
+/** Stop and target start this far from the price, as a percentage. Typed over
+ *  freely — a default is a starting point, not a policy. */
 const DEFAULT_PCT = 2;
+
+/** The legs are entered as SHARE PRICES — the price you want out at — because
+ *  that is the number on the chart and in your head. Fyers takes them as
+ *  distances from the entry, so the conversion happens on the way out, once,
+ *  here. Entering "the price" and having it sent as "the distance" was the old
+ *  trap this removes: a 2% stop on a 1,200 rupee share is 24, and typing 1,176
+ *  into a points field asks for a stop 1,176 rupees away.
+ */
+function legDistance(price: number, reference: number): number {
+  if (!(price > 0) || !(reference > 0)) return 0;
+  return Math.abs(reference - price);
+}
+
+/** Which side of the entry each leg belongs on.
+ *
+ *  A long is stopped below and takes profit above; a short is the mirror. Sent
+ *  as bare distances, Fyers infers the direction from the side — so a stop typed
+ *  on the wrong side of the price would be accepted and then sit where the
+ *  target should be. Hence the check rather than a silent abs().
+ */
+function legSides(side: "BUY" | "SELL") {
+  return side === "BUY"
+    ? { stopBelow: true, targetBelow: false }
+    : { stopBelow: false, targetBelow: true };
+}
 
 function needs(orderType: string, product: string) {
   return {
@@ -71,10 +95,11 @@ function toTick(price: number, tick: number): number {
   return Number((steps * tick).toFixed(decimals));
 }
 
-/** What a points figure is as a percentage of the price it applies to. */
-function asPercent(points: number, reference: number): string | null {
-  if (!(points > 0) || !(reference > 0)) return null;
-  return ((points / reference) * 100).toFixed(2) + "%";
+/** How far a leg price sits from the entry, as a percentage of it. */
+function asPercent(legPrice: number, reference: number): string | null {
+  const distance = legDistance(legPrice, reference);
+  if (!(distance > 0) || !(reference > 0)) return null;
+  return ((distance / reference) * 100).toFixed(2) + "%";
 }
 const labelClass =
   "text-xs font-medium uppercase tracking-wide text-[var(--ink-muted)]";
@@ -85,7 +110,7 @@ export function OrderPadPage() {
   const [symbol, setSymbol] = useState("");
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   const [qty, setQty] = useState("");
-  const [product, setProduct] = useState<string>("BO");
+  const [product, setProduct] = useState<string>("CNC");
   const [orderType, setOrderType] = useState("MARKET");
   const [limitPrice, setLimitPrice] = useState("");
   const [stopPrice, setStopPrice] = useState("");
@@ -140,12 +165,16 @@ export function OrderPadPage() {
   const tick = instrument?.tick_size ?? 0;
   useEffect(() => {
     if (!legsTouched && reference > 0) {
-      // The legs are distances, and the exchange wants them on the tick too.
-      const points = String(toTick((reference * DEFAULT_PCT) / 100, tick || 0.05));
-      setStopLoss(points);
-      setTakeProfit(points);
+      // Prices, DEFAULT_PCT away on the side each leg belongs on, and on the
+      // instrument's tick because that is what the exchange will accept.
+      const step = (reference * DEFAULT_PCT) / 100;
+      const { stopBelow } = legSides(side);
+      const stopAt = stopBelow ? reference - step : reference + step;
+      const targetAt = stopBelow ? reference + step : reference - step;
+      setStopLoss(String(toTick(stopAt, tick || 0.05)));
+      setTakeProfit(String(toTick(targetAt, tick || 0.05)));
     }
-  }, [reference, legsTouched, tick]);
+  }, [reference, legsTouched, tick, side]);
 
   const place = useMutation({
     mutationFn: (request: PlaceRequest) => api.post("/orders", request),
@@ -200,10 +229,28 @@ export function OrderPadPage() {
   if (want.stop && number(stopPrice) <= 0) problems.push("trigger price");
   if (want.legsRequired && number(stopLoss) <= 0) problems.push("stop-loss");
   if (want.legsRequired && number(takeProfit) <= 0) problems.push("target");
-  if (want.legs && reference > 0 && number(stopLoss) >= reference)
-    problems.push("stop-loss must be points, not a price");
-  if (want.target && reference > 0 && number(takeProfit) >= reference)
-    problems.push("target must be points, not a price");
+  // Both legs are prices, and each belongs on its own side of the entry. Sent as
+  // bare distances, a stop typed above a long's entry would be accepted and then
+  // act as the target — so it is refused here instead.
+  const sides = legSides(side);
+  if (want.legs && reference > 0 && number(stopLoss) > 0) {
+    const below = number(stopLoss) < reference;
+    if (below !== sides.stopBelow)
+      problems.push(
+        sides.stopBelow
+          ? "stop-loss must be below the price for a buy"
+          : "stop-loss must be above the price for a sell",
+      );
+  }
+  if (want.target && reference > 0 && number(takeProfit) > 0) {
+    const below = number(takeProfit) < reference;
+    if (below !== sides.targetBelow)
+      problems.push(
+        sides.targetBelow
+          ? "target must be below the price for a sell"
+          : "target must be above the price for a buy",
+      );
+  }
   if (unpriced) problems.push("the broker returned no price for this symbol");
 
   const request: PlaceRequest = {
@@ -215,8 +262,11 @@ export function OrderPadPage() {
     order_type: orderType,
     limit_price: want.limit ? toTick(number(limitPrice), tick) : 0,
     stop_price: want.stop ? toTick(number(stopPrice), tick) : 0,
-    stop_loss: want.legs ? toTick(number(stopLoss), tick) : 0,
-    take_profit: want.target ? toTick(number(takeProfit), tick) : 0,
+    // Prices in, distances out — see legDistance().
+    stop_loss: want.legs ? toTick(legDistance(number(stopLoss), reference), tick) : 0,
+    take_profit: want.target
+      ? toTick(legDistance(number(takeProfit), reference), tick)
+      : 0,
   };
 
   // Shown before the button is pressed, so the server's refusal is a backstop
@@ -340,10 +390,12 @@ export function OrderPadPage() {
                       setDeployAmount("");
                       // Quantity is what the stop can afford: the amount you
                       // are willing to lose, divided by the distance to it.
-                      const points = number(stopLoss);
+                      // Risk per share is the distance to the stop, not the
+                      // price it sits at.
+                      const perShare = legDistance(number(stopLoss), reference);
                       const risk = number(event.target.value);
-                      if (points > 0 && risk > 0) {
-                        setQty(String(Math.max(Math.floor(risk / points), 0)));
+                      if (perShare > 0 && risk > 0) {
+                        setQty(String(Math.max(Math.floor(risk / perShare), 0)));
                         setDone(null);
                       }
                     }}
@@ -373,10 +425,11 @@ export function OrderPadPage() {
                   />
                 </div>
                 <div className="col-span-2 self-end text-xs text-[var(--ink-muted)]">
-                  {riskAmount && number(stopLoss) > 0 ? (
+                  {riskAmount && legDistance(number(stopLoss), reference) > 0 ? (
                     <>
-                      {money(number(riskAmount))} risked over a{" "}
-                      {number(stopLoss)}-point stop is {qty || 0} shares
+                      {money(number(riskAmount))} risked to a stop at{" "}
+                      {money(number(stopLoss))} ({money(legDistance(number(stopLoss), reference))}{" "}
+                      a share) is {qty || 0} shares
                       {reference > 0 && (
                         <> — {money(number(qty) * reference)} committed</>
                       )}
@@ -386,8 +439,12 @@ export function OrderPadPage() {
                     <>
                       {money(number(deployAmount))} at {money(reference)} is {qty || 0}{" "}
                       shares
-                      {number(stopLoss) > 0 && (
-                        <> — {money(number(qty) * number(stopLoss))} at risk</>
+                      {legDistance(number(stopLoss), reference) > 0 && (
+                        <>
+                          {" "}
+                          — {money(number(qty) * legDistance(number(stopLoss), reference))} at
+                          risk
+                        </>
                       )}
                       .
                     </>
@@ -455,7 +512,7 @@ export function OrderPadPage() {
             {want.legs && (
               <div>
                 <span className={labelClass}>
-                  Stop-loss (pts){" "}
+                  Stop-loss (price){" "}
                   <span className="normal-case text-[var(--ink-secondary)]">
                     {asPercent(number(stopLoss), reference) ?? ""}
                   </span>
@@ -476,7 +533,7 @@ export function OrderPadPage() {
             {want.target && (
               <div>
                 <span className={labelClass}>
-                  Target (pts){" "}
+                  Target (price){" "}
                   <span className="normal-case text-[var(--ink-secondary)]">
                     {asPercent(number(takeProfit), reference) ?? ""}
                   </span>
@@ -520,8 +577,12 @@ export function OrderPadPage() {
                 {TYPES.find((t) => t.value === orderType)?.label}
                 {want.limit && ` @ ${money(request.limit_price!)}`}
                 {want.stop && ` trigger ${money(request.stop_price!)}`}
-                {want.legs && ` · SL ${request.stop_loss} pts`}
-                {want.target && ` · target ${request.take_profit} pts`}
+                {/* The price typed, and the distance actually sent — so the review
+                    never hides the conversion the broker's API forces on us. */}
+                {want.legs && number(stopLoss) > 0 &&
+                  ` · SL ${money(number(stopLoss))} (${request.stop_loss} pts)`}
+                {want.target && number(takeProfit) > 0 &&
+                  ` · target ${money(number(takeProfit))} (${request.take_profit} pts)`}
                 {value !== null && (
                   <>
                     {" · "}
@@ -653,9 +714,11 @@ export function OrderPadPage() {
 
       <p className="mt-3 text-xs text-[var(--ink-muted)]">
         BUY and SELL place immediately — there is no second confirmation, so the line above
-        and the button text are the check. Stop-loss and target default to {DEFAULT_PCT}% of
-        the price and are sent as points from the entry; typing over either one stops them
-        following the price, and clearing one leaves the order without it. BO is ours, not
+        and the button text are the check. Stop-loss and target are entered as the SHARE
+        PRICE you want out at, and default to {DEFAULT_PCT}% either side of the price — below
+        for a stop on a buy, above on a sell. Fyers takes them as distances from the entry, so
+        the conversion happens on the way out; typing over either one stops it following the
+        price, and clearing one leaves the order without it. BO is ours, not
         the broker's: Fyers deprecated bracket and cover as product types, so it is sent as
         {" " + SENT_AS.BO} carrying the stop and target on the order itself — which is what a
         bracket always was. It is the one product that requires both legs; every other takes

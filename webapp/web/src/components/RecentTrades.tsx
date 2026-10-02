@@ -1,3 +1,4 @@
+import { Fragment } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { Card } from "./ui";
@@ -13,11 +14,37 @@ import type { RecentLine, RecentPayload } from "../lib/types";
  *  anything, what am I already in, and what did the last few trades do. Split
  *  across Positions and Trades it takes two pages and a mental join.
  *
+ *  Three groups, in the server's order: everything still open, then what closed
+ *  today, then older closes. Open leads because a position still carrying risk
+ *  must never read below a trade that finished last week.
+ *
  *  The consolidation is the server's: one line per scrip, at the price actually
  *  paid across every fill behind it. This renders what it is given, in the order
- *  it is given, so nothing here can reorder while it is being read.
+ *  it is given, so nothing here can reorder while it is being read — the headings
+ *  are inserted where the group changes, not by re-sorting.
  */
 const LIMIT = 20;
+
+/** Today in IST, to label the group the server already put second. */
+function istToday(): string {
+  const now = new Date();
+  const ist = new Date(now.getTime() + (330 + now.getTimezoneOffset()) * 60_000);
+  return ist.toISOString().slice(0, 10);
+}
+
+function GroupRow({ label, count }: { label: string; count: number }) {
+  return (
+    <tr className="border-t" style={{ borderColor: "var(--hairline)" }}>
+      <td
+        colSpan={8}
+        className="bg-black/[0.02] px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--ink-muted)] dark:bg-white/[0.03]"
+      >
+        {label}
+        <span className="ml-1.5 font-normal normal-case">({count})</span>
+      </td>
+    </tr>
+  );
+}
 
 function Line({ line, onPick }: { line: RecentLine; onPick?: () => void }) {
   const net = num(line.net);
@@ -108,7 +135,22 @@ export function RecentTrades({ onPick }: { onPick?: (account: string, symbol: st
   });
 
   const lines = data?.lines ?? [];
-  const open = lines.filter((line) => line.state === "open").length;
+  const today = istToday();
+  // Which group each line falls in — the same rule the server ordered by, so the
+  // headings land on the boundaries rather than inventing their own.
+  const groupOf = (line: RecentLine) =>
+    line.state === "open" ? "open" : line.day === today ? "today" : "earlier";
+  const LABELS: Record<string, string> = {
+    open: "Open — still held",
+    today: "Closed today",
+    earlier: "Closed earlier",
+  };
+  const counts = lines.reduce<Record<string, number>>((acc, line) => {
+    const key = groupOf(line);
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+  const open = counts.open ?? 0;
 
   return (
     <Card className="mt-4 overflow-x-auto">
@@ -118,7 +160,8 @@ export function RecentTrades({ onPick }: { onPick?: (account: string, symbol: st
       >
         <span className="text-sm font-semibold">Recent</span>
         <span className="text-xs text-[var(--ink-muted)]">
-          {open} open, and the {LIMIT} most recent closes — one line per scrip, newest first
+          {open} open{counts.today ? `, ${counts.today} closed today` : ""} — one line per
+          scrip, open first, then newest
         </span>
       </div>
 
@@ -141,13 +184,20 @@ export function RecentTrades({ onPick }: { onPick?: (account: string, symbol: st
             </tr>
           </thead>
           <tbody>
-            {lines.map((line) => (
-              <Line
-                key={`${line.state}-${line.account}-${line.symbol}-${line.day}-${line.direction}-${line.trade_kind}`}
-                line={line}
-                onPick={onPick ? () => onPick(line.account, line.symbol) : undefined}
-              />
-            ))}
+            {lines.map((line, index) => {
+              const group = groupOf(line);
+              const first = index === 0 || groupOf(lines[index - 1]) !== group;
+              const key = `${line.state}-${line.account}-${line.symbol}-${line.day}-${line.direction}-${line.trade_kind}`;
+              return (
+                <Fragment key={key}>
+                  {first && <GroupRow label={LABELS[group]} count={counts[group] ?? 0} />}
+                  <Line
+                    line={line}
+                    onPick={onPick ? () => onPick(line.account, line.symbol) : undefined}
+                  />
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       )}

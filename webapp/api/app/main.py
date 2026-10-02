@@ -452,6 +452,143 @@ def get_recent(limit: int = 20, _: str = Session) -> Dict[str, Any]:
     }
 
 
+# Day change costs a broker call per batch of symbols, and the dashboard polls.
+# Cached so an open page does not spend the bots' rate budget. Five minutes to
+# match the page's own refresh: a move worth a sound is still worth it five
+# minutes later, and a tighter cache only buys precision nobody is watching for.
+_DAY_CHANGE_TTL = 300.0
+_day_change_cache: Dict[str, Any] = {"at": 0.0, "data": {}}
+
+
+def _day_change(rows: List[Dict[str, Any]]) -> Dict[tuple, Dict[str, float]]:
+    """Today's move for every held symbol, keyed (account, symbol).
+
+    Nothing in a positions or holdings payload carries a day change, so this is
+    a separate fan-out to the agents. Chunked at 25 because that is the agent's
+    own per-call ceiling, and failures are swallowed per account — a dashboard
+    that shows no day change is far better than one that shows nothing.
+    """
+    now = time.time()
+    if now - float(_day_change_cache["at"]) < _DAY_CHANGE_TTL:
+        return _day_change_cache["data"]
+
+    wanted: Dict[str, List[str]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        if symbol:
+            wanted.setdefault(row["account"], [])
+            if symbol not in wanted[row["account"]]:
+                wanted[row["account"]].append(symbol)
+
+    client = AgentClient()
+    out: Dict[tuple, Dict[str, float]] = {}
+    for account, symbols in wanted.items():
+        for start in range(0, len(symbols), 25):
+            batch = symbols[start:start + 25]
+            result = client.call(
+                account, "/day-change?symbols=%s" % ",".join(batch), timeout=6.0)
+            if not result.ok:
+                continue
+            for symbol, fields in ((result.data or {}).get("day_change") or {}).items():
+                if isinstance(fields, dict):
+                    out[(account, symbol)] = fields
+
+    _day_change_cache["at"] = now
+    _day_change_cache["data"] = out
+    return out
+
+
+@app.get("/api/dashboard")
+def get_dashboard(threshold: float = 3.0, movers: int = 5,
+                  _: str = Session) -> Dict[str, Any]:
+    """One page: what is held, what moved, and the extremes.
+
+    `threshold` is the percentage a position must have moved — in either
+    direction, on either basis — to count as an alert. It is a query parameter
+    rather than a setting because the useful number changes with the market.
+    """
+    rows, names, missing, _sold = _open_rows()
+    changes = _day_change(rows)
+
+    lines: List[Dict[str, Any]] = []
+    for row in rows:
+        qty = abs(float(row.get("net_qty") or 0))
+        avg = float(row.get("avg_price") or 0)
+        ltp = float(row.get("ltp") or 0)
+        invested = qty * avg
+        unreal = float(row.get("unrealised") or 0)
+        key = (row["account"], str(row.get("symbol") or ""))
+        day = changes.get(key) or {}
+        lines.append({
+            "account": row["account"],
+            "symbol": row.get("symbol"),
+            "direction": row.get("direction"),
+            "product_type": row.get("product_type"),
+            "qty": qty,
+            "avg_price": avg,
+            "ltp": ltp,
+            "invested": round(invested, 2),
+            "market_value": round(qty * ltp, 2),
+            "unrealised": round(unreal, 2),
+            # On cost, so it answers "how is this position doing".
+            "unrealised_pct": round(unreal / invested * 100, 2) if invested > 0 else None,
+            # Since yesterday's close, so it answers "what moved today". None
+            # rather than 0.0 when the broker would not price it — a flat day and
+            # an unknown one must not read the same.
+            "day_change": round(day["change"], 2) if "change" in day else None,
+            "day_change_pct": round(day["change_pct"], 2) if "change_pct" in day else None,
+        })
+
+    def _abs(value: Any) -> float:
+        return abs(float(value)) if value is not None else 0.0
+
+    # The alert is today's move and only today's move: previous close to last
+    # traded. On-cost is a different question — a holding 87% down on cost that
+    # has not moved since yesterday is not news, and letting it trip the alert
+    # buried the symbols that actually moved. It still travels on each line, for
+    # the movers tables and for context on the row.
+    alerts = sorted(
+        (line for line in lines if _abs(line["day_change_pct"]) >= threshold),
+        key=lambda line: _abs(line["day_change_pct"]),
+        reverse=True,
+    )
+
+    # Ranked by money, because a 0.5% move on a large position outranks a 10%
+    # move on a small one in every way that matters to the account. The
+    # percentage rides along so a big move on a small position is still visible.
+    by_pnl = sorted(lines, key=lambda line: float(line["unrealised"]), reverse=True)
+    gainers = [line for line in by_pnl if float(line["unrealised"]) > 0][:movers]
+    losers = [line for line in reversed(by_pnl) if float(line["unrealised"]) < 0][:movers]
+
+    realised_total = 0.0
+    realised_available = False
+    for account in names:
+        figure = store_realised(account)
+        if figure.get("available"):
+            realised_available = True
+            realised_total += float(figure.get("net") or 0)
+
+    invested_total = sum(float(line["invested"]) for line in lines)
+    value_total = sum(float(line["market_value"]) for line in lines)
+    return {
+        "totals": {
+            "invested": round(invested_total, 2),
+            "market_value": round(value_total, 2),
+            "unrealised": round(value_total - invested_total, 2),
+            "realised": round(realised_total, 2),
+            "realised_available": realised_available,
+            "positions": len(lines),
+        },
+        "threshold": threshold,
+        "alerts": alerts,
+        "gainers": gainers,
+        "losers": losers,
+        "day_change_available": bool(changes),
+        "accounts": names,
+        "accounts_missing": missing,
+    }
+
+
 @app.get("/api/trades")
 def get_trades(account: Optional[str] = None, day: Optional[str] = None,
                limit: int = 500, _: str = Session) -> Dict[str, Any]:

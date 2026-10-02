@@ -343,6 +343,21 @@ class FyersGateway:
             return {}
         return {sym: float(price) for sym, price in self._call("get_ltps", symbols).items()}
 
+    def day_change(self, symbols: List[str]) -> Dict[str, Dict[str, float]]:
+        """Each symbol's move since the previous close.
+
+        Nothing in a positions or holdings payload carries a day change, so the
+        dashboard's "what moved today" cannot be derived from what we already
+        poll — it needs this call.
+        """
+        if not symbols:
+            return {}
+        raw = self._call("get_day_change", symbols)
+        return {
+            sym: {key: float(value) for key, value in fields.items()}
+            for sym, fields in raw.items()
+        }
+
     # ── writes ──────────────────────────────────────────────────────────────
     def place_order(self, req: PlaceOrderRequest) -> str:
         return self._call("place_order", req)

@@ -103,6 +103,19 @@ class Agent:
         except Exception as exc:
             raise AgentError(502, str(exc))
 
+    def day_change(self, symbols: List[str]) -> Dict[str, Any]:
+        """Today's move per symbol. Read-only, and budgeted exactly like quote()
+        because it is the same /quotes call underneath."""
+        symbols = [s.strip() for s in symbols if s.strip()][:MAX_QUOTE_SYMBOLS]
+        if not symbols:
+            raise AgentError(400, "no symbols given")
+        if not self.poller.budget.take():
+            raise AgentError(429, "no rate budget spare — try again in a moment")
+        try:
+            return {"day_change": self.gateway.day_change(symbols)}
+        except Exception as exc:
+            raise AgentError(502, str(exc))
+
     def section(self, name: str) -> Dict[str, Any]:
         try:
             return self.book.get(name)
@@ -189,6 +202,8 @@ class Agent:
                 # Parsed from the query string by the handler, which passes it
                 # through in `body` for GET.
                 return 200, self.quote((body or {}).get("symbols") or [])
+            if path.startswith("/day-change"):
+                return 200, self.day_change((body or {}).get("symbols") or [])
             if path.startswith("/") and path[1:] in self.book.STALE_AFTER:
                 return 200, self.section(path[1:])
             raise AgentError(404, "not found")

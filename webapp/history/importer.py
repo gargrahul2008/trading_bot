@@ -128,11 +128,25 @@ def import_realised(conn: sqlite3.Connection, account: str,
     Keyed on `symbol_name`. The endpoint's own `exch_id`, `exchange_name` and
     `segment_name` contradict it on real rows — BSE:SHISHIND-X comes back as NSE
     — so they are not stored at all rather than stored wrong.
+
+    **Each fetched day is replaced, not merged.** Upserting on
+    (account, day, symbol) looks right until a scrip changes series: rahul's
+    KAMDHENU was `NSE:KAMDHENU-BE` when 2026-08-07 was first fetched and
+    `NSE:KAMDHENU-EQ` when it was re-fetched, so the second fetch inserted a
+    second row and the day's realised was counted twice — 5,610.25 of phantom
+    profit that reconciliation against the broker's tax statement exposed.
+    Series changes are routine (surveillance moves a stock in and out of BE),
+    so this is not a one-off. The endpoint returns the complete set for a day,
+    which makes replacing that day both correct and rename-proof.
     """
     rows = [r for r in rows if r.get("symbol") and r.get("day")]
     if not rows:
         return 0
     now = time.time()
+    conn.executemany(
+        "DELETE FROM realised_history WHERE account = ? AND day = ?",
+        [(account, d) for d in sorted({r["day"] for r in rows})],
+    )
     conn.executemany(
         "INSERT INTO realised_history"
         " (account, day, symbol, realised, buy_qty, sell_qty, buy_rate, sell_rate, fetched_at)"
