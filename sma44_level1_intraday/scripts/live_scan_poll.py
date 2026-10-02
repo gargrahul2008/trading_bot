@@ -5,20 +5,27 @@
 09:15–15:30 IST or on a weekend is a silent no-op).
 
 Tracks data/live_scan/watchlist_latest.json's pending setups (written by
-live_scan_after_market.py the previous evening) against LIVE Fyers LTP.
-Fyers' quotes call here only returns `lp` (see live.quotes / FyersClient.
-get_ltps), not the day's own OHLC, so each symbol's running day
-open/high/low/close is rebuilt from repeated LTP polls, persisted to
-data/live_scan/running_bars.json between polls (each cron tick is a
-SEPARATE process, so this can't just live in a Python variable — see
-live.state.read_running_bars/write_running_bars) — meaning a trigger or
-invalidation that happens AND reverts entirely between two 5-minute polls
-can still be missed. This is the tradeoff of a 5-minute LTP-polling design,
-not a bug.
+live_scan_after_market.py the previous evening) against LIVE Fyers quotes.
+Each symbol's running day open/high/low/close comes from the broker's OWN
+session OHLC (live.quotes.fetch_day_bars — the /quotes payload carries
+open_price/high_price/low_price beside lp), folded together with the polled
+lp via max/min so the bar can only widen. It is persisted to
+data/live_scan/running_bars.json between polls, since each cron tick is a
+SEPARATE process and this can't just live in a Python variable (see
+live.state.read_running_bars/write_running_bars).
+
+This used to be rebuilt from repeated lp samples ALONE, which silently
+understated the day's range whenever price spiked and retraced between two
+5-minute polls — and on 2026-09-29 that missed a real entry: IWP's broker
+high was 42.40 against a 42.15 trigger, but the lp-sampled high was only
+41.40, so check_trigger was asked the wrong question and correctly said no.
+If a chunk fails or a payload lacks a field, that symbol alone falls back to
+the old lp-only reconstruction and stays exposed to the same blind spot.
 
 Sends a Telegram alert the moment a pending setup's entry actually
-triggers, and tracks it through to exit (SL / target / force_exit) with a
-second alert including realised P&L — using the IDENTICAL trigger /
+triggers, and tracks it through to exit (SL / target, plus force_exit only
+when the config is NOT continuous_session) with a second alert including
+realised P&L — using the IDENTICAL trigger /
 invalidation / exit rules backtest/engine.py itself uses (see live.engine),
 so a live alert can never disagree with what the backtest would have done
 on the same price path. Every entry/exit is also appended to
@@ -27,6 +34,17 @@ data/live_scan/live_trade_log.csv for manual review.
 Only config.execution.exit_mode == "fixed" is supported for exit tracking —
 live_scan_after_market.py already warns loudly if the notebook's config
 uses atr_chandelier / candle_trail instead.
+
+A pending setup leaves the watchlist for exactly three reasons, matching
+the backtest's own pending-setup lifecycle: it TRIGGERS (becomes a
+position), it is INVALIDATED (the signal candle's opposite extreme breaks
+before entry — "stop_breached_before_entry"), or it EXPIRES after
+scanner.setup_expiry_bars without triggering. Expiry is not evaluated here:
+live_scan_after_market.py re-runs pending_setup_status against the real
+completed daily bars every evening and only writes setups still
+"actionable", so an expired setup simply never appears in the next
+watchlist. Doing it here too would mean hand-rolling a trading-day counter
+that could drift from the backtest's own bar counting.
 
 Usage:
     python -m sma44_level1_intraday.scripts.live_scan_poll
@@ -51,7 +69,7 @@ from common.broker.fyers_client import FyersClient  # noqa: E402
 from sma44_level1_intraday.backtest.costs import compute_trade_costs  # noqa: E402
 from sma44_level1_intraday.live.engine import check_fixed_exit, check_trigger, compute_qty  # noqa: E402
 from sma44_level1_intraday.live.notebook_config import LiveScanSetup, load_live_scan_setup  # noqa: E402
-from sma44_level1_intraday.live.quotes import fetch_ltps  # noqa: E402
+from sma44_level1_intraday.live.quotes import fetch_day_bars, fetch_ltps  # noqa: E402
 from sma44_level1_intraday.live.state import (  # noqa: E402
     append_trade_log, read_open_positions, read_running_bars, read_watchlist, remove_from_watchlist,
     write_open_positions, write_running_bars,
@@ -63,15 +81,32 @@ AUTH_FILE = REPO_ROOT / "fyers_auth.json"
 USER_KEY = "user1"
 
 
-def _update_running_bar(bars: dict[str, dict], symbol: str, ltp: float) -> dict:
+def _update_running_bar(
+    bars: dict[str, dict], symbol: str, ltp: float, day_bar: "dict | None" = None,
+) -> dict:
     """Mutates and returns `bars[symbol]` in place — `bars` is the whole
     day's dict, loaded once per poll via live.state.read_running_bars and
     persisted back at the end of poll_once (see this module's docstring for
-    why it can't just be an in-memory variable)."""
+    why it can't just be an in-memory variable).
+
+    `day_bar` is the broker's OWN session open/high/low/close for this symbol
+    (live.quotes.fetch_day_bars). When present it takes precedence, because it
+    sees the whole session's range including moves that happened between two
+    polls; the lp-sampled values are still folded in with max/min so a bar can
+    only ever widen, never narrow, if the broker's fields lag. When it's absent
+    (failed chunk, or a payload missing a field) this falls back to the old
+    lp-only reconstruction for that symbol alone."""
     bar = bars.get(symbol)
     if bar is None:
         bar = {"open": ltp, "high": ltp, "low": ltp, "close": ltp}
         bars[symbol] = bar
+    if day_bar is not None:
+        # Broker's session open is authoritative; it never changes intraday,
+        # whereas an lp-seeded "open" is just whatever the first poll saw.
+        bar["open"] = day_bar["open"]
+        bar["high"] = max(bar["high"], day_bar["high"], ltp)
+        bar["low"] = min(bar["low"], day_bar["low"], ltp)
+        bar["close"] = day_bar["close"]
     else:
         bar["high"] = max(bar["high"], ltp)
         bar["low"] = min(bar["low"], ltp)
@@ -105,15 +140,26 @@ def poll_once(client: FyersClient, setup: LiveScanSetup, *, now_ist: "datetime |
     watch_symbols = {r["symbol"] for r in wl.get("setups", [])} | set(open_positions.keys())
     if not watch_symbols:
         return
-    ltps = fetch_ltps(client, sorted(watch_symbols))
+    symbols = sorted(watch_symbols)
+    ltps = fetch_ltps(client, symbols)
+    # Same /quotes endpoint, so this is one more call per poll for the whole
+    # watchlist -- and it is what makes a between-polls spike visible at all.
+    day_bars = fetch_day_bars(client, symbols)
 
     # ── 1. Existing open positions: check for exit first ──────────────────
-    force_exit = now_ist.time() >= cfg.market.force_exit_time
+    # continuous_session means the backtest applies NO intraday time gating to
+    # these bars (see _in_market_hours' own note, and backtest/engine.py's
+    # `if not continuous and bar_time >= force_exit_time` at _resolve_exit).
+    # On a 1D timeframe that makes this a SWING strategy: a position is held
+    # across sessions and leaves only on SL or target. Force-exiting it at
+    # 15:15 would close a trade the backtest would still be holding.
+    intraday_time_gating = not cfg.market.continuous_session
+    force_exit = intraday_time_gating and now_ist.time() >= cfg.market.force_exit_time
     for symbol, pos in list(open_positions.items()):
         ltp = ltps.get(symbol)
         if ltp is None:
             continue
-        bar = _update_running_bar(running_bars, symbol, ltp)
+        bar = _update_running_bar(running_bars, symbol, ltp, day_bars.get(symbol))
         exit_info = None
         if cfg.execution.exit_mode == "fixed":
             exit_info = check_fixed_exit(
@@ -149,7 +195,9 @@ def poll_once(client: FyersClient, setup: LiveScanSetup, *, now_ist: "datetime |
         running_bars.pop(symbol, None)
 
     # ── 2. Watchlist setups still pending: check for trigger ──────────────
-    no_new_entries = now_ist.time() > cfg.market.no_new_entry_after
+    # Same gating rule the backtest uses for pending setups:
+    #   past_cutoff = (not continuous) and bar_time > market.no_new_entry_after
+    no_new_entries = intraday_time_gating and now_ist.time() > cfg.market.no_new_entry_after
     for row in wl.get("setups", []):
         symbol = row["symbol"]
         if symbol in open_positions:
@@ -157,20 +205,29 @@ def poll_once(client: FyersClient, setup: LiveScanSetup, *, now_ist: "datetime |
         ltp = ltps.get(symbol)
         if ltp is None:
             continue
-        bar = _update_running_bar(running_bars, symbol, ltp)
+        bar = _update_running_bar(running_bars, symbol, ltp, day_bars.get(symbol))
         if no_new_entries:
             continue  # too late in the session to open a new position
 
-        # A mid-day invalidation isn't acted on here (no "invalidated" alert
-        # is sent, matching what was asked for) — a genuinely invalidated
-        # setup simply stops reappearing in tomorrow's watchlist once the
-        # actual daily bar closes with that breach; until then this row is
-        # re-checked every poll, which is harmless (just an unused LTP check).
-        triggered, _invalidated = check_trigger(
+        triggered, invalidated = check_trigger(
             {"direction": row["direction"], "trigger_price": row["trigger_price"],
              "signal_low": row["signal_low"], "signal_high": row["signal_high"]},
             bar,
         )
+        if invalidated:
+            # The signal candle's opposite extreme broke before entry — the
+            # backtest drops this setup outright ("stop_breached_before_entry",
+            # backtest/engine.py) and never trades it. Drop it here too, rather
+            # than re-checking a dead row every poll: the running bar's low/high
+            # only ever widens, so a breach is permanent for this session and
+            # cannot un-happen later in the day. _resolve_pending_trigger has
+            # already arbitrated the same-bar trigger-vs-invalidation case above,
+            # so reaching here means it really is invalidated, not triggered.
+            # Logged (not alerted) — no "invalidated" Telegram was asked for.
+            remove_from_watchlist(symbol)
+            append_trade_log({**row, "event": "invalidated", "exit_reason": "stop_breached_before_entry",
+                              "exit_time": now_ist.isoformat()})
+            continue
         if not triggered:
             continue
 
