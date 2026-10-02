@@ -49,11 +49,7 @@ BUCKETS = {
         "log":        os.path.join(LOG_DIR, "mexc_bucket2_runner.log"),
         "label":      "Bucket2",
     },
-    "bucket3": {
-        "state_dir":  os.path.join(STATE_DIR, "bucket3"),
-        "log":        os.path.join(LOG_DIR, "mexc_bucket3_runner.log"),
-        "label":      "Bucket3",
-    },
+    # bucket3 (2% tight) DECOMMISSIONED 2026-09-08 — stopped & capital withdrawn. Removed from alerts.
 }
 
 # Thresholds (tunable)

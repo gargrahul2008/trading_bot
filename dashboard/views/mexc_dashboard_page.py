@@ -28,16 +28,14 @@ BUCKETS = {
         "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket2.json"),
         "label": "Bucket 2 — Wide 10% upside grid",
     },
-    "Bucket 3 (tight 2%)": {
-        "state_dir": os.path.join(STATE_DIR, "bucket3"),
-        "config": os.path.join(REPO_ROOT, "strategies", "pct_ladder", "config.mexc.bucket3.json"),
-        "label": "Bucket 3 — Tight 2% grid, short runway (1 buy / 4 sells)",
-    },
+    # Bucket 3 (2% tight) DECOMMISSIONED 2026-09-08 — stopped & capital withdrawn; its
+    # 0.99481 ETH folded into HODL below. Removed from dashboard.
 }
 # Off-bot ETH allocated to Bucket 2's HODL stack (untouched by either bot)
 # Computed as: total broker ETH - bucket1 traded_qty - bucket2 traded_qty
 # Stays constant because each bot's fills move broker ETH 1:1 with state.traded_qty
-OFF_BOT_HODL_ETH = 17.709
+# 2026-09-08: grew 17.709 -> 18.70381 by absorbing decommissioned bucket3's 0.99481 ETH.
+OFF_BOT_HODL_ETH = 18.70381
 
 
 def _jload(path: str) -> Optional[dict]:

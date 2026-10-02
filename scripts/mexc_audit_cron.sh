@@ -2,7 +2,9 @@
 # mexc_audit_cron.sh — run the PnL/reconciliation audit; alert on Telegram ONLY if it fails.
 # Add to crontab (e.g. hourly): 0 * * * * /root/trading_bot/scripts/mexc_audit_cron.sh >> /root/trading_bot/logs/mexc_audit.log 2>&1
 cd /root/trading_bot
-SECRETS="strategies/pct_ladder/secrets/telegram.json"
+# Owner-only secret: audit-failure alerts are operational/internal — do NOT send to the
+# partner (…3258). Partner gets only the polished 8h/monthly reports. (2026-09-08)
+SECRETS="strategies/pct_ladder/secrets/telegram_owner.json"
 PYTHON="env/bin/python"
 
 OUT="$($PYTHON scripts/mexc_audit.py 2>&1)"

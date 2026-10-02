@@ -61,22 +61,18 @@ run_report "bucket1" \
     "1" \
     "2026-06-08T10:44:47"
 
-# Bucket 2: wide grid + 17.709 ETH off-bot HODL stack → include HODL in PV
+# Bucket 2: wide grid + off-bot HODL stack → include HODL in PV.
+# HODL grew 17.709 -> 18.70381 on 2026-09-08 (absorbed bucket3's 0.99481 ETH on decommission).
 run_report "bucket2" \
     "strategies/pct_ladder/config.mexc.bucket2.json" \
     "strategies/pct_ladder/state/bucket2/trades_2026_05_28_v1.jsonl" \
-    "17.709" \
+    "18.70381" \
     "1" \
     ""
 
-# Bucket 3: tight 2% grid. Seeded with 19.7094 ETH @ real blended cost 1939.5
-# (8.42 bought @1865 + 11.29 moved from bucket1 @1995) — pass as initial inventory so seed sells book PnL.
-run_report "bucket3" \
-    "strategies/pct_ladder/config.mexc.bucket3.json" \
-    "strategies/pct_ladder/state/bucket3/trades_2026_07_31_v1.jsonl" \
-    "0" \
-    "1" \
-    "" \
-    "2026_07_31_v1" \
-    "19.7094" \
-    "1939.5"
+# Bucket 3 (2% tight) DECOMMISSIONED 2026-09-08 — stopped & capital withdrawn. No longer reported.
+# Its 0.99481 ETH folded into HODL (see bucket2 extra-eth above); cash withdrawn.
+# run_report "bucket3" \
+#     "strategies/pct_ladder/config.mexc.bucket3.json" \
+#     "strategies/pct_ladder/state/bucket3/trades_2026_07_31_v1.jsonl" \
+#     "0" "1" "" "2026_07_31_v1" "19.7094" "1939.5"

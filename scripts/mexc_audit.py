@@ -25,11 +25,18 @@ import sys, os, json, glob
 sys.path.insert(0, "/root/trading_bot")
 from common.broker.mexc_spot_client import MexcSpotClient
 
-# ── Off-bot HODL (17.709 ETH held outside all buckets). Set its real cost basis. ──
-HODL_ETH        = 17.709
+# ── Off-bot HODL (ETH held outside all buckets). Set its real cost basis. ──
+# 2026-09-08: grew 17.709 -> 18.70381 by absorbing decommissioned bucket3's 0.99481 ETH.
+HODL_ETH        = 18.70381
 HODL_COST_PRICE = None   # <-- SET the avg USD cost of the HODL ETH (None = skip HODL PnL)
 
-BUCKETS = ["bucket1", "bucket2", "bucket3"]
+# Uncommitted account USDC not held by any bucket. Owner withdrawals reduce the account
+# but not any bucket's cash; the residual not-yet-reconciled sits here so USDC still ties out.
+# 2026-09-08 wind-down: finalize (and reduce bucket baselines) AFTER all withdrawals land.
+IDLE_CASH = 0.0
+
+# bucket3 (2% tight) DECOMMISSIONED 2026-09-08 — stopped, orders cancelled, capital withdrawn.
+BUCKETS = ["bucket1", "bucket2"]
 STATE_DIR = "/root/trading_bot/strategies/pct_ladder/state"
 SECRETS   = "/root/trading_bot/strategies/pct_ladder/secrets/mexc_spot.json"
 TOL_ETH   = 0.02      # ETH reconciliation tolerance
@@ -85,13 +92,15 @@ def main():
 
     # ── Reconciliation checks ──
     print("\n--- Reconciliation vs live account ---")
-    tot_eth = sum_qty + HODL_ETH
+    tot_eth  = sum_qty + HODL_ETH
+    tot_cash = sum_cash + IDLE_CASH
     eth_ok = abs(tot_eth - acct_eth) < TOL_ETH
-    usd_ok = abs(sum_cash - acct_usdc) < TOL_USD
+    usd_ok = abs(tot_cash - acct_usdc) < TOL_USD
     if not eth_ok: fails.append(f"ETH: tracked {tot_eth:.4f} != account {acct_eth:.4f}")
-    if not usd_ok: fails.append(f"USDC: tracked {sum_cash:.2f} != account {acct_usdc:.2f}")
+    if not usd_ok: fails.append(f"USDC: tracked {tot_cash:.2f} != account {acct_usdc:.2f}")
     print(f"ETH : tracked {tot_eth:.4f}  vs account {acct_eth:.4f}   [{'PASS' if eth_ok else 'FAIL'}]")
-    print(f"USDC: tracked ${sum_cash:,.2f} vs account ${acct_usdc:,.2f}  [{'PASS' if usd_ok else 'FAIL'}]")
+    idle_note = f" (incl idle ${IDLE_CASH:,.0f})" if IDLE_CASH else ""
+    print(f"USDC: tracked ${tot_cash:,.2f}{idle_note} vs account ${acct_usdc:,.2f}  [{'PASS' if usd_ok else 'FAIL'}]")
 
     # ── PnL totals ──
     print("\n--- PnL (realized + unrealized, cost-basis) ---")

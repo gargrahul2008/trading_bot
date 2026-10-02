@@ -22,11 +22,16 @@ SECRETS   = "/root/trading_bot/strategies/pct_ladder/secrets/mexc_spot.json"
 TG_SECRET = "/root/trading_bot/strategies/pct_ladder/secrets/telegram.json"
 
 # Off-bot HODL held outside all buckets (see docs/mexc_pnl_model.md).
-HODL_ETH  = 17.709
+# 2026-09-08: grew 17.709 -> 18.70381 by absorbing decommissioned bucket3's 0.99481 ETH.
+HODL_ETH  = 18.70381
 
-# bucket -> human label
-LABEL = {"bucket1": "3% grid", "bucket2": "10% wide", "bucket3": "2% tight"}
-BUCKETS = ["bucket1", "bucket2", "bucket3"]
+# Uncommitted account cash not held by any bucket (e.g. withdrawal-in-progress residual).
+# Set during the 2026-09-08 wind-down; finalize after all withdrawals land.
+IDLE_CASH = 0.0
+
+# bucket -> human label. bucket3 DECOMMISSIONED 2026-09-08.
+LABEL = {"bucket1": "3% grid", "bucket2": "10% wide"}
+BUCKETS = ["bucket1", "bucket2"]
 
 TOL_ETH = 0.02   # ETH reconciliation tolerance
 TOL_USD = 5.0    # USDC reconciliation tolerance ($)
@@ -62,6 +67,9 @@ def build_message() -> str:
         sum_eth += eth; sum_cash += cash
     rows.append(("HODL (off-bot)", HODL_ETH, 0.0))
     sum_eth += HODL_ETH
+    if IDLE_CASH:
+        rows.append(("Idle (uncommitted)", 0.0, IDLE_CASH))
+        sum_cash += IDLE_CASH
 
     # Reconciliation vs live exchange
     d_eth = sum_eth - acct_eth
